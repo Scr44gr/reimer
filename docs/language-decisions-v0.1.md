@@ -327,3 +327,15 @@ silently changing precision. Constants follow the same convention.
 They expose named arithmetic methods instead of operator overloads. Normalizing
 an exactly zero vector returns `Option` rather than producing a hidden
 division-by-zero result. Vector operations allocate no memory.
+
+## D-015: transparent target-correct C aliases
+
+The language supports non-generic transparent aliases with
+`pub type Name = ExistingType;`. Aliases are resolved before HIR lowering and
+therefore do not create wrapper layouts, conversions, or runtime costs.
+
+`std::c` uses aliases selected from the native compiler target. C `long` is
+therefore 32-bit on 64-bit Windows and 64-bit on the usual 64-bit Unix targets.
+Bindings should use `std::c` names rather than assuming that C `long` matches
+`isize`. Typed null pointers and pointer/count records remain non-owning; native
+calls and pointer dereferences still require `unsafe`.

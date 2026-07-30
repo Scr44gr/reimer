@@ -56,6 +56,8 @@ pub enum Item {
     Struct(StructDeclaration),
     /// A tagged union type.
     Enum(EnumDeclaration),
+    /// A transparent name for another type.
+    TypeAlias(TypeAliasDeclaration),
     /// A trait declaration.
     Trait(TraitDeclaration),
     /// An inherent or trait implementation block.
@@ -238,6 +240,19 @@ pub struct EnumDeclaration {
     pub variants: Vec<EnumVariant>,
     /// Additional constraints on generic parameters.
     pub where_predicates: Vec<WherePredicate>,
+    /// Full declaration span.
+    pub span: Span,
+}
+
+/// A transparent, non-generic type alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeAliasDeclaration {
+    /// Whether the alias is exported from its module.
+    pub is_public: bool,
+    /// Alias name.
+    pub name: Identifier,
+    /// Existing type named by the alias.
+    pub target: TypeName,
     /// Full declaration span.
     pub span: Span,
 }

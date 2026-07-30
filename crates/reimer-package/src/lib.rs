@@ -205,6 +205,20 @@ struct Scope {
     absolute_modules: HashMap<ModuleName, ModuleName>,
 }
 
+fn declared_symbol(item: &Item) -> Option<(&ast::Identifier, bool)> {
+    Some(match item {
+        Item::Function(declaration) => (&declaration.name, declaration.is_public),
+        Item::ExternFunction(declaration) => (&declaration.name, declaration.is_public),
+        Item::Struct(declaration) => (&declaration.name, declaration.is_public),
+        Item::Enum(declaration) => (&declaration.name, declaration.is_public),
+        Item::TypeAlias(declaration) => (&declaration.name, declaration.is_public),
+        Item::Trait(declaration) => (&declaration.name, declaration.is_public),
+        Item::Constant(declaration) => (&declaration.name, declaration.is_public),
+        Item::Static(declaration) => (&declaration.name, declaration.is_public),
+        Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => return None,
+    })
+}
+
 type ModuleApis = HashMap<ModuleName, Scope>;
 
 /// Loads an entry file and every statically imported module.
@@ -887,93 +901,19 @@ impl Loader {
         api: &mut Scope,
     ) {
         for item in items {
-            match item {
-                Item::Function(function) if function.is_public => {
-                    insert_symbol(
-                        api,
-                        function.name.name.clone(),
-                        Symbol {
-                            canonical: canonical_name(module_name, &function.name.name),
-                        },
-                        function.name.span,
-                        &self.sources,
-                        &mut self.diagnostics,
-                    );
-                }
-                Item::ExternFunction(function) if function.is_public => {
-                    insert_symbol(
-                        api,
-                        function.name.name.clone(),
-                        Symbol {
-                            canonical: canonical_name(module_name, &function.name.name),
-                        },
-                        function.name.span,
-                        &self.sources,
-                        &mut self.diagnostics,
-                    );
-                }
-                Item::Struct(declaration) if declaration.is_public => {
-                    insert_symbol(
-                        api,
-                        declaration.name.name.clone(),
-                        Symbol {
-                            canonical: canonical_name(module_name, &declaration.name.name),
-                        },
-                        declaration.name.span,
-                        &self.sources,
-                        &mut self.diagnostics,
-                    );
-                }
-                Item::Enum(declaration) if declaration.is_public => {
-                    insert_symbol(
-                        api,
-                        declaration.name.name.clone(),
-                        Symbol {
-                            canonical: canonical_name(module_name, &declaration.name.name),
-                        },
-                        declaration.name.span,
-                        &self.sources,
-                        &mut self.diagnostics,
-                    );
-                }
-                Item::Trait(declaration) if declaration.is_public => {
-                    insert_symbol(
-                        api,
-                        declaration.name.name.clone(),
-                        Symbol {
-                            canonical: canonical_name(module_name, &declaration.name.name),
-                        },
-                        declaration.name.span,
-                        &self.sources,
-                        &mut self.diagnostics,
-                    );
-                }
-                Item::Constant(declaration) if declaration.is_public => {
-                    insert_symbol(
-                        api,
-                        declaration.name.name.clone(),
-                        Symbol {
-                            canonical: canonical_name(module_name, &declaration.name.name),
-                        },
-                        declaration.name.span,
-                        &self.sources,
-                        &mut self.diagnostics,
-                    );
-                }
-                Item::Static(declaration) if declaration.is_public => {
-                    insert_symbol(
-                        api,
-                        declaration.name.name.clone(),
-                        Symbol {
-                            canonical: canonical_name(module_name, &declaration.name.name),
-                        },
-                        declaration.name.span,
-                        &self.sources,
-                        &mut self.diagnostics,
-                    );
-                }
-                _ => {}
-            }
+            let Some((name, true)) = declared_symbol(item) else {
+                continue;
+            };
+            insert_symbol(
+                api,
+                name.name.clone(),
+                Symbol {
+                    canonical: canonical_name(module_name, &name.name),
+                },
+                name.span,
+                &self.sources,
+                &mut self.diagnostics,
+            );
         }
     }
 
@@ -1114,40 +1054,19 @@ impl Loader {
         scope: &mut Scope,
     ) {
         for item in items {
-            let declaration = match item {
-                Item::Function(function) => Some((function.name.name.clone(), function.name.span)),
-                Item::ExternFunction(function) => {
-                    Some((function.name.name.clone(), function.name.span))
-                }
-                Item::Struct(declaration) => {
-                    Some((declaration.name.name.clone(), declaration.name.span))
-                }
-                Item::Enum(declaration) => {
-                    Some((declaration.name.name.clone(), declaration.name.span))
-                }
-                Item::Trait(declaration) => {
-                    Some((declaration.name.name.clone(), declaration.name.span))
-                }
-                Item::Constant(declaration) => {
-                    Some((declaration.name.name.clone(), declaration.name.span))
-                }
-                Item::Static(declaration) => {
-                    Some((declaration.name.name.clone(), declaration.name.span))
-                }
-                Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => None,
+            let Some((name, _)) = declared_symbol(item) else {
+                continue;
             };
-            if let Some((name, span)) = declaration {
-                insert_symbol(
-                    scope,
-                    name.clone(),
-                    Symbol {
-                        canonical: canonical_name(module_name, &name),
-                    },
-                    span,
-                    &self.sources,
-                    &mut self.diagnostics,
-                );
-            }
+            insert_symbol(
+                scope,
+                name.name.clone(),
+                Symbol {
+                    canonical: canonical_name(module_name, &name.name),
+                },
+                name.span,
+                &self.sources,
+                &mut self.diagnostics,
+            );
         }
     }
 
@@ -1355,6 +1274,9 @@ fn collect_qualified_paths(program: &ast::Program) -> Vec<&ast::Path> {
                     }
                 }
                 visit_where_predicates(&declaration.where_predicates, &mut paths);
+            }
+            Item::TypeAlias(declaration) => {
+                visit_type_paths(&declaration.target, &mut paths);
             }
             Item::Trait(declaration) => {
                 visit_generic_parameters(&declaration.generic_parameters, &mut paths);
@@ -1658,6 +1580,15 @@ impl ItemRewriteContext<'_> {
             Item::ExternFunction(function) => self.rewrite_extern_function(function),
             Item::Struct(declaration) => self.rewrite_struct(declaration),
             Item::Enum(declaration) => self.rewrite_enum(declaration),
+            Item::TypeAlias(declaration) => {
+                rewrite_identifier(&mut declaration.name, self.module);
+                rewrite_type(
+                    &mut declaration.target,
+                    self.scope,
+                    self.apis,
+                    self.diagnostics,
+                );
+            }
             Item::Trait(declaration) => self.rewrite_trait(declaration),
             Item::Impl(declaration) => self.rewrite_impl(declaration),
             Item::Constant(declaration) => {

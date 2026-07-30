@@ -44,6 +44,9 @@
   be added with the startup runtime for each platform.
 - The runtime encapsulates FFI, allocator, and I/O boundaries; programs use
   safe standard-library wrappers.
+- `std::c` aliases are resolved to the native target's actual scalar ABI before
+  HIR lowering. They are transparent and introduce no wrapper layout. See
+  [`c-interop.md`](c-interop.md).
 
 `std::fs` follows the same boundary. Generated code passes bounded UTF-8 paths
 and byte regions to a small runtime registry of opaque native file handles.

@@ -126,6 +126,18 @@ assertScope(
 );
 assertScope(
   grammar,
+  "pub type Int = c_int;",
+  "Int",
+  "entity.name.type.reimer",
+);
+assertScope(
+  grammar,
+  "pub type Int = c_int;",
+  "c_int",
+  "support.type.primitive.reimer",
+);
+assertScope(
+  grammar,
   "static mut COUNTER: i32 = 0;",
   "COUNTER",
   "variable.other.constant.reimer",

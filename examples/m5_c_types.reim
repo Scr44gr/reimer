@@ -1,0 +1,27 @@
+from std::c import Buffer, Int, Long, bool_from_int, int_from_bool, is_null_mut, null;
+
+@repr(C)
+struct NativeRecord {
+    code: Int,
+    offset: Long,
+}
+
+@link("runtime")
+extern "C" {
+    fn absolute_i32(value: Int) -> Int;
+}
+
+fn main() -> i32 {
+    let pointer: *mut NativeRecord = null();
+    let empty = Buffer::new(null<u8>(), 0);
+    let answer: Int = unsafe { absolute_i32(-42) };
+
+    if is_null_mut(pointer)
+        && empty.is_empty()
+        && bool_from_int(int_from_bool(true))
+        && answer == 42 {
+        answer
+    } else {
+        0
+    }
+}

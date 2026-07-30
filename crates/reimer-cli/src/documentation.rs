@@ -3,7 +3,7 @@ use std::path::Path;
 use reimer_ast::{
     ConstantDeclaration, EnumDeclaration, ExternFunction, Function, GenericParameter,
     ImplDeclaration, Item, StaticDeclaration, StructDeclaration, TraitDeclaration, TraitMethod,
-    WherePredicate,
+    TypeAliasDeclaration, WherePredicate,
 };
 use reimer_diagnostics::Span;
 use reimer_package::{Package, display_symbol_name};
@@ -43,6 +43,13 @@ pub(crate) fn render(package: &Package, source_root: &Path, title: &str) -> Stri
                 render_enum(package, &mut output, declaration);
                 documented_items += 1;
             }
+            Item::TypeAlias(declaration)
+                if declaration.is_public
+                    && belongs_to_root(package, declaration.span, source_root) =>
+            {
+                render_type_alias(package, &mut output, declaration);
+                documented_items += 1;
+            }
             Item::Trait(declaration)
                 if declaration.is_public
                     && belongs_to_root(package, declaration.span, source_root) =>
@@ -74,6 +81,7 @@ pub(crate) fn render(package: &Package, source_root: &Path, title: &str) -> Stri
             | Item::ExternFunction(_)
             | Item::Struct(_)
             | Item::Enum(_)
+            | Item::TypeAlias(_)
             | Item::Trait(_)
             | Item::Impl(_)
             | Item::Constant(_)
@@ -262,6 +270,15 @@ fn render_constant(package: &Package, output: &mut String, declaration: &Constan
         "pub const {display_name}: {} = {};",
         source(package, declaration.ty.span),
         source(package, declaration.value.span())
+    );
+    render_section(package, output, &display_name, &signature, declaration.span);
+}
+
+fn render_type_alias(package: &Package, output: &mut String, declaration: &TypeAliasDeclaration) {
+    let display_name = display_symbol_name(&declaration.name.name);
+    let signature = format!(
+        "pub type {display_name} = {};",
+        source(package, declaration.target.span)
     );
     render_section(package, output, &display_name, &signature, declaration.span);
 }

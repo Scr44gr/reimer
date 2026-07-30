@@ -1,0 +1,109 @@
+/// C `void`, used behind raw pointers and as a no-value return.
+pub type Void = ();
+/// Target-correct plain C `char`.
+pub type Char = c_char;
+/// C `signed char`.
+pub type SignedChar = c_schar;
+/// C `unsigned char`.
+pub type UnsignedChar = c_uchar;
+/// C `short`.
+pub type Short = c_short;
+/// C `unsigned short`.
+pub type UnsignedShort = c_ushort;
+/// C `int`.
+pub type Int = c_int;
+/// C `unsigned int`.
+pub type UnsignedInt = c_uint;
+/// Target-correct C `long`.
+pub type Long = c_long;
+/// Target-correct C `unsigned long`.
+pub type UnsignedLong = c_ulong;
+/// C `long long`.
+pub type LongLong = c_longlong;
+/// C `unsigned long long`.
+pub type UnsignedLongLong = c_ulonglong;
+/// C `float`.
+pub type Float = c_float;
+/// C `double`.
+pub type Double = c_double;
+/// C `size_t`.
+pub type Size = c_size;
+/// C `ptrdiff_t`.
+pub type PtrDiff = c_ptrdiff;
+/// Borrowed pointer to a NUL-terminated C byte string.
+pub type Str = cstr;
+/// C `_Bool` as supported by the native ABI.
+pub type Bool = bool;
+
+/// A C-compatible pointer and element count for read-only memory.
+@repr(C)
+pub struct ConstBuffer<T> {
+    pub data: *const T,
+    pub len: Size,
+}
+
+/// A C-compatible pointer and element count for mutable memory.
+@repr(C)
+pub struct Buffer<T> {
+    pub data: *mut T,
+    pub len: Size,
+}
+
+impl<T> Copy for ConstBuffer<T> {}
+impl<T> Clone for ConstBuffer<T> {}
+impl<T> Copy for Buffer<T> {}
+impl<T> Clone for Buffer<T> {}
+
+impl<T> ConstBuffer<T> {
+    /// Packages a raw read-only region without dereferencing it.
+    pub fn new(data: *const T, len: Size) -> ConstBuffer<T> {
+        ConstBuffer { data: data, len: len }
+    }
+
+    /// Returns whether the region contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<T> Buffer<T> {
+    /// Packages a raw mutable region without dereferencing it.
+    pub fn new(data: *mut T, len: Size) -> Buffer<T> {
+        Buffer { data: data, len: len }
+    }
+
+    /// Returns whether the region contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Returns a null mutable pointer.
+pub fn null<T>() -> *mut T {
+    0 as usize as *mut T
+}
+
+/// Returns a null read-only pointer.
+pub fn null_const<T>() -> *const T {
+    0 as usize as *const T
+}
+
+/// Returns whether a read-only pointer is null.
+pub fn is_null<T>(pointer: *const T) -> bool {
+    pointer as usize == 0
+}
+
+/// Returns whether a mutable pointer is null.
+pub fn is_null_mut<T>(pointer: *mut T) -> bool {
+    pointer as usize == 0
+}
+
+/// Converts a language boolean to the conventional C integer representation.
+pub fn int_from_bool(value: bool) -> Int {
+    if value { 1 } else { 0 }
+}
+
+/// Converts a conventional C integer boolean to a language boolean.
+pub fn bool_from_int(value: Int) -> bool {
+    value != 0
+}

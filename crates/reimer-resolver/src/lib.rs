@@ -3,6 +3,7 @@
 mod comptime;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::mem::size_of;
 
 use reimer_ast::{
     self as ast, AssignmentOperator as AstAssignmentOperator, BinaryOperator as AstBinaryOperator,
@@ -2662,6 +2663,7 @@ impl Resolver {
             .remember_preliminary_constants(&preliminary.constants);
         self.preliminary_constants = preliminary.constants;
         self.collect_type_headers(program);
+        self.collect_type_aliases(program);
         self.collect_trait_headers(program);
         self.resolve_type_definitions(program);
         self.validate_type_cycles();
@@ -2822,6 +2824,7 @@ impl Resolver {
                 }
                 Item::Import(_)
                 | Item::ExternFunction(_)
+                | Item::TypeAlias(_)
                 | Item::Trait(_)
                 | Item::Constant(_)
                 | Item::Static(_)
@@ -3074,6 +3077,36 @@ impl Resolver {
                 Type::Enum(id)
             };
             self.types.names.insert(name.to_owned(), ty);
+        }
+    }
+
+    fn collect_type_aliases(&mut self, program: &ast::Program) {
+        for item in &program.items {
+            let Item::TypeAlias(declaration) = item else {
+                continue;
+            };
+            let name = declaration.name.name.as_str();
+            if primitive_type(name).is_some()
+                || self.types.names.contains_key(name)
+                || self.types.generic_templates.contains_key(name)
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3008",
+                        format!("type `{name}` is declared more than once"),
+                        declaration.name.span,
+                    )
+                    .with_help("give each type alias a unique name"),
+                );
+                continue;
+            }
+            let Some(target) = self
+                .types
+                .resolve_type_name(&declaration.target, &mut self.diagnostics)
+            else {
+                continue;
+            };
+            self.types.names.insert(name.to_owned(), target);
         }
     }
 
@@ -3591,6 +3624,7 @@ impl Resolver {
                 Item::Import(_)
                 | Item::Struct(_)
                 | Item::Enum(_)
+                | Item::TypeAlias(_)
                 | Item::Trait(_)
                 | Item::Constant(_)
                 | Item::Static(_)
@@ -9761,24 +9795,45 @@ impl<'context> FunctionAnalyzer<'context> {
 
 fn primitive_type(name: &str) -> Option<Type> {
     Some(match name {
-        "i8" => Type::I8,
-        "i16" => Type::I16,
-        "i32" => Type::I32,
-        "i64" => Type::I64,
+        "i8" | "c_schar" => Type::I8,
+        "i16" | "c_short" => Type::I16,
+        "i32" | "c_int" => Type::I32,
+        "i64" | "c_longlong" => Type::I64,
         "i128" => Type::I128,
-        "isize" => Type::Isize,
-        "u8" => Type::U8,
-        "u16" => Type::U16,
-        "u32" => Type::U32,
-        "u64" => Type::U64,
+        "isize" | "c_ptrdiff" => Type::Isize,
+        "u8" | "c_uchar" => Type::U8,
+        "u16" | "c_ushort" => Type::U16,
+        "u32" | "c_uint" => Type::U32,
+        "u64" | "c_ulonglong" => Type::U64,
         "u128" => Type::U128,
-        "usize" => Type::Usize,
-        "f32" => Type::F32,
-        "f64" => Type::F64,
+        "usize" | "c_size" => Type::Usize,
+        "f32" | "c_float" => Type::F32,
+        "f64" | "c_double" => Type::F64,
         "bool" => Type::Bool,
         "char" => Type::Char,
         "str" => Type::Str,
         "cstr" => Type::CStr,
+        "c_char" => {
+            if std::ffi::c_char::MIN == 0 {
+                Type::U8
+            } else {
+                Type::I8
+            }
+        }
+        "c_long" => {
+            if size_of::<std::ffi::c_long>() == size_of::<i32>() {
+                Type::I32
+            } else {
+                Type::I64
+            }
+        }
+        "c_ulong" => {
+            if size_of::<std::ffi::c_ulong>() == size_of::<u32>() {
+                Type::U32
+            } else {
+                Type::U64
+            }
+        }
         "never" => Type::Never,
         _ => return None,
     })
@@ -12043,6 +12098,28 @@ mod tests {
         let program = resolve_fixture(source).expect("fixture should resolve");
 
         assert_eq!(program.extern_functions.len(), 1);
+    }
+
+    #[test]
+    fn resolve_should_erase_target_correct_c_type_aliases() {
+        let source = r#"
+            pub type CInt = c_int;
+            pub type CLong = c_long;
+            extern "C" fn inspect(value: CInt, offset: CLong) -> CInt;
+            fn main() -> i32 { 42 }
+        "#;
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+        let function = &program.extern_functions[0];
+        let expected_long = if size_of::<std::ffi::c_long>() == size_of::<i32>() {
+            Type::I32
+        } else {
+            Type::I64
+        };
+
+        assert_eq!(function.parameters[0].ty, Type::I32);
+        assert_eq!(function.parameters[1].ty, expected_long);
+        assert_eq!(function.return_type, Type::I32);
     }
 
     #[test]

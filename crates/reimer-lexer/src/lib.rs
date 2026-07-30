@@ -40,6 +40,8 @@ pub enum TokenKind {
     Struct,
     /// `enum`
     Enum,
+    /// `type`
+    Type,
     /// `match`
     Match,
     /// `loop`
@@ -369,6 +371,7 @@ impl<'source> Lexer<'source> {
             "while" => TokenKind::While,
             "struct" => TokenKind::Struct,
             "enum" => TokenKind::Enum,
+            "type" => TokenKind::Type,
             "match" => TokenKind::Match,
             "loop" => TokenKind::Loop,
             "for" => TokenKind::For,
@@ -760,6 +763,13 @@ mod tests {
 
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Static));
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Mut));
+    }
+
+    #[test]
+    fn lex_should_recognize_type_aliases() {
+        let tokens = lex("pub type Index = usize;").expect("fixture should lex");
+
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Type));
     }
 
     #[test]

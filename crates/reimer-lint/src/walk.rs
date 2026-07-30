@@ -53,6 +53,9 @@ pub(crate) fn program(visitor: &mut impl Visitor, program: &ast::Program) {
                 }
                 where_predicates(visitor, &declaration.where_predicates);
             }
+            Item::TypeAlias(declaration) => {
+                type_name(visitor, &declaration.target);
+            }
             Item::Trait(declaration) => {
                 generic_parameters(visitor, &declaration.generic_parameters);
                 where_predicates(visitor, &declaration.where_predicates);

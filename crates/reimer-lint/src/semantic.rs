@@ -317,6 +317,11 @@ impl<'ast> SyntaxIndex<'ast> {
                         .type_targets
                         .insert(declaration.name.name.clone(), declaration.name.span);
                 }
+                Item::TypeAlias(declaration) => {
+                    index
+                        .type_targets
+                        .insert(declaration.name.name.clone(), declaration.name.span);
+                }
                 Item::Trait(declaration) => {
                     index
                         .type_targets

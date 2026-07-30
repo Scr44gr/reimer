@@ -420,6 +420,17 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_should_complete_target_correct_c_types_vertical_slice() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m5_c_types.reim");
+
+        let result = execute_file(&path).expect("C type program should execute");
+        let object = compile_file_to_object(&path).expect("C type program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
     fn execute_file_should_complete_explicit_integer_overflow_modes() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_integer_overflow.reim");

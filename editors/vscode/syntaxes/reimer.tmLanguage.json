@@ -188,7 +188,7 @@
           }
         },
         {
-          "match": "\\b(struct|enum|trait)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(struct|enum|trait|type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
               "name": "storage.type.reimer"
@@ -287,7 +287,7 @@
       "patterns": [
         {
           "name": "support.type.primitive.reimer",
-          "match": "\\b(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|f32|f64|bool|char|str|cstr)\\b"
+          "match": "\\b(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|f32|f64|bool|char|str|cstr|c_char|c_schar|c_uchar|c_short|c_ushort|c_int|c_uint|c_long|c_ulong|c_longlong|c_ulonglong|c_float|c_double|c_size|c_ptrdiff)\\b"
         },
         {
           "name": "support.type.core.reimer",
@@ -327,7 +327,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.reimer",
-          "match": "\\b(?:assert|debug_assert|panic|print|println|eprint|eprintln|stdin|stdout|stderr|open|create|append|exists|remove_file|rename|read_to_string|write_string|absolute|square_root|floor|ceil|round|sine|cosine|tangent|exponential|natural_logarithm|power|minimum|maximum|clamp|allocate_bytes|general_allocator|page_allocator|size_of|align_of|name|fields|variants|traits|os)\\b(?=\\s*(?:<[^;{}()]+>\\s*)?\\()"
+          "match": "\\b(?:assert|debug_assert|panic|print|println|eprint|eprintln|stdin|stdout|stderr|open|create|append|exists|remove_file|rename|read_to_string|write_string|absolute|square_root|floor|ceil|round|sine|cosine|tangent|exponential|natural_logarithm|power|minimum|maximum|clamp|null|null_const|is_null|is_null_mut|int_from_bool|bool_from_int|allocate_bytes|general_allocator|page_allocator|size_of|align_of|name|fields|variants|traits|os)\\b(?=\\s*(?:<[^;{}()]+>\\s*)?\\()"
         },
         {
           "name": "entity.name.function.call.reimer",

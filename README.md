@@ -57,6 +57,7 @@ cargo run -p reimer-cli -- run examples/m3_assertions.reim
 cargo run -p reimer-cli -- run examples/m3_filesystem.reim
 cargo run -p reimer-cli -- run examples/m3_math.reim
 cargo run -p reimer-cli -- run examples/m5_ffi.reim
+cargo run -p reimer-cli -- run examples/m5_c_types.reim
 cargo run -p reimer-cli -- run examples/m6_generics.reim
 cargo run -p reimer-cli -- run examples/m7_tensor.reim
 cargo run -p reimer-cli -- run examples/m7_matmul.reim
@@ -92,6 +93,8 @@ Safe owned file handles, UTF-8 paths, and explicit reads are documented in
 [`docs/filesystem.md`](docs/filesystem.md).
 Scalar functions and `Vec2`/`Vec3`/`Vec4` are documented in
 [`docs/mathematics.md`](docs/mathematics.md).
+Target-correct C aliases and raw-pointer helpers are documented in
+[`docs/c-interop.md`](docs/c-interop.md).
 `reimer doc` validates the complete package and writes its public `///`
 documentation to `target/reimer/doc/<package>.md`.
 

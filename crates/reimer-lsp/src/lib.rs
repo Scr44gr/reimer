@@ -189,6 +189,12 @@ impl Document {
                         "enum",
                         declaration.span,
                     ),
+                    Item::TypeAlias(declaration) => (
+                        &declaration.name.name,
+                        CompletionItemKind::TYPE_PARAMETER,
+                        "type alias",
+                        declaration.span,
+                    ),
                     Item::Trait(declaration) => (
                         &declaration.name.name,
                         CompletionItemKind::INTERFACE,
@@ -555,6 +561,14 @@ impl Document {
                 declaration.name.span,
                 Some(self.variant_symbols(&declaration.variants)),
             ),
+            Item::TypeAlias(declaration) => (
+                declaration.name.name.clone(),
+                Some("type alias".to_owned()),
+                SymbolKind::TYPE_PARAMETER,
+                declaration.span,
+                declaration.name.span,
+                None,
+            ),
             Item::Trait(declaration) => (
                 declaration.name.name.clone(),
                 Some("trait".to_owned()),
@@ -827,12 +841,43 @@ fn documented_completion(
 const LANGUAGE_KEYWORDS: &[&str] = &[
     "as", "break", "comptime", "const", "continue", "defer", "else", "enum", "extern", "false",
     "fn", "for", "from", "if", "impl", "import", "in", "let", "loop", "match", "mut", "pub",
-    "return", "struct", "trait", "true", "unsafe", "where",
+    "return", "struct", "trait", "true", "type", "unsafe", "where",
 ];
 
 const PRIMITIVE_TYPES: &[&str] = &[
-    "bool", "char", "cstr", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8",
-    "u16", "u32", "u64", "u128", "usize",
+    "bool",
+    "char",
+    "cstr",
+    "f32",
+    "f64",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "isize",
+    "str",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "usize",
+    "c_char",
+    "c_schar",
+    "c_uchar",
+    "c_short",
+    "c_ushort",
+    "c_int",
+    "c_uint",
+    "c_long",
+    "c_ulong",
+    "c_longlong",
+    "c_ulonglong",
+    "c_float",
+    "c_double",
+    "c_size",
+    "c_ptrdiff",
 ];
 
 const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
@@ -889,6 +934,40 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("minimum", CompletionItemKind::FUNCTION, "std::math"),
     ("maximum", CompletionItemKind::FUNCTION, "std::math"),
     ("clamp", CompletionItemKind::FUNCTION, "std::math"),
+    ("Void", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("Char", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("SignedChar", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("UnsignedChar", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("Short", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    (
+        "UnsignedShort",
+        CompletionItemKind::TYPE_PARAMETER,
+        "std::c",
+    ),
+    ("Int", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("UnsignedInt", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("Long", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("UnsignedLong", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("LongLong", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    (
+        "UnsignedLongLong",
+        CompletionItemKind::TYPE_PARAMETER,
+        "std::c",
+    ),
+    ("Float", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("Double", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("Size", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("PtrDiff", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("Str", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("Bool", CompletionItemKind::TYPE_PARAMETER, "std::c"),
+    ("ConstBuffer", CompletionItemKind::STRUCT, "std::c"),
+    ("Buffer", CompletionItemKind::STRUCT, "std::c"),
+    ("null", CompletionItemKind::FUNCTION, "std::c"),
+    ("null_const", CompletionItemKind::FUNCTION, "std::c"),
+    ("is_null", CompletionItemKind::FUNCTION, "std::c"),
+    ("is_null_mut", CompletionItemKind::FUNCTION, "std::c"),
+    ("int_from_bool", CompletionItemKind::FUNCTION, "std::c"),
+    ("bool_from_int", CompletionItemKind::FUNCTION, "std::c"),
     (
         "size_of",
         CompletionItemKind::FUNCTION,
@@ -1973,6 +2052,59 @@ fn main() -> i32 {
                 .contains("Three-dimensional single-precision vector.")
         );
         assert!(!binding_contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_target_correct_c_helper_documentation() {
+        let source = "from std::c import Int, int_from_bool;
+fn main() -> i32 {
+    let code: Int = int_from_bool(true);
+    code
+}
+";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let lines = LineIndex::new(Arc::from(source));
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+        let call_position = lines.position(
+            source
+                .find("int_from_bool(true")
+                .expect("C helper call should exist"),
+        );
+        let binding_position =
+            lines.position(source.find("code:").expect("C alias binding should exist"));
+
+        let call_hover = document
+            .hover(call_position)
+            .expect("C helper call should have hover information");
+        let binding_hover = document
+            .hover(binding_position)
+            .expect("C alias binding should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(call_contents) = call_hover.contents else {
+            panic!("C helper call hover should use markdown");
+        };
+        let tower_lsp::lsp_types::HoverContents::Markup(binding_contents) = binding_hover.contents
+        else {
+            panic!("C alias binding hover should use markdown");
+        };
+
+        assert!(call_contents.value.contains("fn std::c::int_from_bool"));
+        assert!(
+            call_contents
+                .value
+                .contains("conventional C integer representation")
+        );
+        assert!(binding_contents.value.contains("i32"));
+        assert!(!binding_contents.value.contains("__module_"));
+        assert!(
+            document
+                .completions()
+                .iter()
+                .any(|completion| completion.label == "Int")
+        );
     }
 
     #[test]

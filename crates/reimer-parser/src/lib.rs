@@ -13,8 +13,8 @@ use reimer_ast::{
     LetStatement, LoopExpression, MatchArm, MatchExpression, Parameter, Path, Pattern,
     PatternField, Program, ReturnStatement, Statement, StaticDeclaration, StringLiteral,
     StructDeclaration, StructExpression, StructField, TraitDeclaration, TraitMethod,
-    TupleExpression, TypeName, TypeNameKind, UnaryExpression, UnaryOperator, WherePredicate,
-    WhileStatement,
+    TupleExpression, TypeAliasDeclaration, TypeName, TypeNameKind, UnaryExpression, UnaryOperator,
+    WherePredicate, WhileStatement,
 };
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_lexer::{Token, TokenKind};
@@ -134,6 +134,15 @@ impl<'tokens> Parser<'tokens> {
                 .map(|declaration| vec![Item::Enum(declaration)]);
         }
 
+        if self.at_optional_public(&TokenKind::Type) {
+            if !attributes.is_empty() {
+                return self.unsupported_attribute_target(&attributes, "type alias");
+            }
+            return self
+                .parse_type_alias()
+                .map(|declaration| vec![Item::TypeAlias(declaration)]);
+        }
+
         if self.at(&TokenKind::From)
             || self.at(&TokenKind::Import)
             || (self.at(&TokenKind::Pub)
@@ -150,7 +159,7 @@ impl<'tokens> Parser<'tokens> {
         let token = self.current();
         self.diagnostics.push(
             Diagnostic::error("E1001", "expected a declaration", token.span).with_help(
-                "start with `fn`, `const`, `static`, `comptime`, `struct`, `enum`, `trait`, `impl`, `extern`, or an import",
+                "start with `fn`, `const`, `static`, `comptime`, `struct`, `enum`, `type`, `trait`, `impl`, `extern`, or an import",
             ),
         );
         None
@@ -393,6 +402,22 @@ impl<'tokens> Parser<'tokens> {
             name,
             payload,
             span: Span::new(start, end),
+        })
+    }
+
+    fn parse_type_alias(&mut self) -> Option<TypeAliasDeclaration> {
+        let start = self.current().span.start;
+        let is_public = self.take(&TokenKind::Pub).is_some();
+        self.expect_symbol(&TokenKind::Type, "`type`")?;
+        let name = self.expect_identifier("type alias name")?;
+        self.expect_symbol(&TokenKind::Equal, "`=` after the type alias name")?;
+        let target = self.parse_type_name()?;
+        let end = self.expect_symbol(&TokenKind::Semicolon, "`;` after the type alias")?;
+        Some(TypeAliasDeclaration {
+            is_public,
+            name,
+            target,
+            span: Span::new(start, end.span.end),
         })
     }
 
@@ -2288,6 +2313,20 @@ mod tests {
             return_statement.value,
             Some(Expression::Integer(integer)) if integer.value == 42
         ));
+    }
+
+    #[test]
+    fn parse_should_build_public_type_alias() {
+        let tokens = lex("pub type Index = usize;").expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+        let Item::TypeAlias(declaration) = &program.items[0] else {
+            panic!("expected type alias");
+        };
+
+        assert!(declaration.is_public);
+        assert_eq!(declaration.name.name, "Index");
+        assert!(matches!(declaration.target.kind, TypeNameKind::Path(_)));
     }
 
     #[test]
