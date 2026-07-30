@@ -1,0 +1,29 @@
+fn adjust(value: &mut i32) {
+    *value += 2;
+}
+
+fn sum(values: &[i32]) -> i32 {
+    let mut total = 0;
+    for value in values {
+        total += value;
+    }
+    total
+}
+
+fn title_code(title: str) -> i32 {
+    0
+}
+
+fn main() -> i32 {
+    let mut value = 18;
+    adjust(&mut value);
+
+    let values: [i32; 2] = [value, 22];
+    let view: &[i32] = &values;
+    let raw: *mut i32 = &mut value as *mut i32;
+    unsafe {
+        *raw -= 2;
+    }
+
+    sum(view) + title_code("Reimer")
+}

@@ -1,0 +1,54 @@
+from std::alloc import general_allocator;
+from std::job import JobError, JobPool, JobPoolConfig, chunk_len;
+from std::tensor import TensorError, tensor;
+
+fn double_chunk(values: &mut [i32]) {
+    let mut index: usize = 0;
+    let length = chunk_len(values);
+    while index < length {
+        values[index] *= 2;
+        index += 1;
+    }
+}
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let created_pool: Result<JobPool, JobError> =
+        JobPool::init(&allocator, JobPoolConfig::fixed(2));
+    let mut pool = match created_pool {
+        Ok(value) => value,
+        Err(_) => {
+            return 1;
+        },
+    };
+    let created_tensor: Result<tensor<i32, 1>, TensorError> =
+        tensor::filled(&allocator, [4], 21);
+    let mut values = match created_tensor {
+        Ok(value) => value,
+        Err(_) => {
+            pool.deinit();
+            return 2;
+        },
+    };
+    let parallel = values.parallel_for_mut(
+        &pool,
+        double_chunk,
+        2,
+    );
+    let completed = match parallel {
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    let first = values.get_flat(0);
+    let observed = match first {
+        Some(value) => value,
+        None => 0,
+    };
+    values.deinit();
+    pool.deinit();
+    if completed {
+        observed
+    } else {
+        3
+    }
+}

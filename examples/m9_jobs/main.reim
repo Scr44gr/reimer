@@ -1,0 +1,79 @@
+from std::alloc import general_allocator;
+from std::job import Job, JobError, JobPool, JobPoolConfig, chunk_len, parallel_for_array_mut;
+
+fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+fn increment_chunk(values: &mut [i32]) {
+    let mut index: usize = 0;
+    let length = chunk_len(values);
+    while index < length {
+        values[index] += 1;
+        index += 1;
+    }
+}
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let config = JobPoolConfig::fixed(3);
+    let created: Result<JobPool, JobError> =
+        JobPool::init(&allocator, config);
+    let mut pool = match created {
+        Ok(value) => value,
+        Err(_) => {
+            return 1;
+        },
+    };
+    let first: Result<Job<i32>, JobError> =
+        pool.submit(add_one, 19);
+    let second: Result<Job<i32>, JobError> =
+        pool.submit(add_one, 21);
+    let first = match first {
+        Ok(value) => value,
+        Err(_) => {
+            return 2;
+        },
+    };
+    let second = match second {
+        Ok(value) => value,
+        Err(_) => {
+            return 3;
+        },
+    };
+    let left = match first.wait() {
+        Ok(value) => value,
+        Err(_) => {
+            return 4;
+        },
+    };
+    let right = match second.wait() {
+        Ok(value) => value,
+        Err(_) => {
+            return 5;
+        },
+    };
+    let mut values = [1, 2, 3, 4];
+    let parallel = parallel_for_array_mut(
+        &pool,
+        &mut values,
+        increment_chunk,
+        2,
+    );
+    match parallel {
+        Ok(_) => (),
+        Err(_) => {
+            return 6;
+        },
+    }
+    let valid = values[0] == 2
+        && values[1] == 3
+        && values[2] == 4
+        && values[3] == 5;
+    pool.deinit();
+    if valid {
+        left + right
+    } else {
+        7
+    }
+}

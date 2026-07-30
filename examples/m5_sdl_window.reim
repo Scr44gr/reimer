@@ -1,0 +1,72 @@
+pub enum WindowError {
+    InitializationFailed,
+    CreationFailed,
+}
+
+pub struct Window {
+    raw: *mut (),
+}
+
+@link("SDL3")
+extern "C" {
+    fn SDL_Init(flags: u32) -> bool;
+    fn SDL_CreateWindow(
+        title: cstr,
+        width: i32,
+        height: i32,
+        flags: u64,
+    ) -> *mut ();
+    fn SDL_Delay(milliseconds: u32);
+    fn SDL_DestroyWindow(window: *mut ());
+    fn SDL_Quit();
+}
+
+pub fn open_window(
+    width: i32,
+    height: i32,
+    title: cstr,
+) -> Result<Window, WindowError> {
+    let initialized = unsafe { SDL_Init(32) };
+    if !initialized {
+        return Err(WindowError::InitializationFailed);
+    }
+
+    let raw = unsafe { SDL_CreateWindow(title, width, height, 0) };
+    if raw as usize == 0 {
+        unsafe {
+            SDL_Quit();
+        }
+        Err(WindowError::CreationFailed)
+    } else {
+        Ok(Window { raw: raw })
+    }
+}
+
+impl Window {
+    pub fn show_for(&self, milliseconds: u32) {
+        unsafe {
+            SDL_Delay(milliseconds);
+        }
+    }
+
+    pub fn close(self) {
+        unsafe {
+            SDL_DestroyWindow(self.raw);
+            SDL_Quit();
+        }
+    }
+}
+
+fn run() -> Result<i32, WindowError> {
+    let window = open_window(640, 360, c"SDL window from the language")?;
+    defer window.close();
+    window.show_for(250);
+    Ok(42)
+}
+
+fn main() -> i32 {
+    match run() {
+        Ok(value) => value,
+        Err(_) => 0,
+    }
+}

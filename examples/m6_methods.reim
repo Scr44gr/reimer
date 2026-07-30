@@ -1,0 +1,23 @@
+struct Counter {
+    value: i32,
+}
+
+impl Counter {
+    fn new(value: i32) -> Counter {
+        Counter { value: value }
+    }
+
+    fn add(&mut self, amount: i32) {
+        self.value += amount;
+    }
+
+    fn get(&self) -> i32 {
+        self.value
+    }
+}
+
+fn main() -> i32 {
+    let mut counter = Counter::new(40);
+    counter.add(2);
+    counter.get()
+}

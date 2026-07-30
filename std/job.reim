@@ -1,0 +1,125 @@
+from std::alloc import Allocator;
+
+pub enum JobError {
+    PoolCreateFailed,
+    SubmitFailed,
+    InvalidHandle,
+    WorkerPanicked,
+    ResultMismatch,
+}
+
+pub struct JobPoolConfig {
+    workers: usize,
+}
+
+pub struct JobPool {
+    raw: usize,
+    allocator: usize,
+}
+
+pub struct Job<T> {
+    raw: usize,
+}
+
+@link("runtime")
+extern "C" {
+    fn job_pool_create(worker_count: usize) -> usize;
+    fn job_pool_clone(handle: usize) -> usize;
+    fn job_pool_destroy(handle: usize) -> i32;
+}
+
+impl JobPoolConfig {
+    pub fn fixed(workers: usize) -> JobPoolConfig {
+        JobPoolConfig { workers: workers }
+    }
+}
+
+impl JobPool {
+    pub fn init(
+        allocator: &Allocator,
+        config: JobPoolConfig,
+    ) -> Result<JobPool, JobError> {
+        let raw = unsafe { job_pool_create(config.workers) };
+        if raw == 0 {
+            Err(JobError::PoolCreateFailed)
+        } else {
+            Ok(JobPool {
+                raw: raw,
+                allocator: allocator.opaque_handle(),
+            })
+        }
+    }
+
+    pub fn clone(&self) -> JobPool {
+        let raw = unsafe { job_pool_clone((*self).raw) };
+        if raw == 0 {
+            panic("std::job received an invalid pool handle")
+        } else {
+            JobPool {
+                raw: raw,
+                allocator: (*self).allocator,
+            }
+        }
+    }
+
+    pub fn submit<A: Send, T: Send>(
+        &self,
+        callback: fn(A) -> T,
+        argument: A,
+    ) -> Result<Job<T>, JobError> {
+        let submitted: Result<usize, JobError> =
+            __job_submit((*self).raw, callback, argument);
+        let raw = submitted?;
+        Ok(Job { raw: raw })
+    }
+
+    pub fn deinit(&mut self) {
+        let status = unsafe { job_pool_destroy((*self).raw) };
+        if status == 0 {
+            self.raw = 0;
+        } else {
+            panic("std::job received an invalid pool handle")
+        }
+    }
+}
+
+impl<T: Send> Job<T> {
+    pub fn wait(self) -> Result<T, JobError> {
+        __job_wait(self.raw)
+    }
+}
+
+pub fn chunk_len<T>(values: &mut [T]) -> usize {
+    __slice_length(values)
+}
+
+pub fn parallel_for_mut<T: Send>(
+    pool: &JobPool,
+    values: &mut [T],
+    callback: fn(&mut [T]) -> (),
+    minimum_chunk: usize,
+) -> Result<(), JobError> {
+    __parallel_for_mut(
+        (*pool).raw,
+        values,
+        callback,
+        minimum_chunk,
+    )
+}
+
+pub fn parallel_for_array_mut<
+    T: Send,
+    const Length: usize,
+>(
+    pool: &JobPool,
+    values: &mut [T; Length],
+    callback: fn(&mut [T]) -> (),
+    minimum_chunk: usize,
+) -> Result<(), JobError> {
+    __parallel_for_array_mut(
+        (*pool).raw,
+        values,
+        callback,
+        minimum_chunk,
+    )
+}

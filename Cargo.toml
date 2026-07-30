@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/reimer-ast",
+    "crates/reimer-cli",
+    "crates/reimer-codegen-native",
+    "crates/reimer-diagnostics",
+    "crates/reimer-hir",
+    "crates/reimer-lexer",
+    "crates/reimer-lint",
+    "crates/reimer-lsp",
+    "crates/reimer-parser",
+    "crates/reimer-package",
+    "crates/reimer-project",
+    "crates/reimer-resolver",
+    "crates/reimer-runtime",
+    "crates/reimer-types",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+future-incompatible = "warn"
+nonstandard-style = "deny"
+unsafe-code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+pedantic = { level = "warn", priority = 5 }

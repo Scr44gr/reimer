@@ -1,0 +1,105 @@
+from std::thread import AtomicU64, Barrier, Channel, ChannelError, Mutex, RwLock, Semaphore, Thread, ThreadError, ThreadLocal;
+
+struct SharedWork {
+    mutex: Mutex<i32>,
+    rwlock: RwLock<i32>,
+    channel: Channel<i32>,
+    barrier: Barrier,
+    semaphore: Semaphore,
+    atomic: AtomicU64,
+    local: ThreadLocal<i32>,
+}
+
+fn update_shared(work: SharedWork) -> i32 {
+    let mut work = work;
+    work.barrier.wait();
+    work.semaphore.acquire();
+    let previous = work.mutex.replace(20);
+    work.rwlock.replace(30);
+    work.atomic.fetch_add(2);
+    work.local.set(99);
+    let local_value = work.local.get();
+    let sent = work.channel.send(previous);
+
+    work.mutex.deinit();
+    work.rwlock.deinit();
+    work.channel.deinit();
+    work.barrier.deinit();
+    work.semaphore.deinit();
+    work.atomic.deinit();
+    work.local.deinit();
+
+    match sent {
+        Ok(_) => local_value,
+        Err(_) => -1,
+    }
+}
+
+fn main() -> i32 {
+    let mut mutex = Mutex::new(10);
+    let mut rwlock = RwLock::new(15);
+    let mut channel: Channel<i32> = Channel::bounded(1);
+    let mut barrier = Barrier::new(2);
+    let mut semaphore = Semaphore::new(0);
+    let mut atomic = AtomicU64::new(40);
+    let mut local = ThreadLocal::new(5);
+
+    let work = SharedWork {
+        mutex: mutex.clone(),
+        rwlock: rwlock.clone(),
+        channel: channel.clone(),
+        barrier: barrier.clone(),
+        semaphore: semaphore.clone(),
+        atomic: atomic.clone(),
+        local: local.clone(),
+    };
+    let started: Result<Thread<i32>, ThreadError> =
+        Thread::spawn(update_shared, work);
+    let thread = match started {
+        Ok(value) => value,
+        Err(_) => {
+            return 2;
+        },
+    };
+    barrier.wait();
+    semaphore.release(1);
+    let incoming: Result<i32, ChannelError> = channel.receive();
+    let received = match incoming {
+        Ok(value) => value,
+        Err(_) => {
+            return 3;
+        },
+    };
+    let worker_local = match thread.join() {
+        Ok(value) => value,
+        Err(_) => {
+            return 4;
+        },
+    };
+    let mutex_value = mutex.load();
+    let rwlock_value = rwlock.load();
+    let atomic_value = atomic.load();
+    let main_local = local.get();
+
+    let result = if received == 10
+        && mutex_value == 20
+        && rwlock_value == 30
+        && atomic_value == 42
+        && main_local == 5
+        && worker_local == 99
+    {
+        42
+    } else {
+        1
+    };
+
+    mutex.deinit();
+    rwlock.deinit();
+    channel.close();
+    channel.deinit();
+    barrier.deinit();
+    semaphore.deinit();
+    atomic.deinit();
+    local.deinit();
+    result
+}

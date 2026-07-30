@@ -1,0 +1,24 @@
+from std::io import IoError, stderr, stdout;
+
+fn exercise_output() -> Result<i32, IoError> {
+    let output = stdout();
+    let errors = stderr();
+
+    if output.write("")? != 0 {
+        return Ok(0);
+    }
+    output.write_all("")?;
+    output.flush()?;
+    errors.write_all("")?;
+    errors.flush()?;
+    output.is_terminal();
+    errors.is_terminal();
+    Ok(42)
+}
+
+fn main() -> i32 {
+    match exercise_output() {
+        Ok(value) => value,
+        Err(_) => 0,
+    }
+}

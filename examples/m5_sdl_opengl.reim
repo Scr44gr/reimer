@@ -1,0 +1,117 @@
+pub enum GraphicsError {
+    InitializationFailed,
+    WindowCreationFailed,
+    ContextCreationFailed,
+    FramePresentationFailed,
+}
+
+pub struct Graphics {
+    window: *mut (),
+    context: *mut (),
+}
+
+@link("SDL3")
+extern "C" {
+    fn SDL_Init(flags: u32) -> bool;
+    fn SDL_CreateWindow(
+        title: cstr,
+        width: i32,
+        height: i32,
+        flags: u64,
+    ) -> *mut ();
+    fn SDL_GL_CreateContext(window: *mut ()) -> *mut ();
+    fn SDL_GL_DestroyContext(context: *mut ()) -> bool;
+    fn SDL_GL_SwapWindow(window: *mut ()) -> bool;
+    fn SDL_Delay(milliseconds: u32);
+    fn SDL_DestroyWindow(window: *mut ());
+    fn SDL_Quit();
+}
+
+@link("opengl32")
+extern "C" {
+    fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32);
+    fn glClear(mask: u32);
+}
+
+pub fn open_graphics(
+    width: i32,
+    height: i32,
+    title: cstr,
+) -> Result<Graphics, GraphicsError> {
+    let video_subsystem: u32 = 32;
+    let opengl_window: u64 = 2;
+
+    if !unsafe { SDL_Init(video_subsystem) } {
+        return Err(GraphicsError::InitializationFailed);
+    }
+
+    let window = unsafe {
+        SDL_CreateWindow(title, width, height, opengl_window)
+    };
+    if window as usize == 0 {
+        unsafe {
+            SDL_Quit();
+        }
+        return Err(GraphicsError::WindowCreationFailed);
+    }
+
+    let context = unsafe { SDL_GL_CreateContext(window) };
+    if context as usize == 0 {
+        unsafe {
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+        }
+        Err(GraphicsError::ContextCreationFailed)
+    } else {
+        Ok(Graphics {
+            window: window,
+            context: context,
+        })
+    }
+}
+
+impl Graphics {
+    pub fn draw_frame(&self) -> Result<(), GraphicsError> {
+        let color_buffer: u32 = 16384;
+        unsafe {
+            glClearColor(0.08, 0.20, 0.38, 1.0);
+            glClear(color_buffer);
+        }
+
+        if unsafe { SDL_GL_SwapWindow(self.window) } {
+            Ok(())
+        } else {
+            Err(GraphicsError::FramePresentationFailed)
+        }
+    }
+
+    pub fn show_for(&self, milliseconds: u32) {
+        unsafe {
+            SDL_Delay(milliseconds);
+        }
+    }
+
+    pub fn close(self) {
+        unsafe {
+            SDL_GL_DestroyContext(self.context);
+            SDL_DestroyWindow(self.window);
+            SDL_Quit();
+        }
+    }
+}
+
+fn run() -> Result<i32, GraphicsError> {
+    let graphics = open_graphics(800, 450, c"SDL3 + OpenGL")?;
+    defer graphics.close();
+    graphics.draw_frame()?;
+    graphics.show_for(1200);
+
+    Ok(42)
+}
+
+fn main() -> i32 {
+    match run() {
+        Ok(value) => value,
+        Err(_) => 0,
+    }
+}

@@ -1,0 +1,83 @@
+from std::alloc import AllocError, general_allocator;
+from std::collections import HashMap, HashSet, RingBuffer;
+
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let numbers = "123\n";
+    let map_result: Result<HashMap<i32, i32>, AllocError> =
+        HashMap::new(&allocator);
+    let mut map = match map_result {
+        Ok(value) => value,
+        Err(_) => {
+            return 1;
+        },
+    };
+    defer map.deinit();
+    match map.insert(1, 20) {
+        Ok(_) => (),
+        Err(_) => {
+            return 2;
+        },
+    }
+
+    let set_result: Result<HashSet<i32>, AllocError> =
+        HashSet::new(&allocator);
+    let mut set = match set_result {
+        Ok(value) => value,
+        Err(_) => {
+            return 3;
+        },
+    };
+    defer set.deinit();
+    match set.insert(7) {
+        Ok(_) => (),
+        Err(_) => {
+            return 4;
+        },
+    }
+
+    let ring_result: Result<RingBuffer<i32>, AllocError> =
+        RingBuffer::with_capacity(&allocator, 2);
+    let mut ring = match ring_result {
+        Ok(value) => value,
+        Err(_) => {
+            return 5;
+        },
+    };
+    defer ring.deinit();
+    match ring.push(1) {
+        Ok(_) => (),
+        Err(_) => {
+            return 6;
+        },
+    }
+    match ring.push(21) {
+        Ok(_) => (),
+        Err(_) => {
+            return 7;
+        },
+    }
+    match ring.push(22) {
+        Ok(_) => (),
+        Err(_) => {
+            return 8;
+        },
+    }
+
+    let mapped = match map.get(1) {
+        Some(value) => value,
+        None => 0,
+    };
+    let present = if set.contains(7) { 1 } else { 0 };
+    let buffered = match ring.get(1) {
+        Some(value) => value,
+        None => 0,
+    };
+    let removed = match map.remove(1) {
+        Some(20) => 1,
+        Some(_) => 0,
+        None => 0,
+    };
+    mapped - present + buffered + removed
+}

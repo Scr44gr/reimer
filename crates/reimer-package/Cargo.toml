@@ -1,0 +1,19 @@
+[package]
+name = "reimer-package"
+description = "Static multi-file module loader and import resolver for Reimer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reimer-ast = { path = "../reimer-ast" }
+reimer-diagnostics = { path = "../reimer-diagnostics" }
+reimer-lexer = { path = "../reimer-lexer" }
+reimer-parser = { path = "../reimer-parser" }
+
+[dev-dependencies]
+reimer-resolver = { path = "../reimer-resolver" }
+
+[lints]
+workspace = true

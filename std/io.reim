@@ -1,0 +1,379 @@
+from std::alloc import Allocator, OwnedBytes, allocate_bytes;
+from std::string import String, from_initialized_bytes;
+
+pub enum IoError {
+    Failed,
+    UnexpectedEndOfInput,
+    OutOfMemory,
+    InvalidData,
+}
+
+pub struct Stdin {}
+
+pub struct Stdout {}
+
+pub struct Stderr {}
+
+pub struct InputBuffer {
+    bytes: OwnedBytes,
+    len: usize,
+}
+
+@link("runtime")
+extern "C" {
+    fn output_write(stream: u8, data: *const u8, len: usize) -> isize;
+    fn output_write_all(
+        stream: u8,
+        data: *const u8,
+        len: usize,
+        append_newline: bool,
+    ) -> i32;
+    fn output_flush(stream: u8) -> i32;
+    fn output_is_terminal(stream: u8) -> bool;
+    fn input_read(data: *mut u8, capacity: usize) -> isize;
+    fn input_read_exact(data: *mut u8, len: usize) -> isize;
+    fn input_read_line(data: *mut u8, capacity: usize) -> isize;
+    fn input_read_to_end(data: *mut u8, capacity: usize) -> isize;
+    fn input_is_terminal() -> bool;
+    fn buffer_equals(
+        left: *const u8,
+        left_len: usize,
+        right: *const u8,
+        right_len: usize,
+    ) -> bool;
+}
+
+pub fn stdin() -> Stdin {
+    Stdin {}
+}
+
+pub fn stdout() -> Stdout {
+    Stdout {}
+}
+
+pub fn stderr() -> Stderr {
+    Stderr {}
+}
+
+pub fn print(value: str) -> Result<(), IoError> {
+    write_text_all(1, value, false)
+}
+
+pub fn println(value: str) -> Result<(), IoError> {
+    write_text_all(1, value, true)
+}
+
+pub fn eprint(value: str) -> Result<(), IoError> {
+    write_text_all(2, value, false)
+}
+
+pub fn eprintln(value: str) -> Result<(), IoError> {
+    write_text_all(2, value, true)
+}
+
+fn write_text(stream: u8, value: str) -> Result<usize, IoError> {
+    let written = unsafe {
+        output_write(stream, __string_data(value), __string_length(value))
+    };
+    if written < 0 {
+        Err(IoError::Failed)
+    } else {
+        Ok(written as usize)
+    }
+}
+
+fn write_text_all(
+    stream: u8,
+    value: str,
+    append_newline: bool,
+) -> Result<(), IoError> {
+    let status = unsafe {
+        output_write_all(
+            stream,
+            __string_data(value),
+            __string_length(value),
+            append_newline,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(IoError::Failed)
+    }
+}
+
+fn write_input_buffer(
+    stream: u8,
+    buffer: &InputBuffer,
+) -> Result<usize, IoError> {
+    let written = unsafe {
+        output_write(stream, buffer.bytes.as_ptr(), buffer.len)
+    };
+    if written < 0 {
+        Err(IoError::Failed)
+    } else {
+        Ok(written as usize)
+    }
+}
+
+fn write_input_buffer_all(
+    stream: u8,
+    buffer: &InputBuffer,
+) -> Result<(), IoError> {
+    let status = unsafe {
+        output_write_all(stream, buffer.bytes.as_ptr(), buffer.len, false)
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(IoError::Failed)
+    }
+}
+
+fn flush_output(stream: u8) -> Result<(), IoError> {
+    let status = unsafe { output_flush(stream) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(IoError::Failed)
+    }
+}
+
+fn allocate_input_buffer(
+    allocator: &Allocator,
+    capacity: usize,
+) -> Result<OwnedBytes, IoError> {
+    match allocate_bytes(allocator, capacity) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => Err(IoError::OutOfMemory),
+    }
+}
+
+fn finish_input(
+    bytes: OwnedBytes,
+    initialized: isize,
+) -> Result<InputBuffer, IoError> {
+    if initialized < 0 {
+        bytes.deinit();
+        if initialized == -2 {
+            Err(IoError::UnexpectedEndOfInput)
+        } else {
+            Err(IoError::Failed)
+        }
+    } else {
+        Ok(InputBuffer {
+            bytes: bytes,
+            len: initialized as usize,
+        })
+    }
+}
+
+fn read_input_once(
+    allocator: &Allocator,
+    capacity: usize,
+) -> Result<InputBuffer, IoError> {
+    let mut bytes = allocate_input_buffer(allocator, capacity)?;
+    let initialized = unsafe {
+        input_read(bytes.as_mut_ptr(), capacity)
+    };
+    finish_input(bytes, initialized)
+}
+
+fn read_input_exact(
+    allocator: &Allocator,
+    len: usize,
+) -> Result<InputBuffer, IoError> {
+    let mut bytes = allocate_input_buffer(allocator, len)?;
+    let initialized = unsafe {
+        input_read_exact(bytes.as_mut_ptr(), len)
+    };
+    finish_input(bytes, initialized)
+}
+
+fn read_input_line(
+    allocator: &Allocator,
+    capacity: usize,
+) -> Result<InputBuffer, IoError> {
+    let mut bytes = allocate_input_buffer(allocator, capacity)?;
+    let initialized = unsafe {
+        input_read_line(bytes.as_mut_ptr(), capacity)
+    };
+    finish_input(bytes, initialized)
+}
+
+fn read_input_to_end(
+    allocator: &Allocator,
+    capacity: usize,
+) -> Result<InputBuffer, IoError> {
+    let mut bytes = allocate_input_buffer(allocator, capacity)?;
+    let initialized = unsafe {
+        input_read_to_end(bytes.as_mut_ptr(), capacity)
+    };
+    finish_input(bytes, initialized)
+}
+
+impl Stdin {
+    pub fn read(
+        &self,
+        allocator: &Allocator,
+        capacity: usize,
+    ) -> Result<InputBuffer, IoError> {
+        read_input_once(allocator, capacity)
+    }
+
+    pub fn read_exact(
+        &self,
+        allocator: &Allocator,
+        len: usize,
+    ) -> Result<InputBuffer, IoError> {
+        read_input_exact(allocator, len)
+    }
+
+    pub fn read_line(
+        &self,
+        allocator: &Allocator,
+        capacity: usize,
+    ) -> Result<InputBuffer, IoError> {
+        read_input_line(allocator, capacity)
+    }
+
+    pub fn read_to_end(
+        &self,
+        allocator: &Allocator,
+        capacity: usize,
+    ) -> Result<InputBuffer, IoError> {
+        read_input_to_end(allocator, capacity)
+    }
+
+    pub fn read_line_string(
+        &self,
+        allocator: &Allocator,
+        capacity: usize,
+    ) -> Result<String, IoError> {
+        let buffer = read_input_line(allocator, capacity)?;
+        buffer.into_string()
+    }
+
+    pub fn read_to_string(
+        &self,
+        allocator: &Allocator,
+        capacity: usize,
+    ) -> Result<String, IoError> {
+        let buffer = read_input_to_end(allocator, capacity)?;
+        buffer.into_string()
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        unsafe { input_is_terminal() }
+    }
+}
+
+impl Stdout {
+    pub fn write(&self, value: str) -> Result<usize, IoError> {
+        write_text(1, value)
+    }
+
+    pub fn write_all(&self, value: str) -> Result<(), IoError> {
+        write_text_all(1, value, false)
+    }
+
+    pub fn write_line(&self, value: str) -> Result<(), IoError> {
+        write_text_all(1, value, true)
+    }
+
+    pub fn write_buffer(
+        &self,
+        buffer: &InputBuffer,
+    ) -> Result<usize, IoError> {
+        write_input_buffer(1, buffer)
+    }
+
+    pub fn write_buffer_all(
+        &self,
+        buffer: &InputBuffer,
+    ) -> Result<(), IoError> {
+        write_input_buffer_all(1, buffer)
+    }
+
+    pub fn flush(&self) -> Result<(), IoError> {
+        flush_output(1)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        unsafe { output_is_terminal(1) }
+    }
+}
+
+impl Stderr {
+    pub fn write(&self, value: str) -> Result<usize, IoError> {
+        write_text(2, value)
+    }
+
+    pub fn write_all(&self, value: str) -> Result<(), IoError> {
+        write_text_all(2, value, false)
+    }
+
+    pub fn write_line(&self, value: str) -> Result<(), IoError> {
+        write_text_all(2, value, true)
+    }
+
+    pub fn write_buffer(
+        &self,
+        buffer: &InputBuffer,
+    ) -> Result<usize, IoError> {
+        write_input_buffer(2, buffer)
+    }
+
+    pub fn write_buffer_all(
+        &self,
+        buffer: &InputBuffer,
+    ) -> Result<(), IoError> {
+        write_input_buffer_all(2, buffer)
+    }
+
+    pub fn flush(&self) -> Result<(), IoError> {
+        flush_output(2)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        unsafe { output_is_terminal(2) }
+    }
+}
+
+impl InputBuffer {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn matches(&self, value: str) -> bool {
+        unsafe {
+            buffer_equals(
+                self.bytes.as_ptr(),
+                self.len,
+                __string_data(value),
+                __string_length(value),
+            )
+        }
+    }
+
+    pub fn into_string(self) -> Result<String, IoError> {
+        let len = self.len;
+        let bytes = self.bytes;
+        match from_initialized_bytes(bytes, len) {
+            Ok(value) => Ok(value),
+            Err(_) => Err(IoError::InvalidData),
+        }
+    }
+
+    pub fn deinit(self) {
+        self.bytes.deinit();
+    }
+}

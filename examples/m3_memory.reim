@@ -1,0 +1,29 @@
+struct Resource {
+    value: i32,
+}
+
+fn consume(resource: Resource) -> i32 {
+    resource.value
+}
+
+fn record(log: &mut i32, digit: i32) {
+    *log = *log * 10 + digit;
+}
+
+fn scoped(log: &mut i32) {
+    defer record(log, 1);
+    defer record(log, 2);
+}
+
+fn main() -> i32 {
+    let resource = Resource { value: 20 };
+    let moved = resource;
+    let mut cleanup_log = 0;
+    scoped(&mut cleanup_log);
+
+    if consume(moved) + cleanup_log + 1 == 42 {
+        42
+    } else {
+        panic("invalid ownership or defer behavior")
+    }
+}

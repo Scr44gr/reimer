@@ -1,0 +1,5 @@
+from vectors import answer;
+
+pub fn combined() -> i32 {
+    answer()
+}

@@ -1,0 +1,46 @@
+fn maybe(flag: bool) -> Option<i32> {
+    if flag {
+        Some(42)
+    } else {
+        None
+    }
+}
+
+fn forward(flag: bool) -> Option<i32> {
+    let value = maybe(flag)?;
+    Some(value)
+}
+
+fn fallible(flag: bool) -> Result<i32, i32> {
+    if flag {
+        Ok(42)
+    } else {
+        Err(7)
+    }
+}
+
+fn relay(flag: bool) -> Result<i32, i32> {
+    let value = fallible(flag)?;
+    Ok(value)
+}
+
+fn main() -> i32 {
+    let success = match forward(true) {
+        Some(value) => value,
+        None => 0,
+    };
+    let optional_failure = match forward(false) {
+        Some(_) => 0,
+        None => 1,
+    };
+    let result_failure = match relay(false) {
+        Ok(_) => 0,
+        Err(code) => code,
+    };
+
+    if success == 42 && optional_failure == 1 && result_failure == 7 {
+        42
+    } else {
+        0
+    }
+}

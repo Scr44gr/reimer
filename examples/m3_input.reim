@@ -1,0 +1,18 @@
+from std::alloc import general_allocator;
+from std::io import IoError, stdin;
+
+fn receive_answer() -> Result<i32, IoError> {
+    let allocator = general_allocator();
+    let input = stdin();
+    let line = input.read_line_string(&allocator, 64)?;
+    let result = if line.matches("answer\n") { 42 } else { 0 };
+    line.deinit();
+    Ok(result)
+}
+
+fn main() -> i32 {
+    match receive_answer() {
+        Ok(value) => value,
+        Err(_) => 0,
+    }
+}

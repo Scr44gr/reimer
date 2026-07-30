@@ -1,0 +1,45 @@
+from std::alloc import general_allocator;
+from std::tensor import tensor;
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let left_shape: [usize; 2] = [1, 2];
+    let right_shape: [usize; 2] = [2, 1];
+    let output_shape: [usize; 2] = [1, 1];
+    let mut left: tensor<f32, 2> =
+        match tensor::zeros(&allocator, left_shape) {
+            Ok(value) => value,
+            Err(_) => {
+                return 1;
+            },
+        };
+    defer left.deinit();
+    let mut right: tensor<f32, 2> =
+        match tensor::zeros(&allocator, right_shape) {
+            Ok(value) => value,
+            Err(_) => {
+                return 2;
+            },
+        };
+    defer right.deinit();
+    let mut output: tensor<f32, 2> =
+        match tensor::zeros(&allocator, output_shape) {
+            Ok(value) => value,
+            Err(_) => {
+                return 3;
+            },
+        };
+    defer output.deinit();
+
+    left[0, 0] = 6.0;
+    left[0, 1] = 6.0;
+    right[0, 0] = 3.0;
+    right[1, 0] = 4.0;
+    match tensor::matmul_into(&left, &right, &mut output) {
+        Ok(_) => (),
+        Err(_) => {
+            return 4;
+        },
+    }
+    if output[0, 0] == 42.0 { 42 } else { 5 }
+}

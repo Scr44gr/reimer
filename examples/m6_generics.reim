@@ -1,0 +1,44 @@
+struct Holder<T> {
+    value: T,
+}
+
+trait Measure {
+    fn measure(&self) -> i32;
+}
+
+struct Counter {
+    value: i32,
+}
+
+impl Measure for Counter {
+    fn measure(&self) -> i32 {
+        self.value
+    }
+}
+
+impl<T> Holder<T> {
+    fn new(value: T) -> Holder<T> {
+        Holder { value: value }
+    }
+
+    fn get(&self) -> T {
+        self.value
+    }
+}
+
+fn first<T, const N: usize>(values: [T; N]) -> T {
+    values[0]
+}
+
+fn identity<T>(value: T) -> T {
+    value
+}
+
+fn read<T: Measure>(value: T) -> i32 {
+    value.measure()
+}
+
+fn main() -> i32 {
+    let holder: Holder<i32> = Holder::new(first([20, 7]));
+    identity(holder.get()) + read(Counter { value: 22 })
+}

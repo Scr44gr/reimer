@@ -1,0 +1,164 @@
+pub enum AllocError {
+    OutOfMemory,
+}
+
+pub struct Allocator {
+    raw: usize,
+}
+
+pub struct OwnedBytes {
+    data: *mut u8,
+    len: usize,
+    allocator: usize,
+}
+
+pub struct ArenaAllocator {
+    allocator: Allocator,
+}
+
+pub struct FixedBufferAllocator {
+    allocator: Allocator,
+}
+
+@link("runtime")
+extern "C" {
+    fn arena_allocator_init(parent: usize) -> usize;
+    fn arena_allocator_deinit(handle: usize);
+    fn fixed_buffer_allocator_init(data: *mut u8, len: usize) -> usize;
+    fn fixed_buffer_allocator_deinit(handle: usize);
+    fn copy_bytes(
+        destination: *mut u8,
+        source: *const u8,
+        len: usize,
+    ) -> i32;
+}
+
+pub fn general_allocator() -> Allocator {
+    Allocator { raw: 1 }
+}
+
+pub fn page_allocator() -> Allocator {
+    Allocator { raw: 2 }
+}
+
+impl Allocator {
+    pub fn opaque_handle(&self) -> usize {
+        (*self).raw
+    }
+}
+
+pub fn allocate_bytes(
+    allocator: &Allocator,
+    len: usize,
+) -> Result<OwnedBytes, AllocError> {
+    __allocate_bytes((*allocator).raw, len)
+}
+
+pub fn deinit_bytes(bytes: OwnedBytes) {
+    unsafe {
+        __deallocate_bytes(bytes.allocator, bytes.data, bytes.len);
+    }
+}
+
+pub fn bytes_len(bytes: &OwnedBytes) -> usize {
+    (*bytes).len
+}
+
+impl OwnedBytes {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.data as *const u8
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data
+    }
+
+    pub fn grow(&mut self, new_len: usize) -> Result<(), AllocError> {
+        if new_len <= self.len {
+            Ok(())
+        } else {
+            let allocation: Result<OwnedBytes, AllocError> =
+                __allocate_bytes(self.allocator, new_len);
+            let replacement = allocation?;
+            let status = unsafe {
+                copy_bytes(
+                    replacement.data,
+                    self.data as *const u8,
+                    self.len,
+                )
+            };
+            if status == 0 {
+                unsafe {
+                    __deallocate_bytes(self.allocator, self.data, self.len);
+                }
+                self.data = replacement.data;
+                self.len = replacement.len;
+                self.allocator = replacement.allocator;
+                Ok(())
+            } else {
+                unsafe {
+                    __deallocate_bytes(
+                        replacement.allocator,
+                        replacement.data,
+                        replacement.len,
+                    );
+                }
+                panic("std::alloc received invalid bounded byte regions")
+            }
+        }
+    }
+
+    pub fn deinit(self) {
+        deinit_bytes(self);
+    }
+}
+
+impl ArenaAllocator {
+    pub fn init(parent: &Allocator) -> Result<ArenaAllocator, AllocError> {
+        let raw = unsafe { arena_allocator_init(parent.raw) };
+        if raw == 0 {
+            Err(AllocError::OutOfMemory)
+        } else {
+            Ok(ArenaAllocator {
+                allocator: Allocator { raw: raw },
+            })
+        }
+    }
+
+    pub fn allocator(&self) -> &Allocator {
+        &self.allocator
+    }
+
+    pub fn deinit(self) {
+        unsafe {
+            arena_allocator_deinit(self.allocator.raw);
+        }
+    }
+}
+
+impl FixedBufferAllocator {
+    pub fn init(data: *mut u8, len: usize) -> Result<FixedBufferAllocator, AllocError> {
+        let raw = unsafe { fixed_buffer_allocator_init(data, len) };
+        if raw == 0 {
+            Err(AllocError::OutOfMemory)
+        } else {
+            Ok(FixedBufferAllocator {
+                allocator: Allocator { raw: raw },
+            })
+        }
+    }
+
+    pub fn allocator(&self) -> &Allocator {
+        &self.allocator
+    }
+
+    pub fn deinit(self) {
+        unsafe {
+            fixed_buffer_allocator_deinit(self.allocator.raw);
+        }
+    }
+}

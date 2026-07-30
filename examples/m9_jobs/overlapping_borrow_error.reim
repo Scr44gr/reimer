@@ -1,0 +1,33 @@
+from std::alloc import general_allocator;
+from std::job import JobError, JobPool, JobPoolConfig, chunk_len, parallel_for_array_mut;
+
+fn increment(values: &mut [i32]) {
+    let mut index = 0 as usize;
+    while index < chunk_len(values) {
+        values[index] += 1;
+        index += 1;
+    }
+}
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let created: Result<JobPool, JobError> =
+        JobPool::init(&allocator, JobPoolConfig::fixed(2));
+    let mut pool = match created {
+        Ok(value) => value,
+        Err(_) => {
+            return 1;
+        },
+    };
+    let mut values = [1, 2, 3, 4];
+    let held = &mut values;
+    let completed = parallel_for_array_mut(
+        &pool,
+        &mut values,
+        increment,
+        1,
+    );
+    held[0] = 42;
+    pool.deinit();
+    0
+}

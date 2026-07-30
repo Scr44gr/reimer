@@ -1,0 +1,14 @@
+[package]
+name = "reimer-hir"
+description = "Typed and name-resolved high-level IR for Reimer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reimer-diagnostics = { path = "../reimer-diagnostics" }
+reimer-types = { path = "../reimer-types" }
+
+[lints]
+workspace = true

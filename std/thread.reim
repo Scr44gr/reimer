@@ -1,0 +1,623 @@
+pub enum ThreadError {
+    SpawnFailed,
+    InvalidHandle,
+    WorkerPanicked,
+    ResultMismatch,
+}
+
+pub enum ChannelError {
+    Closed,
+}
+
+pub struct Thread<T> {
+    raw: usize,
+}
+
+pub struct Mutex<T> {
+    raw: usize,
+}
+
+pub struct RwLock<T> {
+    raw: usize,
+}
+
+pub struct Channel<T> {
+    raw: usize,
+}
+
+pub struct Barrier {
+    raw: usize,
+}
+
+pub struct Semaphore {
+    raw: usize,
+}
+
+pub struct AtomicU64 {
+    raw: usize,
+}
+
+pub struct AtomicI64 {
+    raw: usize,
+}
+
+pub struct AtomicUsize {
+    raw: usize,
+}
+
+pub struct AtomicIsize {
+    raw: usize,
+}
+
+pub struct AtomicBool {
+    raw: usize,
+}
+
+pub struct ThreadLocal<T> {
+    raw: usize,
+}
+
+@link("runtime")
+extern "C" {
+    fn mutex_clone(handle: usize) -> usize;
+    fn mutex_destroy(handle: usize) -> i32;
+    fn rwlock_clone(handle: usize) -> usize;
+    fn rwlock_destroy(handle: usize) -> i32;
+    fn channel_clone(handle: usize) -> usize;
+    fn channel_close(handle: usize) -> i32;
+    fn channel_destroy(handle: usize) -> i32;
+    fn barrier_create(participants: usize) -> usize;
+    fn barrier_clone(handle: usize) -> usize;
+    fn barrier_wait(handle: usize) -> i32;
+    fn barrier_destroy(handle: usize) -> i32;
+    fn semaphore_create(permits: usize) -> usize;
+    fn semaphore_clone(handle: usize) -> usize;
+    fn semaphore_acquire(handle: usize) -> i32;
+    fn semaphore_try_acquire(handle: usize) -> i32;
+    fn semaphore_release(handle: usize, count: usize) -> i32;
+    fn semaphore_destroy(handle: usize) -> i32;
+    fn atomic_create(value: u64) -> usize;
+    fn atomic_clone(handle: usize) -> usize;
+    fn atomic_load(handle: usize) -> u64;
+    fn atomic_store(handle: usize, value: u64) -> i32;
+    fn atomic_swap(handle: usize, value: u64) -> u64;
+    fn atomic_fetch_add(handle: usize, value: u64) -> u64;
+    fn atomic_compare_exchange(
+        handle: usize,
+        current: u64,
+        replacement: u64,
+    ) -> bool;
+    fn atomic_destroy(handle: usize) -> i32;
+    fn thread_local_clone(handle: usize) -> usize;
+    fn thread_local_destroy(handle: usize) -> i32;
+}
+
+impl<T: Send> Thread<T> {
+    pub fn spawn<A: Send>(
+        callback: fn(A) -> T,
+        argument: A,
+    ) -> Result<Thread<T>, ThreadError> {
+        let started: Result<usize, ThreadError> =
+            __thread_spawn(callback, argument);
+        let raw = started?;
+        Ok(Thread { raw: raw })
+    }
+
+    pub fn join(self) -> Result<T, ThreadError> {
+        __thread_join(self.raw)
+    }
+}
+
+pub fn scope<A: Send, T: Send>(
+    callback: fn(A) -> T,
+    argument: A,
+) -> Result<T, ThreadError> {
+    __thread_scope(callback, argument)
+}
+
+fn require_handle(raw: usize) -> usize {
+    if raw == 0 {
+        panic("std::thread could not create or clone a synchronization handle")
+    } else {
+        raw
+    }
+}
+
+fn require_status(status: i32) {
+    if status != 0 {
+        panic("std::thread received an invalid synchronization handle")
+    }
+}
+
+impl<T: Send> Mutex<T> {
+    pub fn new(value: T) -> Mutex<T> {
+        let raw = __mutex_create(value);
+        Mutex {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> Mutex<T> {
+        let raw = unsafe { mutex_clone((*self).raw) };
+        Mutex {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn load(&self) -> T
+    where
+        T: Copy,
+    {
+        __mutex_load((*self).raw)
+    }
+
+    pub fn replace(&self, value: T) -> T {
+        __mutex_replace((*self).raw, value)
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { mutex_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl<T: Send + Sync> RwLock<T> {
+    pub fn new(value: T) -> RwLock<T> {
+        let raw = __rwlock_create(value);
+        RwLock {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> RwLock<T> {
+        let raw = unsafe { rwlock_clone((*self).raw) };
+        RwLock {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn load(&self) -> T
+    where
+        T: Copy,
+    {
+        __rwlock_load((*self).raw)
+    }
+
+    pub fn replace(&self, value: T) -> T {
+        __rwlock_replace((*self).raw, value)
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { rwlock_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl<T: Send> Channel<T> {
+    pub fn bounded(capacity: usize) -> Channel<T> {
+        let probe = 0 as usize as *const T;
+        let raw = __channel_create(probe, capacity);
+        Channel {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> Channel<T> {
+        let raw = unsafe { channel_clone((*self).raw) };
+        Channel {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn send(&self, value: T) -> Result<(), ChannelError> {
+        __channel_send((*self).raw, value)
+    }
+
+    pub fn receive(&self) -> Result<T, ChannelError> {
+        __channel_receive((*self).raw)
+    }
+
+    pub fn close(&self) {
+        require_status(unsafe { channel_close((*self).raw) });
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { channel_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl Barrier {
+    pub fn new(participants: usize) -> Barrier {
+        let raw = unsafe { barrier_create(participants) };
+        Barrier {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> Barrier {
+        let raw = unsafe { barrier_clone((*self).raw) };
+        Barrier {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn wait(&self) -> bool {
+        let status = unsafe { barrier_wait((*self).raw) };
+        if status < 0 {
+            panic("std::thread received an invalid barrier handle")
+        } else {
+            status == 1
+        }
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { barrier_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl Semaphore {
+    pub fn new(permits: usize) -> Semaphore {
+        let raw = unsafe { semaphore_create(permits) };
+        Semaphore {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> Semaphore {
+        let raw = unsafe { semaphore_clone((*self).raw) };
+        Semaphore {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn acquire(&self) {
+        require_status(unsafe { semaphore_acquire((*self).raw) });
+    }
+
+    pub fn try_acquire(&self) -> bool {
+        let status = unsafe { semaphore_try_acquire((*self).raw) };
+        if status == 0 {
+            true
+        } else if status == 2 {
+            false
+        } else {
+            panic("std::thread received an invalid semaphore handle")
+        }
+    }
+
+    pub fn release(&self, count: usize) {
+        require_status(unsafe { semaphore_release((*self).raw, count) });
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { semaphore_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl AtomicU64 {
+    pub fn new(value: u64) -> AtomicU64 {
+        let raw = unsafe { atomic_create(value) };
+        AtomicU64 {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> AtomicU64 {
+        let raw = unsafe { atomic_clone((*self).raw) };
+        AtomicU64 {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn load(&self) -> u64 {
+        let raw = require_handle((*self).raw);
+        unsafe { atomic_load(raw) }
+    }
+
+    pub fn store(&self, value: u64) {
+        let raw = require_handle((*self).raw);
+        require_status(unsafe { atomic_store(raw, value) });
+    }
+
+    pub fn swap(&self, value: u64) -> u64 {
+        let raw = require_handle((*self).raw);
+        unsafe { atomic_swap(raw, value) }
+    }
+
+    pub fn fetch_add(&self, value: u64) -> u64 {
+        let raw = require_handle((*self).raw);
+        unsafe { atomic_fetch_add(raw, value) }
+    }
+
+    pub fn compare_exchange(
+        &self,
+        current: u64,
+        replacement: u64,
+    ) -> bool {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_compare_exchange(raw, current, replacement)
+        }
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { atomic_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl AtomicI64 {
+    pub fn new(value: i64) -> AtomicI64 {
+        let raw = unsafe { atomic_create(value as u64) };
+        AtomicI64 {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> AtomicI64 {
+        let raw = unsafe { atomic_clone((*self).raw) };
+        AtomicI64 {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn load(&self) -> i64 {
+        let raw = require_handle((*self).raw);
+        unsafe { atomic_load(raw) as i64 }
+    }
+
+    pub fn store(&self, value: i64) {
+        let raw = require_handle((*self).raw);
+        require_status(unsafe {
+            atomic_store(raw, value as u64)
+        });
+    }
+
+    pub fn swap(&self, value: i64) -> i64 {
+        let raw = require_handle((*self).raw);
+        unsafe { atomic_swap(raw, value as u64) as i64 }
+    }
+
+    pub fn fetch_add(&self, value: i64) -> i64 {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_fetch_add(raw, value as u64) as i64
+        }
+    }
+
+    pub fn compare_exchange(
+        &self,
+        current: i64,
+        replacement: i64,
+    ) -> bool {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_compare_exchange(
+                raw,
+                current as u64,
+                replacement as u64,
+            )
+        }
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { atomic_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl AtomicUsize {
+    pub fn new(value: usize) -> AtomicUsize {
+        let raw = unsafe { atomic_create(value as u64) };
+        AtomicUsize {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> AtomicUsize {
+        let raw = unsafe { atomic_clone((*self).raw) };
+        AtomicUsize {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn load(&self) -> usize {
+        let raw = require_handle((*self).raw);
+        unsafe { atomic_load(raw) as usize }
+    }
+
+    pub fn store(&self, value: usize) {
+        let raw = require_handle((*self).raw);
+        require_status(unsafe {
+            atomic_store(raw, value as u64)
+        });
+    }
+
+    pub fn swap(&self, value: usize) -> usize {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_swap(raw, value as u64) as usize
+        }
+    }
+
+    pub fn fetch_add(&self, value: usize) -> usize {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_fetch_add(raw, value as u64) as usize
+        }
+    }
+
+    pub fn compare_exchange(
+        &self,
+        current: usize,
+        replacement: usize,
+    ) -> bool {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_compare_exchange(
+                raw,
+                current as u64,
+                replacement as u64,
+            )
+        }
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { atomic_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl AtomicIsize {
+    pub fn new(value: isize) -> AtomicIsize {
+        let raw = unsafe { atomic_create(value as u64) };
+        AtomicIsize {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> AtomicIsize {
+        let raw = unsafe { atomic_clone((*self).raw) };
+        AtomicIsize {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn load(&self) -> isize {
+        let raw = require_handle((*self).raw);
+        unsafe { atomic_load(raw) as isize }
+    }
+
+    pub fn store(&self, value: isize) {
+        let raw = require_handle((*self).raw);
+        require_status(unsafe {
+            atomic_store(raw, value as u64)
+        });
+    }
+
+    pub fn swap(&self, value: isize) -> isize {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_swap(raw, value as u64) as isize
+        }
+    }
+
+    pub fn fetch_add(&self, value: isize) -> isize {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_fetch_add(raw, value as u64) as isize
+        }
+    }
+
+    pub fn compare_exchange(
+        &self,
+        current: isize,
+        replacement: isize,
+    ) -> bool {
+        let raw = require_handle((*self).raw);
+        unsafe {
+            atomic_compare_exchange(
+                raw,
+                current as u64,
+                replacement as u64,
+            )
+        }
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { atomic_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl AtomicBool {
+    pub fn new(value: bool) -> AtomicBool {
+        let bits = if value { 1 as u64 } else { 0 as u64 };
+        let raw = unsafe { atomic_create(bits) };
+        AtomicBool {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> AtomicBool {
+        let raw = unsafe { atomic_clone((*self).raw) };
+        AtomicBool {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn load(&self) -> bool {
+        let raw = require_handle((*self).raw);
+        unsafe { atomic_load(raw) != 0 }
+    }
+
+    pub fn store(&self, value: bool) {
+        let raw = require_handle((*self).raw);
+        let bits = if value { 1 as u64 } else { 0 as u64 };
+        require_status(unsafe {
+            atomic_store(raw, bits)
+        });
+    }
+
+    pub fn swap(&self, value: bool) -> bool {
+        let raw = require_handle((*self).raw);
+        let bits = if value { 1 as u64 } else { 0 as u64 };
+        unsafe { atomic_swap(raw, bits) != 0 }
+    }
+
+    pub fn compare_exchange(
+        &self,
+        current: bool,
+        replacement: bool,
+    ) -> bool {
+        let raw = require_handle((*self).raw);
+        let current_bits =
+            if current { 1 as u64 } else { 0 as u64 };
+        let replacement_bits =
+            if replacement { 1 as u64 } else { 0 as u64 };
+        unsafe {
+            atomic_compare_exchange(
+                raw,
+                current_bits,
+                replacement_bits,
+            )
+        }
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { atomic_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}
+
+impl<T: Copy + Send> ThreadLocal<T> {
+    pub fn new(value: T) -> ThreadLocal<T> {
+        let raw = __thread_local_create(value);
+        ThreadLocal {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn clone(&self) -> ThreadLocal<T> {
+        let raw = unsafe { thread_local_clone((*self).raw) };
+        ThreadLocal {
+            raw: require_handle(raw),
+        }
+    }
+
+    pub fn get(&self) -> T {
+        __thread_local_get((*self).raw)
+    }
+
+    pub fn set(&self, value: T) {
+        __thread_local_set((*self).raw, value);
+    }
+
+    pub fn deinit(&mut self) {
+        require_status(unsafe { thread_local_destroy((*self).raw) });
+        self.raw = 0;
+    }
+}

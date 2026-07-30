@@ -1,0 +1,12 @@
+from std::thread import Thread, ThreadError;
+
+fn read(value: &i32) -> i32 {
+    *value
+}
+
+fn main() -> i32 {
+    let local = 42;
+    let started: Result<Thread<i32>, ThreadError> =
+        Thread::spawn(read, &local);
+    0
+}

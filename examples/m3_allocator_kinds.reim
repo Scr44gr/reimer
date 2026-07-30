@@ -1,0 +1,39 @@
+from std::alloc import AllocError, ArenaAllocator, FixedBufferAllocator, allocate_bytes, general_allocator;
+
+fn arena_length() -> Result<usize, AllocError> {
+    let parent = general_allocator();
+    let arena = ArenaAllocator::init(&parent)?;
+    defer arena.deinit();
+    let bytes = allocate_bytes(arena.allocator(), 42)?;
+    defer bytes.deinit();
+    Ok(bytes.len())
+}
+
+fn fixed_length() -> Result<usize, AllocError> {
+    let mut storage: [u8; 64] = [
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let data = &mut storage as *mut u8;
+    let fixed = FixedBufferAllocator::init(data, 64)?;
+    defer fixed.deinit();
+    let bytes = allocate_bytes(fixed.allocator(), 42)?;
+    defer bytes.deinit();
+    Ok(bytes.len())
+}
+
+fn main() -> i32 {
+    match arena_length() {
+        Ok(arena_len) => match fixed_length() {
+            Ok(fixed_len) => (arena_len + fixed_len - 42) as i32,
+            Err(_) => 1,
+        },
+        Err(_) => 1,
+    }
+}

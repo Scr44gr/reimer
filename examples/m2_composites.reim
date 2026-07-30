@@ -1,0 +1,40 @@
+struct Pair {
+    left: i32,
+    right: i32,
+}
+
+enum Sample {
+    Empty,
+    Pair(i32, i32),
+    Named { value: i32 },
+}
+
+fn make_pair(left: i32, right: i32) -> Pair {
+    Pair {
+        left: left,
+        right: right,
+    }
+}
+
+fn sum(pair: Pair) -> i32 {
+    pair.left + pair.right
+}
+
+fn main() -> i32 {
+    let mut pairs: [Pair; 2] = [make_pair(18, 0), make_pair(0, 0)];
+    let mut offsets: [i32; 2] = [2, 22];
+    pairs[0].left += offsets[0];
+    pairs[0].right = offsets[1];
+
+    let selected = pairs[0];
+    let result: (i32, bool) = (sum(selected), true);
+    let empty = Sample::Empty;
+    let tuple = Sample::Pair(20, 22);
+    let named = Sample::Named { value: 42 };
+
+    if result.1 {
+        result.0
+    } else {
+        0
+    }
+}

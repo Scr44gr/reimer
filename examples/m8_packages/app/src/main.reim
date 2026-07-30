@@ -1,0 +1,5 @@
+from physics import combined;
+
+fn main() -> i32 {
+    combined()
+}

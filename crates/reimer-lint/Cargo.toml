@@ -1,0 +1,21 @@
+[package]
+name = "reimer-lint"
+description = "Static analysis and editor-oriented indexes for Reimer source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reimer-ast = { path = "../reimer-ast" }
+reimer-diagnostics = { path = "../reimer-diagnostics" }
+reimer-hir = { path = "../reimer-hir" }
+reimer-lexer = { path = "../reimer-lexer" }
+reimer-parser = { path = "../reimer-parser" }
+reimer-package = { path = "../reimer-package" }
+reimer-resolver = { path = "../reimer-resolver" }
+reimer-project = { path = "../reimer-project" }
+reimer-types = { path = "../reimer-types" }
+
+[lints]
+workspace = true

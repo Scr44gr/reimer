@@ -1,0 +1,22 @@
+[package]
+name = "reimer-lsp"
+description = "Language Server Protocol implementation for Reimer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reimer-ast = { path = "../reimer-ast" }
+reimer-diagnostics = { path = "../reimer-diagnostics" }
+reimer-lexer = { path = "../reimer-lexer" }
+reimer-lint = { path = "../reimer-lint" }
+reimer-package = { path = "../reimer-package" }
+reimer-project = { path = "../reimer-project" }
+reimer-resolver = { path = "../reimer-resolver" }
+serde_json = "1.0.142"
+tokio = { version = "1.47.1", features = ["io-std", "macros", "rt-multi-thread", "sync"] }
+tower-lsp = "0.20.0"
+
+[lints]
+workspace = true

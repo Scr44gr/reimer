@@ -1,0 +1,64 @@
+from std::thread import AtomicBool, AtomicI64, AtomicIsize, AtomicUsize, Thread, ThreadError;
+
+struct AtomicWork {
+    ready: AtomicBool,
+    signed: AtomicI64,
+    count: AtomicUsize,
+    delta: AtomicIsize,
+}
+
+fn update(work: AtomicWork) -> i32 {
+    let mut work = work;
+    work.ready.store(true);
+    work.signed.fetch_add(2);
+    work.count.fetch_add(2);
+    work.delta.fetch_add(-2);
+
+    let changed = work.signed.compare_exchange(42, 43);
+    let result = if changed { 42 } else { 1 };
+
+    work.ready.deinit();
+    work.signed.deinit();
+    work.count.deinit();
+    work.delta.deinit();
+    result
+}
+
+fn main() -> i32 {
+    let mut ready = AtomicBool::new(false);
+    let mut signed = AtomicI64::new(40);
+    let mut count = AtomicUsize::new(40);
+    let mut delta = AtomicIsize::new(2);
+    let work = AtomicWork {
+        ready: ready.clone(),
+        signed: signed.clone(),
+        count: count.clone(),
+        delta: delta.clone(),
+    };
+    let started: Result<Thread<i32>, ThreadError> =
+        Thread::spawn(update, work);
+    let thread = match started {
+        Ok(value) => value,
+        Err(_) => {
+            return 2;
+        },
+    };
+    let worker = match thread.join() {
+        Ok(value) => value,
+        Err(_) => {
+            return 3;
+        },
+    };
+    let valid = worker == 42
+        && ready.load()
+        && signed.load() == 43
+        && count.load() == 42
+        && delta.load() == 0;
+
+    ready.deinit();
+    signed.deinit();
+    count.deinit();
+    delta.deinit();
+
+    if valid { 42 } else { 1 }
+}

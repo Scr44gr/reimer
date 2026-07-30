@@ -1,0 +1,20 @@
+[package]
+name = "reimer-resolver"
+description = "Name resolution and type checking for Reimer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reimer-ast = { path = "../reimer-ast" }
+reimer-diagnostics = { path = "../reimer-diagnostics" }
+reimer-hir = { path = "../reimer-hir" }
+reimer-types = { path = "../reimer-types" }
+
+[dev-dependencies]
+reimer-lexer = { path = "../reimer-lexer" }
+reimer-parser = { path = "../reimer-parser" }
+
+[lints]
+workspace = true

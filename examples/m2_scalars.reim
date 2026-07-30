@@ -1,0 +1,19 @@
+fn widen(value: u8) -> u64 {
+    value as u64
+}
+
+fn main() -> i32 {
+    let byte: u8 = 21;
+    let wide: u64 = widen(byte);
+    let ratio: f32 = 1.5;
+    let scalar: char = 'A';
+    let mut mask: u64 = 1;
+    mask <<= 1;
+    mask |= 40;
+
+    if wide << 1 == mask && ratio > 1.0 && scalar as u32 == 65 {
+        42
+    } else {
+        0
+    }
+}

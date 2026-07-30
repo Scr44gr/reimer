@@ -1,0 +1,8 @@
+@link("runtime")
+extern "C" {
+    fn absolute_i32(value: i32) -> i32;
+}
+
+fn main() -> i32 {
+    unsafe { absolute_i32(-42) }
+}

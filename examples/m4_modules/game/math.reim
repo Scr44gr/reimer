@@ -1,0 +1,5 @@
+from self::types import Pair;
+
+pub fn sum(pair: Pair) -> i32 {
+    pair.left + pair.right
+}

@@ -1,0 +1,13 @@
+[package]
+name = "reimer-lexer"
+description = "UTF-8 lexer with byte-accurate spans for Reimer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reimer-diagnostics = { path = "../reimer-diagnostics" }
+
+[lints]
+workspace = true

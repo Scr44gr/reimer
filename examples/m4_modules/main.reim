@@ -1,0 +1,9 @@
+from game import Pair;
+
+fn main() -> i32 {
+    let pair = Pair {
+        left: 20,
+        right: 22,
+    };
+    game::math::sum(pair)
+}

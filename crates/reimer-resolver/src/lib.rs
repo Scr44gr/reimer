@@ -1,0 +1,9593 @@
+//! Name resolution and type checking from Reimer AST to typed HIR.
+
+use std::collections::HashMap;
+
+use reimer_ast::{
+    self as ast, AssignmentOperator as AstAssignmentOperator, BinaryOperator as AstBinaryOperator,
+    Expression as AstExpression, Item, Statement as AstStatement, TypeNameKind,
+    UnaryOperator as AstUnaryOperator,
+};
+use reimer_diagnostics::{Diagnostic, Span};
+use reimer_hir::{
+    self as hir, AssignmentOperator, BinaryOperator, Expression, ExpressionKind, FunctionId,
+    LocalId, Place, PlaceKind, UnaryOperator,
+};
+use reimer_types::{Type, TypeId};
+
+/// Resolves names and checks the types of one parsed compilation unit.
+///
+/// # Errors
+///
+/// Returns accumulated semantic diagnostics for invalid declarations,
+/// unresolved names, type mismatches, mutability violations, and invalid
+/// control flow.
+pub fn resolve(program: &ast::Program) -> Result<hir::Program, Vec<Diagnostic>> {
+    Resolver::new().resolve(program, true)
+}
+
+/// Resolves names and checks types without requiring an executable entry point.
+///
+/// # Errors
+///
+/// Returns accumulated semantic diagnostics for invalid declarations,
+/// unresolved names, type mismatches, mutability violations, and invalid
+/// control flow.
+pub fn resolve_library(program: &ast::Program) -> Result<hir::Program, Vec<Diagnostic>> {
+    Resolver::new().resolve(program, false)
+}
+
+#[derive(Debug, Clone)]
+struct Signature {
+    id: FunctionId,
+    parameter_types: Vec<Type>,
+    return_type: Type,
+    requires_unsafe: bool,
+    is_public: bool,
+}
+
+struct SignatureSource<'ast> {
+    resolved_name: &'ast str,
+    source_name: &'ast ast::Identifier,
+    parameters: &'ast [ast::Parameter],
+    return_type: Option<&'ast ast::TypeName>,
+    span: Span,
+    requires_unsafe: bool,
+    is_public: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThreadErrorVariants {
+    spawn_failed: u32,
+    invalid_handle: u32,
+    worker_panicked: u32,
+    result_mismatch: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JobErrorVariants {
+    submit_failed: u32,
+    invalid_handle: u32,
+    worker_panicked: u32,
+    result_mismatch: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ParallelInputKind {
+    Slice,
+    Array,
+}
+
+enum Declaration<'ast> {
+    Reimer {
+        function: &'ast ast::Function,
+        resolved_name: String,
+        signature: Signature,
+    },
+    Extern {
+        function: &'ast ast::ExternFunction,
+        signature: Signature,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct GenericFunctionTemplate {
+    function: ast::Function,
+    parameters: Vec<ast::GenericParameter>,
+    where_predicates: Vec<ast::WherePredicate>,
+    resolved_name: String,
+    module_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GenericFunctionKey {
+    resolved_name: String,
+    arguments: Vec<GenericValue>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFunction {
+    function: ast::Function,
+    resolved_name: String,
+    signature: Signature,
+    environment: GenericEnvironment,
+    module_identity: Option<String>,
+}
+
+#[derive(Default)]
+struct GenericFunctionRegistry {
+    templates: HashMap<String, GenericFunctionTemplate>,
+    instances: HashMap<GenericFunctionKey, Signature>,
+    pending: Vec<PendingFunction>,
+    next_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum StructuralType {
+    Tuple(Vec<Type>),
+    Array {
+        element: Type,
+        length: u64,
+    },
+    Reference {
+        target: Type,
+        mutable: bool,
+    },
+    RawPointer {
+        target: Type,
+        mutable: bool,
+    },
+    Slice {
+        element: Type,
+        mutable: bool,
+    },
+    Function {
+        parameters: Vec<Type>,
+        return_type: Type,
+    },
+    Option(Type),
+    Result {
+        success: Type,
+        error: Type,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IntrinsicType {
+    Option { value: Type },
+    Result { success: Type, error: Type },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StringViewIntrinsic {
+    Data,
+    Length,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ThreadSafety {
+    Send,
+    Sync,
+}
+
+#[derive(Debug, Clone)]
+enum GenericTypeTemplate {
+    Struct(ast::StructDeclaration),
+    Enum(ast::EnumDeclaration),
+}
+
+impl GenericTypeTemplate {
+    fn parameters(&self) -> &[ast::GenericParameter] {
+        match self {
+            Self::Struct(declaration) => &declaration.generic_parameters,
+            Self::Enum(declaration) => &declaration.generic_parameters,
+        }
+    }
+
+    fn span(&self) -> Span {
+        match self {
+            Self::Struct(declaration) => declaration.span,
+            Self::Enum(declaration) => declaration.span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GenericValue {
+    Type(Type),
+    Const(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GenericTypeKey {
+    name: String,
+    arguments: Vec<GenericValue>,
+}
+
+#[derive(Debug, Clone)]
+struct GenericTypeInstance {
+    base_name: String,
+    arguments: Vec<GenericValue>,
+}
+
+#[derive(Debug, Clone)]
+struct TraitDefinition {
+    declaration: ast::TraitDeclaration,
+}
+
+#[derive(Debug, Clone)]
+struct TraitImplementation {
+    trait_name: String,
+    target: ast::TypeName,
+    parameters: Vec<ast::GenericParameter>,
+    where_predicates: Vec<ast::WherePredicate>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GenericEnvironment {
+    types: HashMap<String, Type>,
+    constants: HashMap<String, u64>,
+}
+
+#[derive(Default)]
+struct TypeRegistry {
+    names: HashMap<String, Type>,
+    structural: HashMap<StructuralType, Type>,
+    definitions: Vec<hir::TypeDefinition>,
+    intrinsics: HashMap<Type, IntrinsicType>,
+    generic_templates: HashMap<String, GenericTypeTemplate>,
+    generic_instances: HashMap<GenericTypeKey, Type>,
+    generic_instance_data: HashMap<Type, GenericTypeInstance>,
+    traits: HashMap<String, TraitDefinition>,
+    trait_implementations: Vec<TraitImplementation>,
+}
+
+impl TypeRegistry {
+    fn push_definition(
+        &mut self,
+        name: Option<String>,
+        kind: hir::TypeDefinitionKind,
+        span: Span,
+    ) -> Option<TypeId> {
+        let id = TypeId(u32::try_from(self.definitions.len()).ok()?);
+        self.definitions.push(hir::TypeDefinition {
+            id,
+            name,
+            kind,
+            representation: hir::TypeRepresentation::Native,
+            span,
+        });
+        Some(id)
+    }
+
+    fn intern_tuple(
+        &mut self,
+        elements: Vec<Type>,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        let key = StructuralType::Tuple(elements.clone());
+        if let Some(ty) = self.structural.get(&key) {
+            return Some(*ty);
+        }
+        let Some(id) =
+            self.push_definition(None, hir::TypeDefinitionKind::Tuple { elements }, span)
+        else {
+            diagnostics.push(Diagnostic::error(
+                "E3999",
+                "this compilation unit contains too many types",
+                span,
+            ));
+            return None;
+        };
+        let ty = Type::Tuple(id);
+        self.structural.insert(key, ty);
+        Some(ty)
+    }
+
+    fn intern_array(
+        &mut self,
+        element: Type,
+        length: u64,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        let key = StructuralType::Array { element, length };
+        if let Some(ty) = self.structural.get(&key) {
+            return Some(*ty);
+        }
+        let Some(id) = self.push_definition(
+            None,
+            hir::TypeDefinitionKind::Array { element, length },
+            span,
+        ) else {
+            diagnostics.push(Diagnostic::error(
+                "E3999",
+                "this compilation unit contains too many types",
+                span,
+            ));
+            return None;
+        };
+        let ty = Type::Array(id);
+        self.structural.insert(key, ty);
+        Some(ty)
+    }
+
+    fn intern_indirect_type(
+        &mut self,
+        key: StructuralType,
+        kind: hir::TypeDefinitionKind,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+        constructor: fn(TypeId) -> Type,
+    ) -> Option<Type> {
+        if let Some(ty) = self.structural.get(&key) {
+            return Some(*ty);
+        }
+        let Some(id) = self.push_definition(None, kind, span) else {
+            diagnostics.push(Diagnostic::error(
+                "E3999",
+                "this compilation unit contains too many types",
+                span,
+            ));
+            return None;
+        };
+        let ty = constructor(id);
+        self.structural.insert(key, ty);
+        Some(ty)
+    }
+
+    fn intern_reference(
+        &mut self,
+        target: Type,
+        mutable: bool,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        self.intern_indirect_type(
+            StructuralType::Reference { target, mutable },
+            hir::TypeDefinitionKind::Reference { target, mutable },
+            span,
+            diagnostics,
+            Type::Reference,
+        )
+    }
+
+    fn intern_raw_pointer(
+        &mut self,
+        target: Type,
+        mutable: bool,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        self.intern_indirect_type(
+            StructuralType::RawPointer { target, mutable },
+            hir::TypeDefinitionKind::RawPointer { target, mutable },
+            span,
+            diagnostics,
+            Type::RawPointer,
+        )
+    }
+
+    fn intern_slice(
+        &mut self,
+        element: Type,
+        mutable: bool,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        self.intern_indirect_type(
+            StructuralType::Slice { element, mutable },
+            hir::TypeDefinitionKind::Slice { element, mutable },
+            span,
+            diagnostics,
+            Type::Slice,
+        )
+    }
+
+    fn intern_function(
+        &mut self,
+        parameters: Vec<Type>,
+        return_type: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        self.intern_indirect_type(
+            StructuralType::Function {
+                parameters: parameters.clone(),
+                return_type,
+            },
+            hir::TypeDefinitionKind::Function {
+                parameters,
+                return_type,
+            },
+            span,
+            diagnostics,
+            Type::Function,
+        )
+    }
+
+    fn intern_option(
+        &mut self,
+        value: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        let key = StructuralType::Option(value);
+        if let Some(ty) = self.structural.get(&key) {
+            return Some(*ty);
+        }
+        let kind = hir::TypeDefinitionKind::Enum {
+            variants: vec![
+                hir::EnumVariant {
+                    name: "Some".to_owned(),
+                    fields: hir::EnumVariantFields::Tuple(vec![value]),
+                    span,
+                },
+                hir::EnumVariant {
+                    name: "None".to_owned(),
+                    fields: hir::EnumVariantFields::Unit,
+                    span,
+                },
+            ],
+        };
+        let Some(id) = self.push_definition(Some("Option".to_owned()), kind, span) else {
+            diagnostics.push(Diagnostic::error(
+                "E3999",
+                "this compilation unit contains too many types",
+                span,
+            ));
+            return None;
+        };
+        let ty = Type::Enum(id);
+        self.structural.insert(key, ty);
+        self.intrinsics.insert(ty, IntrinsicType::Option { value });
+        Some(ty)
+    }
+
+    fn intern_result(
+        &mut self,
+        success: Type,
+        error: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        let key = StructuralType::Result { success, error };
+        if let Some(ty) = self.structural.get(&key) {
+            return Some(*ty);
+        }
+        let kind = hir::TypeDefinitionKind::Enum {
+            variants: vec![
+                hir::EnumVariant {
+                    name: "Ok".to_owned(),
+                    fields: hir::EnumVariantFields::Tuple(vec![success]),
+                    span,
+                },
+                hir::EnumVariant {
+                    name: "Err".to_owned(),
+                    fields: hir::EnumVariantFields::Tuple(vec![error]),
+                    span,
+                },
+            ],
+        };
+        let Some(id) = self.push_definition(Some("Result".to_owned()), kind, span) else {
+            diagnostics.push(Diagnostic::error(
+                "E3999",
+                "this compilation unit contains too many types",
+                span,
+            ));
+            return None;
+        };
+        let ty = Type::Enum(id);
+        self.structural.insert(key, ty);
+        self.intrinsics
+            .insert(ty, IntrinsicType::Result { success, error });
+        Some(ty)
+    }
+
+    fn resolve_type_name(
+        &mut self,
+        type_name: &ast::TypeName,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        self.resolve_type_name_in(type_name, &GenericEnvironment::default(), diagnostics)
+    }
+
+    fn resolve_type_name_in(
+        &mut self,
+        type_name: &ast::TypeName,
+        environment: &GenericEnvironment,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        match &type_name.kind {
+            TypeNameKind::Function {
+                parameters: parameter_names,
+                return_type,
+            } => {
+                let mut parameters = Vec::with_capacity(parameter_names.len());
+                for parameter in parameter_names {
+                    parameters.push(self.resolve_type_name_in(
+                        parameter,
+                        environment,
+                        diagnostics,
+                    )?);
+                }
+                let return_type =
+                    self.resolve_type_name_in(return_type, environment, diagnostics)?;
+                self.intern_function(parameters, return_type, type_name.span, diagnostics)
+            }
+            TypeNameKind::Unit => Some(Type::Unit),
+            TypeNameKind::Generic { path, arguments } => self.resolve_generic_type_name(
+                path,
+                arguments,
+                environment,
+                type_name.span,
+                diagnostics,
+            ),
+            TypeNameKind::Tuple(element_names) => {
+                let mut elements = Vec::with_capacity(element_names.len());
+                for element in element_names {
+                    elements.push(self.resolve_type_name_in(element, environment, diagnostics)?);
+                }
+                self.intern_tuple(elements, type_name.span, diagnostics)
+            }
+            TypeNameKind::Array { element, length } => {
+                let element = self.resolve_type_name_in(element, environment, diagnostics)?;
+                let length = evaluate_array_length_in(length, environment, diagnostics)?;
+                self.intern_array(element, length, type_name.span, diagnostics)
+            }
+            TypeNameKind::Reference { mutable, target } => {
+                if let TypeNameKind::Slice(element) = &target.kind {
+                    let element = self.resolve_type_name_in(element, environment, diagnostics)?;
+                    self.intern_slice(element, *mutable, type_name.span, diagnostics)
+                } else {
+                    let target = self.resolve_type_name_in(target, environment, diagnostics)?;
+                    self.intern_reference(target, *mutable, type_name.span, diagnostics)
+                }
+            }
+            TypeNameKind::RawPointer { mutable, target } => {
+                let target = self.resolve_type_name_in(target, environment, diagnostics)?;
+                self.intern_raw_pointer(target, *mutable, type_name.span, diagnostics)
+            }
+            TypeNameKind::Slice(_) => {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "E3006",
+                        "slice types require a scoped reference in Reimer v0.1",
+                        type_name.span,
+                    )
+                    .with_help("write `&[T]` or `&mut [T]` once references are enabled"),
+                );
+                None
+            }
+            TypeNameKind::Path(path) => {
+                let ty = single_path_name(path)
+                    .and_then(|name| environment.types.get(name).copied())
+                    .or_else(|| single_path_name(path).and_then(primitive_type))
+                    .or_else(|| {
+                        single_path_name(path).and_then(|name| self.names.get(name).copied())
+                    });
+                if ty.is_none() {
+                    let message = if single_path_name(path)
+                        .is_some_and(|name| self.generic_templates.contains_key(name))
+                    {
+                        format!(
+                            "generic type `{}` requires type or const arguments",
+                            path.display()
+                        )
+                    } else {
+                        format!("unknown type `{}`", path.display())
+                    };
+                    diagnostics.push(
+                        Diagnostic::error("E3005", message, type_name.span)
+                            .with_help("declare the type or supply its generic arguments"),
+                    );
+                }
+                ty
+            }
+        }
+    }
+
+    fn resolve_generic_type_name(
+        &mut self,
+        path: &ast::Path,
+        arguments: &[ast::GenericArgument],
+        environment: &GenericEnvironment,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        let name = single_path_name(path);
+        match (name, arguments) {
+            (Some("Option"), [ast::GenericArgument::Type(value)]) => {
+                let value = self.resolve_type_name_in(value, environment, diagnostics)?;
+                self.intern_option(value, span, diagnostics)
+            }
+            (
+                Some("Result"),
+                [
+                    ast::GenericArgument::Type(success),
+                    ast::GenericArgument::Type(error),
+                ],
+            ) => {
+                let success = self.resolve_type_name_in(success, environment, diagnostics)?;
+                let error = self.resolve_type_name_in(error, environment, diagnostics)?;
+                self.intern_result(success, error, span, diagnostics)
+            }
+            (Some("Option" | "Result"), _) => {
+                diagnostics.push(Diagnostic::error(
+                    "E3007",
+                    format!("invalid type argument count for `{}`", path.display()),
+                    span,
+                ));
+                None
+            }
+            (Some(name), _) => {
+                self.instantiate_generic_type(name, arguments, environment, span, diagnostics)
+            }
+            (None, _) => {
+                diagnostics.push(Diagnostic::error(
+                    "E6003",
+                    format!(
+                        "generic type path `{}` must resolve to one declared type",
+                        path.display()
+                    ),
+                    span,
+                ));
+                None
+            }
+        }
+    }
+
+    fn instantiate_generic_type(
+        &mut self,
+        name: &str,
+        arguments: &[ast::GenericArgument],
+        outer_environment: &GenericEnvironment,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        let Some(template) = self.generic_templates.get(name).cloned() else {
+            diagnostics.push(
+                Diagnostic::error("E6003", format!("unknown generic type `{name}`"), span)
+                    .with_help("declare the generic struct or enum before using it"),
+            );
+            return None;
+        };
+        let (values, environment) = self.bind_generic_arguments(
+            template.parameters(),
+            arguments,
+            outer_environment,
+            span,
+            diagnostics,
+        )?;
+        let where_predicates = match &template {
+            GenericTypeTemplate::Struct(declaration) => &declaration.where_predicates,
+            GenericTypeTemplate::Enum(declaration) => &declaration.where_predicates,
+        };
+        if !self.validate_bounds(
+            template.parameters(),
+            where_predicates,
+            &environment,
+            span,
+            diagnostics,
+        ) {
+            return None;
+        }
+        let key = GenericTypeKey {
+            name: name.to_owned(),
+            arguments: values.clone(),
+        };
+        if let Some(ty) = self.generic_instances.get(&key) {
+            if self.reject_hidden_scoped_storage(&values, *ty, span, diagnostics) {
+                return None;
+            }
+            return Some(*ty);
+        }
+
+        let display_name = self.generic_type_display_name(name, &values);
+        let (placeholder, constructor, representation) = match &template {
+            GenericTypeTemplate::Struct(declaration) => (
+                hir::TypeDefinitionKind::Struct { fields: Vec::new() },
+                Type::Struct as fn(TypeId) -> Type,
+                if declaration.repr_c {
+                    hir::TypeRepresentation::C
+                } else {
+                    hir::TypeRepresentation::Native
+                },
+            ),
+            GenericTypeTemplate::Enum(_) => (
+                hir::TypeDefinitionKind::Enum {
+                    variants: Vec::new(),
+                },
+                Type::Enum as fn(TypeId) -> Type,
+                hir::TypeRepresentation::Native,
+            ),
+        };
+        let Some(id) = self.push_definition(Some(display_name), placeholder, template.span())
+        else {
+            diagnostics.push(Diagnostic::error(
+                "E3999",
+                "this compilation unit contains too many types",
+                span,
+            ));
+            return None;
+        };
+        let ty = constructor(id);
+        self.generic_instances.insert(key, ty);
+        self.generic_instance_data.insert(
+            ty,
+            GenericTypeInstance {
+                base_name: name.to_owned(),
+                arguments: values.clone(),
+            },
+        );
+        let kind = match template {
+            GenericTypeTemplate::Struct(declaration) => hir::TypeDefinitionKind::Struct {
+                fields: self.resolve_fields_in(&declaration.fields, &environment, diagnostics),
+            },
+            GenericTypeTemplate::Enum(declaration) => hir::TypeDefinitionKind::Enum {
+                variants: self.resolve_variants_in(
+                    &declaration.variants,
+                    &environment,
+                    diagnostics,
+                ),
+            },
+        };
+        if let Some(definition) = self
+            .definitions
+            .get_mut(usize::try_from(id.0).unwrap_or(usize::MAX))
+        {
+            definition.representation = representation;
+            definition.kind = kind;
+        }
+        if self.reject_hidden_scoped_storage(&values, ty, span, diagnostics) {
+            return None;
+        }
+        Some(ty)
+    }
+
+    fn reject_hidden_scoped_storage(
+        &self,
+        values: &[GenericValue],
+        result: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> bool {
+        let hides_scoped_value = values
+            .iter()
+            .any(|value| matches!(value, GenericValue::Type(ty) if self.is_scoped(*ty)))
+            && !self.is_scoped(result);
+        if hides_scoped_value {
+            diagnostics.push(scoped_storage_diagnostic(span));
+        }
+        hides_scoped_value
+    }
+
+    fn bind_generic_arguments(
+        &mut self,
+        parameters: &[ast::GenericParameter],
+        arguments: &[ast::GenericArgument],
+        outer_environment: &GenericEnvironment,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<(Vec<GenericValue>, GenericEnvironment)> {
+        let required = parameters
+            .iter()
+            .filter(|parameter| match parameter {
+                ast::GenericParameter::Type { default, .. } => default.is_none(),
+                ast::GenericParameter::Const { default, .. } => default.is_none(),
+            })
+            .count();
+        if arguments.len() < required || arguments.len() > parameters.len() {
+            diagnostics.push(Diagnostic::error(
+                "E6003",
+                format!(
+                    "generic type expects between {required} and {} argument(s), but {} were provided",
+                    parameters.len(),
+                    arguments.len()
+                ),
+                span,
+            ));
+            return None;
+        }
+        let mut environment = outer_environment.clone();
+        let mut values = Vec::with_capacity(parameters.len());
+        for (index, parameter) in parameters.iter().enumerate() {
+            let argument = arguments.get(index);
+            match parameter {
+                ast::GenericParameter::Type { name, default, .. } => {
+                    let ty = match argument {
+                        Some(ast::GenericArgument::Type(ty)) => {
+                            self.resolve_type_name_in(ty, &environment, diagnostics)?
+                        }
+                        Some(ast::GenericArgument::Const(value)) => {
+                            diagnostics.push(Diagnostic::error(
+                                "E6003",
+                                format!("type parameter `{}` received a const argument", name.name),
+                                value.span(),
+                            ));
+                            return None;
+                        }
+                        None => {
+                            self.resolve_type_name_in(default.as_ref()?, &environment, diagnostics)?
+                        }
+                    };
+                    environment.types.insert(name.name.clone(), ty);
+                    values.push(GenericValue::Type(ty));
+                }
+                ast::GenericParameter::Const { name, default, .. } => {
+                    let value = match argument {
+                        Some(ast::GenericArgument::Const(value)) => {
+                            evaluate_array_length_in(value, &environment, diagnostics)?
+                        }
+                        Some(ast::GenericArgument::Type(ty)) => {
+                            let TypeNameKind::Path(path) = &ty.kind else {
+                                diagnostics.push(Diagnostic::error(
+                                    "E6003",
+                                    format!(
+                                        "const parameter `{}` received a type argument",
+                                        name.name
+                                    ),
+                                    ty.span,
+                                ));
+                                return None;
+                            };
+                            let Some(constant_name) = single_path_name(path) else {
+                                diagnostics.push(Diagnostic::error(
+                                    "E6003",
+                                    "const argument must be an integer expression",
+                                    ty.span,
+                                ));
+                                return None;
+                            };
+                            let Some(value) = environment.constants.get(constant_name).copied()
+                            else {
+                                diagnostics.push(Diagnostic::error(
+                                    "E6003",
+                                    format!("unknown const argument `{constant_name}`"),
+                                    ty.span,
+                                ));
+                                return None;
+                            };
+                            value
+                        }
+                        None => {
+                            evaluate_array_length_in(default.as_ref()?, &environment, diagnostics)?
+                        }
+                    };
+                    environment.constants.insert(name.name.clone(), value);
+                    values.push(GenericValue::Const(value));
+                }
+            }
+        }
+        Some((values, environment))
+    }
+
+    fn resolve_fields_in(
+        &mut self,
+        fields: &[ast::StructField],
+        environment: &GenericEnvironment,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Vec<hir::TypeField> {
+        let mut names = HashMap::new();
+        let mut resolved = Vec::with_capacity(fields.len());
+        for field in fields {
+            if names.insert(&field.name.name, field.name.span).is_some() {
+                diagnostics.push(Diagnostic::error(
+                    "E3010",
+                    format!("field `{}` is declared more than once", field.name.name),
+                    field.name.span,
+                ));
+            }
+            if let Some(ty) = self.resolve_type_name_in(&field.ty, environment, diagnostics) {
+                resolved.push(hir::TypeField {
+                    name: field.name.name.clone(),
+                    is_public: field.is_public,
+                    ty,
+                    span: field.span,
+                });
+            }
+        }
+        resolved
+    }
+
+    fn resolve_variants_in(
+        &mut self,
+        variants: &[ast::EnumVariant],
+        environment: &GenericEnvironment,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Vec<hir::EnumVariant> {
+        let mut names = HashMap::new();
+        let mut resolved = Vec::with_capacity(variants.len());
+        for variant in variants {
+            if names
+                .insert(&variant.name.name, variant.name.span)
+                .is_some()
+            {
+                diagnostics.push(Diagnostic::error(
+                    "E3009",
+                    format!(
+                        "enum variant `{}` is declared more than once",
+                        variant.name.name
+                    ),
+                    variant.name.span,
+                ));
+            }
+            let fields = match &variant.payload {
+                ast::EnumVariantPayload::Unit => hir::EnumVariantFields::Unit,
+                ast::EnumVariantPayload::Tuple(types) => {
+                    let mut fields = Vec::with_capacity(types.len());
+                    for type_name in types {
+                        if let Some(ty) =
+                            self.resolve_type_name_in(type_name, environment, diagnostics)
+                        {
+                            fields.push(ty);
+                        }
+                    }
+                    hir::EnumVariantFields::Tuple(fields)
+                }
+                ast::EnumVariantPayload::Struct(fields) => hir::EnumVariantFields::Struct(
+                    self.resolve_fields_in(fields, environment, diagnostics),
+                ),
+            };
+            resolved.push(hir::EnumVariant {
+                name: variant.name.name.clone(),
+                fields,
+                span: variant.span,
+            });
+        }
+        resolved
+    }
+
+    fn generic_type_display_name(&self, name: &str, values: &[GenericValue]) -> String {
+        let arguments = values
+            .iter()
+            .map(|value| match value {
+                GenericValue::Type(ty) => self
+                    .definition(*ty)
+                    .and_then(|definition| definition.name.clone())
+                    .unwrap_or_else(|| ty.to_string()),
+                GenericValue::Const(value) => value.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{name}<{arguments}>")
+    }
+
+    fn generic_instance(&self, ty: Type) -> Option<&GenericTypeInstance> {
+        self.generic_instance_data.get(&ty)
+    }
+
+    fn infer_type_pattern(
+        &self,
+        pattern: &ast::TypeName,
+        actual: Type,
+        parameters: &[ast::GenericParameter],
+        environment: &mut GenericEnvironment,
+    ) -> bool {
+        match &pattern.kind {
+            TypeNameKind::Function {
+                parameters: parameter_patterns,
+                return_type,
+            } => {
+                let Some((actual_parameters, actual_return)) = self.function_shape(actual) else {
+                    return false;
+                };
+                parameter_patterns.len() == actual_parameters.len()
+                    && parameter_patterns
+                        .iter()
+                        .zip(actual_parameters)
+                        .all(|(pattern, actual)| {
+                            self.infer_type_pattern(pattern, *actual, parameters, environment)
+                        })
+                    && self.infer_type_pattern(return_type, actual_return, parameters, environment)
+            }
+            TypeNameKind::Unit => actual == Type::Unit,
+            TypeNameKind::Path(path) => {
+                let Some(name) = single_path_name(path) else {
+                    return false;
+                };
+                if generic_type_parameter(parameters, name) {
+                    return bind_type_argument(environment, name, actual);
+                }
+                environment
+                    .types
+                    .get(name)
+                    .copied()
+                    .or_else(|| primitive_type(name))
+                    .or_else(|| self.names.get(name).copied())
+                    .is_some_and(|expected| expected == actual)
+            }
+            TypeNameKind::Reference { mutable, target } => {
+                self.infer_borrowed_type_pattern(*mutable, target, actual, parameters, environment)
+            }
+            TypeNameKind::RawPointer { mutable, target } => {
+                self.pointer_shape(actual)
+                    .is_some_and(|(actual_target, actual_mutable, raw)| {
+                        raw && *mutable == actual_mutable
+                            && self.infer_type_pattern(
+                                target,
+                                actual_target,
+                                parameters,
+                                environment,
+                            )
+                    })
+            }
+            TypeNameKind::Slice(element) => {
+                self.slice_shape(actual).is_some_and(|(actual_element, _)| {
+                    self.infer_type_pattern(element, actual_element, parameters, environment)
+                })
+            }
+            TypeNameKind::Tuple(elements) => {
+                let Some(definition) = self.definition(actual) else {
+                    return false;
+                };
+                let hir::TypeDefinitionKind::Tuple {
+                    elements: actual_elements,
+                } = &definition.kind
+                else {
+                    return false;
+                };
+                elements.len() == actual_elements.len()
+                    && elements
+                        .iter()
+                        .zip(actual_elements)
+                        .all(|(element, actual)| {
+                            self.infer_type_pattern(element, *actual, parameters, environment)
+                        })
+            }
+            TypeNameKind::Array { element, length } => {
+                let Some(definition) = self.definition(actual) else {
+                    return false;
+                };
+                let hir::TypeDefinitionKind::Array {
+                    element: actual_element,
+                    length: actual_length,
+                } = definition.kind
+                else {
+                    return false;
+                };
+                self.infer_type_pattern(element, actual_element, parameters, environment)
+                    && infer_const_pattern(length, actual_length, parameters, environment)
+            }
+            TypeNameKind::Generic { path, arguments } => {
+                self.infer_generic_type_pattern(path, arguments, actual, parameters, environment)
+            }
+        }
+    }
+
+    fn infer_borrowed_type_pattern(
+        &self,
+        mutable: bool,
+        target: &ast::TypeName,
+        actual: Type,
+        parameters: &[ast::GenericParameter],
+        environment: &mut GenericEnvironment,
+    ) -> bool {
+        if let TypeNameKind::Slice(element) = &target.kind {
+            return self
+                .slice_shape(actual)
+                .is_some_and(|(actual_element, actual_mutable)| {
+                    mutable == actual_mutable
+                        && self.infer_type_pattern(element, actual_element, parameters, environment)
+                });
+        }
+        self.pointer_shape(actual)
+            .is_some_and(|(actual_target, actual_mutable, raw)| {
+                !raw && mutable == actual_mutable
+                    && self.infer_type_pattern(target, actual_target, parameters, environment)
+            })
+    }
+
+    fn infer_generic_type_pattern(
+        &self,
+        path: &ast::Path,
+        arguments: &[ast::GenericArgument],
+        actual: Type,
+        parameters: &[ast::GenericParameter],
+        environment: &mut GenericEnvironment,
+    ) -> bool {
+        let Some(name) = single_path_name(path) else {
+            return false;
+        };
+        if name == "Option" {
+            let Some(IntrinsicType::Option { value }) = self.intrinsic(actual) else {
+                return false;
+            };
+            let [ast::GenericArgument::Type(argument)] = arguments else {
+                return false;
+            };
+            return self.infer_type_pattern(argument, value, parameters, environment);
+        }
+        if name == "Result" {
+            let Some(IntrinsicType::Result { success, error }) = self.intrinsic(actual) else {
+                return false;
+            };
+            let [
+                ast::GenericArgument::Type(success_pattern),
+                ast::GenericArgument::Type(error_pattern),
+            ] = arguments
+            else {
+                return false;
+            };
+            return self.infer_type_pattern(success_pattern, success, parameters, environment)
+                && self.infer_type_pattern(error_pattern, error, parameters, environment);
+        }
+        let Some(instance) = self.generic_instance(actual) else {
+            return false;
+        };
+        instance.base_name == name
+            && arguments.len() == instance.arguments.len()
+            && arguments
+                .iter()
+                .zip(&instance.arguments)
+                .all(|(argument, actual)| {
+                    self.infer_generic_argument(argument, *actual, parameters, environment)
+                })
+    }
+
+    fn infer_generic_argument(
+        &self,
+        argument: &ast::GenericArgument,
+        actual: GenericValue,
+        parameters: &[ast::GenericParameter],
+        environment: &mut GenericEnvironment,
+    ) -> bool {
+        match (argument, actual) {
+            (ast::GenericArgument::Type(pattern), GenericValue::Type(actual)) => {
+                self.infer_type_pattern(pattern, actual, parameters, environment)
+            }
+            (ast::GenericArgument::Const(pattern), GenericValue::Const(actual)) => {
+                infer_const_pattern(pattern, actual, parameters, environment)
+            }
+            (
+                ast::GenericArgument::Type(ast::TypeName {
+                    kind: TypeNameKind::Path(path),
+                    ..
+                }),
+                GenericValue::Const(actual),
+            ) => single_path_name(path).is_some_and(|name| {
+                generic_const_parameter(parameters, name)
+                    && bind_const_argument(environment, name, actual)
+            }),
+            _ => false,
+        }
+    }
+
+    fn validate_bounds(
+        &mut self,
+        parameters: &[ast::GenericParameter],
+        where_predicates: &[ast::WherePredicate],
+        environment: &GenericEnvironment,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> bool {
+        let mut valid = true;
+        for parameter in parameters {
+            let ast::GenericParameter::Type { name, bounds, .. } = parameter else {
+                continue;
+            };
+            let Some(ty) = environment.types.get(&name.name).copied() else {
+                continue;
+            };
+            for bound in bounds {
+                valid &= self.validate_bound(ty, bound, span, diagnostics);
+            }
+        }
+        for predicate in where_predicates {
+            let Some(ty) = self.resolve_type_name_in(&predicate.ty, environment, diagnostics)
+            else {
+                valid = false;
+                continue;
+            };
+            for bound in &predicate.bounds {
+                valid &= self.validate_bound(ty, bound, predicate.span, diagnostics);
+            }
+        }
+        valid
+    }
+
+    fn validate_bound(
+        &self,
+        ty: Type,
+        bound: &ast::Path,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> bool {
+        let Some(name) = single_path_name(bound) else {
+            diagnostics.push(Diagnostic::error(
+                "E6014",
+                "trait bound must resolve to one trait",
+                bound.span,
+            ));
+            return false;
+        };
+        if !is_builtin_trait(name) && !self.traits.contains_key(name) {
+            diagnostics.push(Diagnostic::error(
+                "E6014",
+                format!("unknown trait bound `{name}`"),
+                bound.span,
+            ));
+            return false;
+        }
+        if self.satisfies_trait(ty, name) {
+            true
+        } else {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E6014",
+                    format!("type `{ty}` does not satisfy trait bound `{name}`"),
+                    span,
+                )
+                .with_help("add a matching trait implementation or use a compatible type"),
+            );
+            false
+        }
+    }
+
+    fn definition(&self, ty: Type) -> Option<&hir::TypeDefinition> {
+        let (Type::Struct(id)
+        | Type::Enum(id)
+        | Type::Tuple(id)
+        | Type::Array(id)
+        | Type::Reference(id)
+        | Type::RawPointer(id)
+        | Type::Slice(id)
+        | Type::Function(id)) = ty
+        else {
+            return None;
+        };
+        self.definitions.get(usize::try_from(id.0).ok()?)
+    }
+
+    fn pointer_shape(&self, ty: Type) -> Option<(Type, bool, bool)> {
+        let definition = self.definition(ty)?;
+        match definition.kind {
+            hir::TypeDefinitionKind::Reference { target, mutable } => {
+                Some((target, mutable, false))
+            }
+            hir::TypeDefinitionKind::RawPointer { target, mutable } => {
+                Some((target, mutable, true))
+            }
+            _ => None,
+        }
+    }
+
+    fn slice_shape(&self, ty: Type) -> Option<(Type, bool)> {
+        let definition = self.definition(ty)?;
+        let hir::TypeDefinitionKind::Slice { element, mutable } = definition.kind else {
+            return None;
+        };
+        Some((element, mutable))
+    }
+
+    fn function_shape(&self, ty: Type) -> Option<(&[Type], Type)> {
+        let definition = self.definition(ty)?;
+        let hir::TypeDefinitionKind::Function {
+            parameters,
+            return_type,
+        } = &definition.kind
+        else {
+            return None;
+        };
+        Some((parameters, *return_type))
+    }
+
+    fn intrinsic(&self, ty: Type) -> Option<IntrinsicType> {
+        self.intrinsics.get(&ty).copied()
+    }
+
+    fn is_copy(&self, ty: Type) -> bool {
+        self.is_intrinsically_copy(ty) || self.has_trait_implementation(ty, "Copy", 0)
+    }
+
+    fn is_intrinsically_copy(&self, ty: Type) -> bool {
+        match ty {
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::I128
+            | Type::Isize
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::U128
+            | Type::Usize
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::Char
+            | Type::RawPointer(_)
+            | Type::Function(_)
+            | Type::Str
+            | Type::CStr
+            | Type::Unit
+            | Type::Never => true,
+            Type::Reference(_) => self.definition(ty).is_some_and(|definition| {
+                matches!(
+                    definition.kind,
+                    hir::TypeDefinitionKind::Reference { mutable: false, .. }
+                )
+            }),
+            Type::Slice(_) => self.definition(ty).is_some_and(|definition| {
+                matches!(
+                    definition.kind,
+                    hir::TypeDefinitionKind::Slice { mutable: false, .. }
+                )
+            }),
+            Type::Tuple(_) => self.definition(ty).is_some_and(|definition| {
+                let hir::TypeDefinitionKind::Tuple { elements } = &definition.kind else {
+                    return false;
+                };
+                elements.iter().all(|element| self.is_copy(*element))
+            }),
+            Type::Array(_) => self.definition(ty).is_some_and(|definition| {
+                let hir::TypeDefinitionKind::Array { element, .. } = definition.kind else {
+                    return false;
+                };
+                self.is_copy(element)
+            }),
+            Type::Enum(_) if self.intrinsic(ty).is_some() => self.intrinsic_fields_are_copy(ty),
+            Type::Struct(_) | Type::Enum(_) => false,
+        }
+    }
+
+    fn satisfies_trait(&self, ty: Type, trait_name: &str) -> bool {
+        self.satisfies_trait_at_depth(ty, trait_name, 0)
+    }
+
+    fn satisfies_trait_at_depth(&self, ty: Type, trait_name: &str, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let builtin_satisfied = match trait_name {
+            "Copy" | "Clone" => Some(self.is_intrinsically_copy(ty)),
+            "Eq" => Some(self.is_equality_capable(ty)),
+            "Ord" | "Ordered" => Some(is_ordered_type(ty)),
+            "Hash" => Some(self.is_hash_capable(ty)),
+            "Send" => {
+                return self.satisfies_thread_safety_at_depth(ty, ThreadSafety::Send, depth);
+            }
+            "Sync" => {
+                return self.satisfies_thread_safety_at_depth(ty, ThreadSafety::Sync, depth);
+            }
+            _ => None,
+        };
+        if builtin_satisfied == Some(true) {
+            return true;
+        }
+        self.has_trait_implementation(ty, trait_name, depth)
+    }
+
+    fn satisfies_thread_safety_at_depth(
+        &self,
+        ty: Type,
+        safety: ThreadSafety,
+        depth: usize,
+    ) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        match ty {
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::I128
+            | Type::Isize
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::U128
+            | Type::Usize
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::Char
+            | Type::Function(_)
+            | Type::Str
+            | Type::CStr
+            | Type::Unit
+            | Type::Never => true,
+            Type::RawPointer(_) => false,
+            Type::Reference(_) => self.definition(ty).is_some_and(|definition| {
+                let hir::TypeDefinitionKind::Reference { target, mutable } = definition.kind else {
+                    return false;
+                };
+                let required = if mutable && matches!(safety, ThreadSafety::Send) {
+                    ThreadSafety::Send
+                } else {
+                    ThreadSafety::Sync
+                };
+                self.satisfies_thread_safety_at_depth(target, required, depth + 1)
+            }),
+            Type::Slice(_) => self.definition(ty).is_some_and(|definition| {
+                let hir::TypeDefinitionKind::Slice { element, mutable } = definition.kind else {
+                    return false;
+                };
+                let required = if mutable && matches!(safety, ThreadSafety::Send) {
+                    ThreadSafety::Send
+                } else {
+                    ThreadSafety::Sync
+                };
+                self.satisfies_thread_safety_at_depth(element, required, depth + 1)
+            }),
+            Type::Struct(_) => self.definition(ty).is_some_and(|definition| {
+                let hir::TypeDefinitionKind::Struct { fields } = &definition.kind else {
+                    return false;
+                };
+                fields
+                    .iter()
+                    .all(|field| self.satisfies_thread_safety_at_depth(field.ty, safety, depth + 1))
+            }),
+            Type::Tuple(_) => self.definition(ty).is_some_and(|definition| {
+                let hir::TypeDefinitionKind::Tuple { elements } = &definition.kind else {
+                    return false;
+                };
+                elements.iter().all(|element| {
+                    self.satisfies_thread_safety_at_depth(*element, safety, depth + 1)
+                })
+            }),
+            Type::Array(_) => self.definition(ty).is_some_and(|definition| {
+                let hir::TypeDefinitionKind::Array { element, .. } = definition.kind else {
+                    return false;
+                };
+                self.satisfies_thread_safety_at_depth(element, safety, depth + 1)
+            }),
+            Type::Enum(_) => self.definition(ty).is_some_and(|definition| {
+                let hir::TypeDefinitionKind::Enum { variants } = &definition.kind else {
+                    return false;
+                };
+                variants.iter().all(|variant| match &variant.fields {
+                    hir::EnumVariantFields::Unit => true,
+                    hir::EnumVariantFields::Tuple(fields) => fields.iter().all(|field| {
+                        self.satisfies_thread_safety_at_depth(*field, safety, depth + 1)
+                    }),
+                    hir::EnumVariantFields::Struct(fields) => fields.iter().all(|field| {
+                        self.satisfies_thread_safety_at_depth(field.ty, safety, depth + 1)
+                    }),
+                })
+            }),
+        }
+    }
+
+    fn has_trait_implementation(&self, ty: Type, trait_name: &str, depth: usize) -> bool {
+        self.trait_implementations.iter().any(|implementation| {
+            if implementation.trait_name != trait_name {
+                return false;
+            }
+            let mut environment = GenericEnvironment::default();
+            if !self.infer_type_pattern(
+                &implementation.target,
+                ty,
+                &implementation.parameters,
+                &mut environment,
+            ) {
+                return false;
+            }
+            let parameter_bounds_hold = implementation.parameters.iter().all(|parameter| {
+                let ast::GenericParameter::Type { name, bounds, .. } = parameter else {
+                    return true;
+                };
+                let Some(actual) = environment.types.get(&name.name).copied() else {
+                    return false;
+                };
+                bounds.iter().all(|bound| {
+                    single_path_name(bound).is_some_and(|bound| {
+                        self.satisfies_trait_at_depth(actual, bound, depth + 1)
+                    })
+                })
+            });
+            let supertraits_hold = self.traits.get(trait_name).is_none_or(|definition| {
+                definition.declaration.supertraits.iter().all(|supertrait| {
+                    single_path_name(supertrait).is_some_and(|supertrait| {
+                        self.satisfies_trait_at_depth(ty, supertrait, depth + 1)
+                    })
+                })
+            });
+            parameter_bounds_hold
+                && supertraits_hold
+                && implementation.where_predicates.iter().all(|predicate| {
+                    let Some(subject) = self.resolve_existing_type(&predicate.ty, &environment)
+                    else {
+                        return false;
+                    };
+                    predicate.bounds.iter().all(|bound| {
+                        single_path_name(bound).is_some_and(|bound| {
+                            self.satisfies_trait_at_depth(subject, bound, depth + 1)
+                        })
+                    })
+                })
+        })
+    }
+
+    fn resolve_existing_type(
+        &self,
+        type_name: &ast::TypeName,
+        environment: &GenericEnvironment,
+    ) -> Option<Type> {
+        match &type_name.kind {
+            TypeNameKind::Function {
+                parameters,
+                return_type,
+            } => {
+                let parameters = parameters
+                    .iter()
+                    .map(|parameter| self.resolve_existing_type(parameter, environment))
+                    .collect::<Option<Vec<_>>>()?;
+                let return_type = self.resolve_existing_type(return_type, environment)?;
+                self.structural
+                    .get(&StructuralType::Function {
+                        parameters,
+                        return_type,
+                    })
+                    .copied()
+            }
+            TypeNameKind::Path(path) => {
+                let name = single_path_name(path)?;
+                environment
+                    .types
+                    .get(name)
+                    .copied()
+                    .or_else(|| primitive_type(name))
+                    .or_else(|| self.names.get(name).copied())
+            }
+            TypeNameKind::Generic { path, arguments } => {
+                let name = single_path_name(path)?;
+                let mut values = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    let value = match argument {
+                        ast::GenericArgument::Type(ty) => {
+                            if let TypeNameKind::Path(path) = &ty.kind
+                                && let Some(name) = single_path_name(path)
+                                && let Some(value) = environment.constants.get(name)
+                            {
+                                GenericValue::Const(*value)
+                            } else {
+                                GenericValue::Type(self.resolve_existing_type(ty, environment)?)
+                            }
+                        }
+                        ast::GenericArgument::Const(value) => {
+                            let mut diagnostics = Vec::new();
+                            GenericValue::Const(evaluate_array_length_in(
+                                value,
+                                environment,
+                                &mut diagnostics,
+                            )?)
+                        }
+                    };
+                    values.push(value);
+                }
+                self.generic_instances
+                    .get(&GenericTypeKey {
+                        name: name.to_owned(),
+                        arguments: values,
+                    })
+                    .copied()
+            }
+            TypeNameKind::Unit => Some(Type::Unit),
+            TypeNameKind::Tuple(_)
+            | TypeNameKind::Array { .. }
+            | TypeNameKind::Slice(_)
+            | TypeNameKind::Reference { .. }
+            | TypeNameKind::RawPointer { .. } => None,
+        }
+    }
+
+    fn is_equality_capable(&self, ty: Type) -> bool {
+        if is_equality_type(ty) {
+            return true;
+        }
+        let Some(definition) = self.definition(ty) else {
+            return false;
+        };
+        match &definition.kind {
+            hir::TypeDefinitionKind::Tuple { elements } => elements
+                .iter()
+                .all(|element| self.is_equality_capable(*element)),
+            hir::TypeDefinitionKind::Array { element, .. } => self.is_equality_capable(*element),
+            hir::TypeDefinitionKind::Reference { .. }
+            | hir::TypeDefinitionKind::RawPointer { .. }
+            | hir::TypeDefinitionKind::Slice { .. }
+            | hir::TypeDefinitionKind::Function { .. }
+            | hir::TypeDefinitionKind::Struct { .. }
+            | hir::TypeDefinitionKind::Enum { .. } => false,
+        }
+    }
+
+    fn is_hash_capable(&self, ty: Type) -> bool {
+        self.is_equality_capable(ty)
+    }
+
+    fn intrinsic_fields_are_copy(&self, ty: Type) -> bool {
+        let Some(definition) = self.definition(ty) else {
+            return false;
+        };
+        let hir::TypeDefinitionKind::Enum { variants } = &definition.kind else {
+            return false;
+        };
+        variants.iter().all(|variant| match &variant.fields {
+            hir::EnumVariantFields::Unit => true,
+            hir::EnumVariantFields::Tuple(fields) => {
+                fields.iter().all(|field| self.is_copy(*field))
+            }
+            hir::EnumVariantFields::Struct(fields) => {
+                fields.iter().all(|field| self.is_copy(field.ty))
+            }
+        })
+    }
+
+    fn is_mutable_view(&self, ty: Type) -> bool {
+        self.definition(ty).is_some_and(|definition| {
+            matches!(
+                definition.kind,
+                hir::TypeDefinitionKind::Reference { mutable: true, .. }
+                    | hir::TypeDefinitionKind::Slice { mutable: true, .. }
+            )
+        })
+    }
+
+    fn is_scoped(&self, ty: Type) -> bool {
+        self.is_scoped_at_depth(ty, 0)
+    }
+
+    fn is_scoped_at_depth(&self, ty: Type, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        if matches!(
+            ty,
+            Type::Reference(_) | Type::Slice(_) | Type::Str | Type::CStr
+        ) {
+            return true;
+        }
+        let Some(definition) = self.definition(ty) else {
+            return false;
+        };
+        match &definition.kind {
+            hir::TypeDefinitionKind::Struct { fields } => fields
+                .iter()
+                .any(|field| self.is_scoped_at_depth(field.ty, depth + 1)),
+            hir::TypeDefinitionKind::Tuple { elements } => elements
+                .iter()
+                .any(|element| self.is_scoped_at_depth(*element, depth + 1)),
+            hir::TypeDefinitionKind::Array { element, .. } => {
+                self.is_scoped_at_depth(*element, depth + 1)
+            }
+            hir::TypeDefinitionKind::Enum { variants } => {
+                variants.iter().any(|variant| match &variant.fields {
+                    hir::EnumVariantFields::Unit => false,
+                    hir::EnumVariantFields::Tuple(fields) => fields
+                        .iter()
+                        .any(|field| self.is_scoped_at_depth(*field, depth + 1)),
+                    hir::EnumVariantFields::Struct(fields) => fields
+                        .iter()
+                        .any(|field| self.is_scoped_at_depth(field.ty, depth + 1)),
+                })
+            }
+            hir::TypeDefinitionKind::Reference { .. } | hir::TypeDefinitionKind::Slice { .. } => {
+                true
+            }
+            hir::TypeDefinitionKind::RawPointer { .. }
+            | hir::TypeDefinitionKind::Function { .. } => false,
+        }
+    }
+
+    fn type_name_may_be_scoped(&self, type_name: &ast::TypeName) -> bool {
+        self.type_name_may_be_scoped_at_depth(type_name, 0)
+    }
+
+    fn type_name_may_be_scoped_at_depth(&self, type_name: &ast::TypeName, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        match &type_name.kind {
+            TypeNameKind::Reference { .. } | TypeNameKind::Slice(_) => true,
+            TypeNameKind::Path(path) => {
+                single_path_name(path).is_some_and(|name| matches!(name, "str" | "cstr"))
+            }
+            TypeNameKind::Generic { path, arguments } => {
+                if arguments.iter().any(|argument| match argument {
+                    ast::GenericArgument::Type(ty) => {
+                        self.type_name_may_be_scoped_at_depth(ty, depth + 1)
+                    }
+                    ast::GenericArgument::Const(_) => false,
+                }) {
+                    return true;
+                }
+                let Some(name) = single_path_name(path) else {
+                    return false;
+                };
+                let Some(template) = self.generic_templates.get(name) else {
+                    return false;
+                };
+                match template {
+                    GenericTypeTemplate::Struct(declaration) => declaration
+                        .fields
+                        .iter()
+                        .any(|field| self.type_name_may_be_scoped_at_depth(&field.ty, depth + 1)),
+                    GenericTypeTemplate::Enum(declaration) => {
+                        declaration
+                            .variants
+                            .iter()
+                            .any(|variant| match &variant.payload {
+                                ast::EnumVariantPayload::Unit => false,
+                                ast::EnumVariantPayload::Tuple(fields) => {
+                                    fields.iter().any(|field| {
+                                        self.type_name_may_be_scoped_at_depth(field, depth + 1)
+                                    })
+                                }
+                                ast::EnumVariantPayload::Struct(fields) => {
+                                    fields.iter().any(|field| {
+                                        self.type_name_may_be_scoped_at_depth(&field.ty, depth + 1)
+                                    })
+                                }
+                            })
+                    }
+                }
+            }
+            TypeNameKind::Tuple(elements) => elements
+                .iter()
+                .any(|element| self.type_name_may_be_scoped_at_depth(element, depth + 1)),
+            TypeNameKind::Array { element, .. } => {
+                self.type_name_may_be_scoped_at_depth(element, depth + 1)
+            }
+            TypeNameKind::Function { .. }
+            | TypeNameKind::Unit
+            | TypeNameKind::RawPointer { .. } => false,
+        }
+    }
+
+    fn is_ffi_safe_type(&self, ty: Type) -> bool {
+        match ty {
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::Isize
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Usize
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::CStr => true,
+            Type::RawPointer(_) => self.ffi_pointer_target(ty).is_some_and(|target| {
+                target == Type::Unit
+                    || self.is_ffi_safe_type(target)
+                    || self.is_c_representation_struct(target)
+            }),
+            Type::I128
+            | Type::U128
+            | Type::Char
+            | Type::Struct(_)
+            | Type::Enum(_)
+            | Type::Tuple(_)
+            | Type::Array(_)
+            | Type::Reference(_)
+            | Type::Function(_)
+            | Type::Slice(_)
+            | Type::Str
+            | Type::Unit
+            | Type::Never => false,
+        }
+    }
+
+    fn is_ffi_safe_return_type(&self, ty: Type) -> bool {
+        ty == Type::Unit || self.is_ffi_safe_type(ty)
+    }
+
+    fn ffi_pointer_target(&self, ty: Type) -> Option<Type> {
+        let definition = self.definition(ty)?;
+        let hir::TypeDefinitionKind::RawPointer { target, .. } = definition.kind else {
+            return None;
+        };
+        Some(target)
+    }
+
+    fn is_c_representation_struct(&self, ty: Type) -> bool {
+        self.definition(ty).is_some_and(|definition| {
+            matches!(ty, Type::Struct(_)) && definition.representation == hir::TypeRepresentation::C
+        })
+    }
+
+    fn nominal_name(&self, ty: Type) -> Option<&str> {
+        if let Some((target, _, false)) = self.pointer_shape(ty) {
+            return self.nominal_name(target);
+        }
+        self.definition(ty)?.name.as_deref()
+    }
+}
+
+struct Resolver {
+    signatures: HashMap<String, Signature>,
+    generic_functions: GenericFunctionRegistry,
+    types: TypeRegistry,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl Resolver {
+    fn new() -> Self {
+        Self {
+            signatures: HashMap::new(),
+            generic_functions: GenericFunctionRegistry::default(),
+            types: TypeRegistry::default(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn resolve(
+        mut self,
+        program: &ast::Program,
+        require_entry: bool,
+    ) -> Result<hir::Program, Vec<Diagnostic>> {
+        self.collect_type_headers(program);
+        self.collect_trait_headers(program);
+        self.resolve_type_definitions(program);
+        self.collect_trait_implementations(program);
+        let declarations = self.collect_declarations(program);
+        self.generic_functions.next_id = u32::try_from(declarations.len()).unwrap_or(u32::MAX);
+        let entry = require_entry.then(|| self.validate_entry()).flatten();
+        let mut functions = Vec::with_capacity(declarations.len());
+        let mut extern_functions = Vec::new();
+
+        for declaration in declarations {
+            match declaration {
+                Declaration::Reimer {
+                    function,
+                    resolved_name,
+                    signature,
+                } => {
+                    let mut analyzer = FunctionAnalyzer::new(
+                        &mut self.signatures,
+                        &mut self.generic_functions,
+                        &mut self.types,
+                        &mut self.diagnostics,
+                        signature,
+                        GenericEnvironment::default(),
+                        symbol_module_identity(&resolved_name).map(str::to_owned),
+                    );
+                    functions.push(analyzer.analyze(function, resolved_name));
+                }
+                Declaration::Extern {
+                    function,
+                    signature,
+                } => {
+                    let parameters = function
+                        .parameters
+                        .iter()
+                        .zip(&signature.parameter_types)
+                        .enumerate()
+                        .filter_map(|(index, (parameter, ty))| {
+                            Some(hir::Parameter {
+                                local: LocalId(u32::try_from(index).ok()?),
+                                name: parameter.name.name.clone(),
+                                ty: *ty,
+                                span: parameter.span,
+                            })
+                        })
+                        .collect();
+                    extern_functions.push(hir::ExternFunction {
+                        id: signature.id,
+                        name: function.name.name.clone(),
+                        symbol: function.symbol.clone(),
+                        link: function.link.clone(),
+                        is_public: function.is_public,
+                        abi: function.abi.clone(),
+                        parameters,
+                        return_type: signature.return_type,
+                        span: function.span,
+                    });
+                }
+            }
+        }
+
+        let mut pending_index = 0;
+        while let Some(pending) = self.generic_functions.pending.get(pending_index).cloned() {
+            pending_index += 1;
+            let mut analyzer = FunctionAnalyzer::new(
+                &mut self.signatures,
+                &mut self.generic_functions,
+                &mut self.types,
+                &mut self.diagnostics,
+                pending.signature,
+                pending.environment,
+                pending.module_identity,
+            );
+            functions.push(analyzer.analyze(&pending.function, pending.resolved_name));
+        }
+        self.validate_type_cycles();
+        functions.sort_by_key(|function| function.id.0);
+        extern_functions.sort_by_key(|function| function.id.0);
+
+        if self.diagnostics.is_empty() {
+            Ok(hir::Program {
+                types: self.types.definitions,
+                functions,
+                extern_functions,
+                entry,
+            })
+        } else {
+            Err(self.diagnostics)
+        }
+    }
+
+    fn collect_type_headers(&mut self, program: &ast::Program) {
+        for item in &program.items {
+            let (name, span, is_struct, repr_c, generic_template) = match item {
+                Item::Struct(declaration) => (
+                    &declaration.name.name,
+                    declaration.span,
+                    true,
+                    declaration.repr_c,
+                    (!declaration.generic_parameters.is_empty())
+                        .then(|| GenericTypeTemplate::Struct(declaration.clone())),
+                ),
+                Item::Enum(declaration) => (
+                    &declaration.name.name,
+                    declaration.span,
+                    false,
+                    false,
+                    (!declaration.generic_parameters.is_empty())
+                        .then(|| GenericTypeTemplate::Enum(declaration.clone())),
+                ),
+                _ => continue,
+            };
+            if primitive_type(name).is_some()
+                || self.types.names.contains_key(name)
+                || self.types.generic_templates.contains_key(name)
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3008",
+                        format!("type `{name}` is declared more than once"),
+                        span,
+                    )
+                    .with_help("give each type a unique name"),
+                );
+                continue;
+            }
+            if let Some(template) = generic_template {
+                validate_generic_parameter_names(template.parameters(), &mut self.diagnostics);
+                self.types.generic_templates.insert(name.clone(), template);
+                continue;
+            }
+            let kind = if is_struct {
+                hir::TypeDefinitionKind::Struct { fields: Vec::new() }
+            } else {
+                hir::TypeDefinitionKind::Enum {
+                    variants: Vec::new(),
+                }
+            };
+            let Some(id) = self.types.push_definition(Some(name.clone()), kind, span) else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3999",
+                    "this compilation unit contains too many types",
+                    span,
+                ));
+                continue;
+            };
+            if repr_c
+                && let Some(definition) = self
+                    .types
+                    .definitions
+                    .get_mut(usize::try_from(id.0).unwrap_or(usize::MAX))
+            {
+                definition.representation = hir::TypeRepresentation::C;
+            }
+            let ty = if is_struct {
+                Type::Struct(id)
+            } else {
+                Type::Enum(id)
+            };
+            self.types.names.insert(name.clone(), ty);
+        }
+    }
+
+    fn collect_trait_headers(&mut self, program: &ast::Program) {
+        for item in &program.items {
+            let Item::Trait(declaration) = item else {
+                continue;
+            };
+            let name = &declaration.name.name;
+            if primitive_type(name).is_some()
+                || self.types.names.contains_key(name)
+                || self.types.generic_templates.contains_key(name)
+                || self.types.traits.contains_key(name)
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6010",
+                        format!("trait `{name}` is declared more than once"),
+                        declaration.name.span,
+                    )
+                    .with_help("give each trait a unique name"),
+                );
+                continue;
+            }
+            validate_generic_parameter_names(
+                &declaration.generic_parameters,
+                &mut self.diagnostics,
+            );
+            let mut methods = HashMap::new();
+            for method in &declaration.methods {
+                validate_generic_parameter_names(&method.generic_parameters, &mut self.diagnostics);
+                if methods
+                    .insert(method.name.name.as_str(), method.name.span)
+                    .is_some()
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E6010",
+                        format!(
+                            "trait method `{}` is declared more than once",
+                            method.name.name
+                        ),
+                        method.name.span,
+                    ));
+                }
+            }
+            self.types.traits.insert(
+                name.clone(),
+                TraitDefinition {
+                    declaration: declaration.clone(),
+                },
+            );
+        }
+
+        for definition in self.types.traits.values() {
+            for supertrait in &definition.declaration.supertraits {
+                let Some(name) = single_path_name(supertrait) else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E6010",
+                        "supertrait must resolve to one declared trait",
+                        supertrait.span,
+                    ));
+                    continue;
+                };
+                if !self.types.traits.contains_key(name) && !is_builtin_trait(name) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E6010",
+                        format!("unknown supertrait `{name}`"),
+                        supertrait.span,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn collect_trait_implementations(&mut self, program: &ast::Program) {
+        for item in &program.items {
+            let Item::Impl(implementation) = item else {
+                continue;
+            };
+            let Some(trait_type) = &implementation.trait_type else {
+                continue;
+            };
+            let Some(trait_name) = type_constructor_name(trait_type).map(str::to_owned) else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6011",
+                    "implemented trait must use a nominal trait path",
+                    trait_type.span,
+                ));
+                continue;
+            };
+            let definition = self.types.traits.get(&trait_name).cloned();
+            if definition.is_none() && !is_builtin_trait(&trait_name) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6011",
+                    format!("unknown trait `{trait_name}`"),
+                    trait_type.span,
+                ));
+                continue;
+            }
+            let argument_count = match &trait_type.kind {
+                TypeNameKind::Generic { arguments, .. } => arguments.len(),
+                _ => 0,
+            };
+            let expected_argument_count = definition.as_ref().map_or(0, |definition| {
+                definition.declaration.generic_parameters.len()
+            });
+            if argument_count != expected_argument_count {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6011",
+                    format!("trait `{trait_name}` expects {expected_argument_count} generic argument(s), but {argument_count} were provided"),
+                    trait_type.span,
+                ));
+            }
+            let implementation_key = type_pattern_key(&implementation.target);
+            if self.types.trait_implementations.iter().any(|existing| {
+                existing.trait_name == trait_name
+                    && type_pattern_key(&existing.target) == implementation_key
+            }) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6012",
+                        format!(
+                            "trait `{trait_name}` is implemented more than once for `{implementation_key}`"
+                        ),
+                        implementation.span,
+                    )
+                    .with_help("keep one coherent implementation for each trait and target"),
+                );
+                continue;
+            }
+            if let Some(definition) = &definition {
+                self.validate_trait_methods(&definition.declaration, implementation);
+            } else if !implementation.methods.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6013",
+                    format!("built-in marker trait `{trait_name}` does not declare methods"),
+                    implementation.span,
+                ));
+            }
+            self.types.trait_implementations.push(TraitImplementation {
+                trait_name,
+                target: implementation.target.clone(),
+                parameters: implementation.generic_parameters.clone(),
+                where_predicates: implementation.where_predicates.clone(),
+            });
+        }
+    }
+
+    fn validate_trait_methods(
+        &mut self,
+        declaration: &ast::TraitDeclaration,
+        implementation: &ast::ImplDeclaration,
+    ) {
+        let concrete_environment = if implementation.generic_parameters.is_empty() {
+            self.concrete_trait_environment(declaration, implementation)
+        } else {
+            None
+        };
+        for required in &declaration.methods {
+            let Some(provided) = implementation
+                .methods
+                .iter()
+                .find(|method| method.name.name == required.name.name)
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6013",
+                    format!(
+                        "implementation of `{}` is missing method `{}`",
+                        declaration.name.name, required.name.name
+                    ),
+                    implementation.span,
+                ));
+                continue;
+            };
+            if provided.parameters.len() != required.parameters.len()
+                || provided.generic_parameters.len() != required.generic_parameters.len()
+                || provided.return_type.is_some() != required.return_type.is_some()
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6013",
+                        format!(
+                            "method `{}` does not match its trait signature",
+                            required.name.name
+                        ),
+                        provided.span,
+                    )
+                    .with_help("match the trait parameter, generic, and return-type shape"),
+                );
+            }
+            let required_receiver = required
+                .parameters
+                .first()
+                .map(|parameter| &parameter.ty.kind);
+            let provided_receiver = provided
+                .parameters
+                .first()
+                .map(|parameter| &parameter.ty.kind);
+            if !receiver_shapes_match(required_receiver, provided_receiver) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6013",
+                    format!(
+                        "method `{}` uses a different receiver than the trait",
+                        required.name.name
+                    ),
+                    provided.span,
+                ));
+            }
+            if required.generic_parameters.is_empty()
+                && provided.generic_parameters.is_empty()
+                && let Some(environment) = &concrete_environment
+            {
+                self.validate_concrete_trait_method_signature(
+                    declaration,
+                    required,
+                    provided,
+                    environment,
+                );
+            }
+        }
+        for provided in &implementation.methods {
+            if !declaration
+                .methods
+                .iter()
+                .any(|required| required.name.name == provided.name.name)
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6013",
+                    format!(
+                        "method `{}` is not part of trait `{}`",
+                        provided.name.name, declaration.name.name
+                    ),
+                    provided.name.span,
+                ));
+            }
+        }
+    }
+
+    fn concrete_trait_environment(
+        &mut self,
+        declaration: &ast::TraitDeclaration,
+        implementation: &ast::ImplDeclaration,
+    ) -> Option<GenericEnvironment> {
+        let target = self
+            .types
+            .resolve_type_name(&implementation.target, &mut self.diagnostics)?;
+        let mut environment = GenericEnvironment::default();
+        environment.types.insert("Self".to_owned(), target);
+        let trait_type = implementation.trait_type.as_ref()?;
+        let arguments = match &trait_type.kind {
+            TypeNameKind::Path(_) => &[][..],
+            TypeNameKind::Generic { arguments, .. } => arguments.as_slice(),
+            _ => return None,
+        };
+        self.types
+            .bind_generic_arguments(
+                &declaration.generic_parameters,
+                arguments,
+                &environment,
+                trait_type.span,
+                &mut self.diagnostics,
+            )
+            .map(|(_, environment)| environment)
+    }
+
+    fn validate_concrete_trait_method_signature(
+        &mut self,
+        declaration: &ast::TraitDeclaration,
+        required: &ast::TraitMethod,
+        provided: &ast::Function,
+        environment: &GenericEnvironment,
+    ) {
+        for (required_parameter, provided_parameter) in
+            required.parameters.iter().zip(&provided.parameters)
+        {
+            let required_type = self.types.resolve_type_name_in(
+                &required_parameter.ty,
+                environment,
+                &mut self.diagnostics,
+            );
+            let provided_type = self.types.resolve_type_name_in(
+                &provided_parameter.ty,
+                environment,
+                &mut self.diagnostics,
+            );
+            if required_type != provided_type {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6013",
+                    format!(
+                        "parameter `{}` of method `{}` does not match trait `{}`",
+                        provided_parameter.name.name, provided.name.name, declaration.name.name
+                    ),
+                    provided_parameter.ty.span,
+                ));
+            }
+        }
+        let required_return = required
+            .return_type
+            .as_ref()
+            .map_or(Some(Type::Unit), |ty| {
+                self.types
+                    .resolve_type_name_in(ty, environment, &mut self.diagnostics)
+            });
+        let provided_return = provided
+            .return_type
+            .as_ref()
+            .map_or(Some(Type::Unit), |ty| {
+                self.types
+                    .resolve_type_name_in(ty, environment, &mut self.diagnostics)
+            });
+        if required_return != provided_return {
+            self.diagnostics.push(Diagnostic::error(
+                "E6013",
+                format!(
+                    "return type of method `{}` does not match trait `{}`",
+                    provided.name.name, declaration.name.name
+                ),
+                provided
+                    .return_type
+                    .as_ref()
+                    .map_or(provided.span, |ty| ty.span),
+            ));
+        }
+    }
+
+    fn resolve_type_definitions(&mut self, program: &ast::Program) {
+        for item in &program.items {
+            match item {
+                Item::Struct(declaration) => self.resolve_struct_definition(declaration),
+                Item::Enum(declaration) => self.resolve_enum_definition(declaration),
+                _ => {}
+            }
+        }
+    }
+
+    fn resolve_struct_definition(&mut self, declaration: &ast::StructDeclaration) {
+        if !declaration.generic_parameters.is_empty() {
+            return;
+        }
+        let Some(Type::Struct(id)) = self.types.names.get(&declaration.name.name).copied() else {
+            return;
+        };
+        let index = usize::try_from(id.0).unwrap_or(usize::MAX);
+        if !self
+            .types
+            .definitions
+            .get(index)
+            .is_some_and(|definition| definition.span == declaration.span)
+        {
+            return;
+        }
+        let fields = self.resolve_fields(&declaration.fields);
+        if let Some(definition) = self.types.definitions.get_mut(index) {
+            definition.kind = hir::TypeDefinitionKind::Struct { fields };
+        }
+    }
+
+    fn resolve_enum_definition(&mut self, declaration: &ast::EnumDeclaration) {
+        if !declaration.generic_parameters.is_empty() {
+            return;
+        }
+        let Some(Type::Enum(id)) = self.types.names.get(&declaration.name.name).copied() else {
+            return;
+        };
+        let index = usize::try_from(id.0).unwrap_or(usize::MAX);
+        if !self
+            .types
+            .definitions
+            .get(index)
+            .is_some_and(|definition| definition.span == declaration.span)
+        {
+            return;
+        }
+        let mut names = HashMap::new();
+        let mut variants = Vec::with_capacity(declaration.variants.len());
+        for variant in &declaration.variants {
+            if names
+                .insert(&variant.name.name, variant.name.span)
+                .is_some()
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3009",
+                    format!(
+                        "enum variant `{}` is declared more than once",
+                        variant.name.name
+                    ),
+                    variant.name.span,
+                ));
+            }
+            let fields = match &variant.payload {
+                ast::EnumVariantPayload::Unit => hir::EnumVariantFields::Unit,
+                ast::EnumVariantPayload::Tuple(types) => {
+                    let mut resolved = Vec::with_capacity(types.len());
+                    for ty in types {
+                        if let Some(ty) = self.types.resolve_type_name(ty, &mut self.diagnostics) {
+                            resolved.push(ty);
+                        }
+                    }
+                    hir::EnumVariantFields::Tuple(resolved)
+                }
+                ast::EnumVariantPayload::Struct(fields) => {
+                    hir::EnumVariantFields::Struct(self.resolve_fields(fields))
+                }
+            };
+            variants.push(hir::EnumVariant {
+                name: variant.name.name.clone(),
+                fields,
+                span: variant.span,
+            });
+        }
+        if let Some(definition) = self.types.definitions.get_mut(index) {
+            definition.kind = hir::TypeDefinitionKind::Enum { variants };
+        }
+    }
+
+    fn resolve_fields(&mut self, fields: &[ast::StructField]) -> Vec<hir::TypeField> {
+        let mut names = HashMap::new();
+        let mut resolved = Vec::with_capacity(fields.len());
+        for field in fields {
+            if names.insert(&field.name.name, field.name.span).is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3010",
+                    format!("field `{}` is declared more than once", field.name.name),
+                    field.name.span,
+                ));
+            }
+            if let Some(ty) = self
+                .types
+                .resolve_type_name(&field.ty, &mut self.diagnostics)
+            {
+                resolved.push(hir::TypeField {
+                    name: field.name.name.clone(),
+                    is_public: field.is_public,
+                    ty,
+                    span: field.span,
+                });
+            }
+        }
+        resolved
+    }
+
+    fn validate_type_cycles(&mut self) {
+        let mut states = vec![0_u8; self.types.definitions.len()];
+        for index in 0..self.types.definitions.len() {
+            if states[index] != 0 {
+                continue;
+            }
+            let Ok(raw_id) = u32::try_from(index) else {
+                break;
+            };
+            let Some(cyclic) =
+                find_type_cycle(&self.types.definitions, &mut states, TypeId(raw_id))
+            else {
+                continue;
+            };
+            let Some(definition) = self
+                .types
+                .definitions
+                .get(usize::try_from(cyclic.0).unwrap_or(usize::MAX))
+            else {
+                continue;
+            };
+            let name = definition.name.as_deref().unwrap_or("structural type");
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3012",
+                    format!("type `{name}` contains itself by value"),
+                    definition.span,
+                )
+                .with_help("break the cycle with an owning handle or raw pointer"),
+            );
+        }
+    }
+
+    fn collect_declarations<'ast>(
+        &mut self,
+        program: &'ast ast::Program,
+    ) -> Vec<Declaration<'ast>> {
+        let mut declarations = Vec::new();
+
+        for item in &program.items {
+            match item {
+                Item::Function(function) => {
+                    self.collect_reimer_declaration(
+                        &mut declarations,
+                        function,
+                        function.name.name.clone(),
+                    );
+                }
+                Item::ExternFunction(function) => {
+                    self.collect_extern_declaration(&mut declarations, function);
+                }
+                Item::Impl(implementation) => {
+                    self.collect_impl_declarations(&mut declarations, implementation);
+                }
+                Item::Import(_) | Item::Struct(_) | Item::Enum(_) | Item::Trait(_) => {}
+            }
+        }
+
+        declarations
+    }
+
+    fn collect_reimer_declaration<'ast>(
+        &mut self,
+        declarations: &mut Vec<Declaration<'ast>>,
+        function: &'ast ast::Function,
+        resolved_name: String,
+    ) {
+        if !function.generic_parameters.is_empty() {
+            self.register_generic_function_template(
+                function,
+                function.generic_parameters.clone(),
+                function.where_predicates.clone(),
+                resolved_name,
+            );
+            return;
+        }
+        let source = SignatureSource {
+            resolved_name: &resolved_name,
+            source_name: &function.name,
+            parameters: &function.parameters,
+            return_type: function.return_type.as_ref(),
+            span: function.span,
+            requires_unsafe: false,
+            is_public: function.is_public,
+        };
+        let Some(signature) = self.build_signature(declarations.len(), &source) else {
+            return;
+        };
+        self.signatures
+            .insert(resolved_name.clone(), signature.clone());
+        declarations.push(Declaration::Reimer {
+            function,
+            resolved_name,
+            signature,
+        });
+    }
+
+    fn register_generic_function_template(
+        &mut self,
+        function: &ast::Function,
+        parameters: Vec<ast::GenericParameter>,
+        where_predicates: Vec<ast::WherePredicate>,
+        resolved_name: String,
+    ) {
+        validate_generic_parameter_names(&parameters, &mut self.diagnostics);
+        if self.signatures.contains_key(&resolved_name)
+            || self
+                .generic_functions
+                .templates
+                .contains_key(&resolved_name)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3004",
+                    format!("function `{resolved_name}` is declared more than once"),
+                    function.name.span,
+                )
+                .with_help("rename or remove one of the declarations"),
+            );
+            return;
+        }
+        self.generic_functions.templates.insert(
+            resolved_name.clone(),
+            GenericFunctionTemplate {
+                function: function.clone(),
+                parameters,
+                where_predicates,
+                module_identity: symbol_module_identity(&resolved_name).map(str::to_owned),
+                resolved_name,
+            },
+        );
+    }
+
+    fn collect_extern_declaration<'ast>(
+        &mut self,
+        declarations: &mut Vec<Declaration<'ast>>,
+        function: &'ast ast::ExternFunction,
+    ) {
+        let source = SignatureSource {
+            resolved_name: &function.name.name,
+            source_name: &function.name,
+            parameters: &function.parameters,
+            return_type: function.return_type.as_ref(),
+            span: function.span,
+            requires_unsafe: true,
+            is_public: function.is_public,
+        };
+        let Some(signature) = self.build_signature(declarations.len(), &source) else {
+            return;
+        };
+        self.validate_extern_signature(function, &signature);
+        self.signatures
+            .insert(function.name.name.clone(), signature.clone());
+        declarations.push(Declaration::Extern {
+            function,
+            signature,
+        });
+    }
+
+    fn collect_impl_declarations<'ast>(
+        &mut self,
+        declarations: &mut Vec<Declaration<'ast>>,
+        implementation: &'ast ast::ImplDeclaration,
+    ) {
+        let has_generic_methods = implementation
+            .methods
+            .iter()
+            .any(|method| !method.generic_parameters.is_empty());
+        if !implementation.generic_parameters.is_empty() || has_generic_methods {
+            let Some(owner) = type_constructor_name(&implementation.target).map(str::to_owned)
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6001",
+                    "generic impl requires a single nominal target type",
+                    implementation.target.span,
+                ));
+                return;
+            };
+            if !self.types.generic_templates.contains_key(&owner)
+                && !self.types.names.contains_key(&owner)
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E6001",
+                    format!("cannot implement methods for unknown type `{owner}`"),
+                    implementation.target.span,
+                ));
+                return;
+            }
+            validate_generic_parameter_names(
+                &implementation.generic_parameters,
+                &mut self.diagnostics,
+            );
+            for method in &implementation.methods {
+                let mut parameters = implementation.generic_parameters.clone();
+                parameters.extend(method.generic_parameters.iter().cloned());
+                let mut where_predicates = implementation.where_predicates.clone();
+                where_predicates.extend(method.where_predicates.iter().cloned());
+                let resolved_name = format!("{owner}::{}", method.name.name);
+                self.register_generic_function_template(
+                    method,
+                    parameters,
+                    where_predicates,
+                    resolved_name,
+                );
+            }
+            return;
+        }
+        let Some(target) = self
+            .types
+            .resolve_type_name(&implementation.target, &mut self.diagnostics)
+        else {
+            return;
+        };
+        let Some(owner) = self
+            .types
+            .definition(target)
+            .and_then(|definition| definition.name.clone())
+        else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6001",
+                    "inherent impl requires a named struct or enum",
+                    implementation.target.span,
+                )
+                .with_help("implement methods on a declared nominal type"),
+            );
+            return;
+        };
+        for method in &implementation.methods {
+            let resolved_name = format!("{owner}::{}", method.name.name);
+            self.collect_reimer_declaration(declarations, method, resolved_name);
+        }
+    }
+
+    fn build_signature(
+        &mut self,
+        declaration_count: usize,
+        source: &SignatureSource<'_>,
+    ) -> Option<Signature> {
+        if self.signatures.contains_key(source.resolved_name)
+            || self
+                .generic_functions
+                .templates
+                .contains_key(source.resolved_name)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3004",
+                    format!(
+                        "function `{}` is declared more than once",
+                        source.resolved_name
+                    ),
+                    source.source_name.span,
+                )
+                .with_help("rename or remove one of the declarations"),
+            );
+            return None;
+        }
+        let Ok(index) = u32::try_from(declaration_count) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3999",
+                "this compilation unit contains too many functions",
+                source.span,
+            ));
+            return None;
+        };
+        let parameter_types = source
+            .parameters
+            .iter()
+            .map(|parameter| {
+                self.types
+                    .resolve_type_name(&parameter.ty, &mut self.diagnostics)
+                    .unwrap_or(Type::Unit)
+            })
+            .collect();
+        let return_type = source.return_type.map_or(Type::Unit, |ty| {
+            self.types
+                .resolve_type_name(ty, &mut self.diagnostics)
+                .unwrap_or(Type::Unit)
+        });
+        Some(Signature {
+            id: FunctionId(index),
+            parameter_types,
+            return_type,
+            requires_unsafe: source.requires_unsafe,
+            is_public: source.is_public,
+        })
+    }
+
+    fn validate_extern_signature(&mut self, function: &ast::ExternFunction, signature: &Signature) {
+        for (parameter, ty) in function.parameters.iter().zip(&signature.parameter_types) {
+            if !self.types.is_ffi_safe_type(*ty) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E5001",
+                        format!("type `{ty}` is not ABI-safe in an extern parameter"),
+                        parameter.ty.span,
+                    )
+                    .with_help("use C-compatible scalars, cstr, or raw pointers"),
+                );
+            }
+        }
+        if !self.types.is_ffi_safe_return_type(signature.return_type) {
+            let span = function
+                .return_type
+                .as_ref()
+                .map_or(function.span, |ty| ty.span);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E5001",
+                    format!(
+                        "type `{}` is not ABI-safe as an extern return value",
+                        signature.return_type
+                    ),
+                    span,
+                )
+                .with_help("use `()`, a C-compatible scalar, cstr, or a raw pointer"),
+            );
+        }
+    }
+
+    fn validate_entry(&mut self) -> Option<FunctionId> {
+        let Some(main) = self.signatures.get("main") else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3001",
+                    "program requires a `main` function",
+                    Span::empty(0),
+                )
+                .with_help("add `fn main() -> i32 { ... }`"),
+            );
+            return None;
+        };
+        let id = main.id;
+        if main.requires_unsafe {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3001",
+                    "`main` must have a Reimer function body",
+                    Span::empty(0),
+                )
+                .with_help("declare `fn main() -> i32 { ... }`"),
+            );
+        }
+        let has_parameters = !main.parameter_types.is_empty();
+        let returns_i32 = main.return_type == Type::I32;
+
+        if has_parameters {
+            self.diagnostics.push(Diagnostic::error(
+                "E3002",
+                "`main` cannot accept parameters",
+                Span::empty(0),
+            ));
+        }
+        if !returns_i32 {
+            self.diagnostics.push(
+                Diagnostic::error("E3003", "`main` must return `i32`", Span::empty(0))
+                    .with_help("declare `fn main() -> i32`"),
+            );
+        }
+        Some(id)
+    }
+}
+
+fn find_type_cycle(
+    definitions: &[hir::TypeDefinition],
+    states: &mut [u8],
+    id: TypeId,
+) -> Option<TypeId> {
+    let index = usize::try_from(id.0).ok()?;
+    match states.get(index).copied()? {
+        1 => return Some(id),
+        2 => return None,
+        _ => {}
+    }
+    states[index] = 1;
+    let definition = definitions.get(index)?;
+    for child in composite_children(definition) {
+        if let Some(cyclic) = find_type_cycle(definitions, states, child) {
+            return Some(cyclic);
+        }
+    }
+    states[index] = 2;
+    None
+}
+
+fn composite_children(definition: &hir::TypeDefinition) -> Vec<TypeId> {
+    let mut children = Vec::new();
+    match &definition.kind {
+        hir::TypeDefinitionKind::Struct { fields } => {
+            children.extend(
+                fields
+                    .iter()
+                    .filter_map(|field| composite_type_id(field.ty)),
+            );
+        }
+        hir::TypeDefinitionKind::Enum { variants } => {
+            for variant in variants {
+                match &variant.fields {
+                    hir::EnumVariantFields::Unit => {}
+                    hir::EnumVariantFields::Tuple(types) => {
+                        children.extend(types.iter().filter_map(|ty| composite_type_id(*ty)));
+                    }
+                    hir::EnumVariantFields::Struct(fields) => {
+                        children.extend(
+                            fields
+                                .iter()
+                                .filter_map(|field| composite_type_id(field.ty)),
+                        );
+                    }
+                }
+            }
+        }
+        hir::TypeDefinitionKind::Tuple { elements } => {
+            children.extend(elements.iter().filter_map(|ty| composite_type_id(*ty)));
+        }
+        hir::TypeDefinitionKind::Array { element, .. } => {
+            children.extend(composite_type_id(*element));
+        }
+        hir::TypeDefinitionKind::Reference { .. }
+        | hir::TypeDefinitionKind::RawPointer { .. }
+        | hir::TypeDefinitionKind::Slice { .. }
+        | hir::TypeDefinitionKind::Function { .. } => {}
+    }
+    children
+}
+
+fn composite_type_id(ty: Type) -> Option<TypeId> {
+    match ty {
+        Type::Struct(id)
+        | Type::Enum(id)
+        | Type::Tuple(id)
+        | Type::Array(id)
+        | Type::Reference(id)
+        | Type::RawPointer(id)
+        | Type::Slice(id)
+        | Type::Function(id) => Some(id),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Binding {
+    local: LocalId,
+    ty: Type,
+    mutable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continues,
+    Stops,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopKind {
+    Statement,
+    Expression,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoopContext {
+    kind: LoopKind,
+    expected: Option<Type>,
+    break_type: Option<Type>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BorrowState {
+    shared: u32,
+    mutable: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeferredUse {
+    span: Span,
+    consuming: bool,
+}
+
+struct FunctionAnalyzer<'context> {
+    signatures: &'context mut HashMap<String, Signature>,
+    generic_functions: &'context mut GenericFunctionRegistry,
+    types: &'context mut TypeRegistry,
+    diagnostics: &'context mut Vec<Diagnostic>,
+    signature: Signature,
+    generic_environment: GenericEnvironment,
+    scopes: Vec<HashMap<String, Binding>>,
+    next_local: u32,
+    loops: Vec<LoopContext>,
+    unsafe_depth: usize,
+    parameter_count: u32,
+    borrow_states: HashMap<LocalId, BorrowState>,
+    borrow_scopes: Vec<Vec<(LocalId, bool)>>,
+    persistent_borrow: bool,
+    defer_depth: usize,
+    moved_locals: HashMap<LocalId, Span>,
+    deferred_uses: HashMap<LocalId, DeferredUse>,
+    deferred_use_scopes: Vec<Vec<LocalId>>,
+    consuming_value: bool,
+    reborrow_argument: bool,
+    module_identity: Option<String>,
+}
+
+impl<'context> FunctionAnalyzer<'context> {
+    fn new(
+        signatures: &'context mut HashMap<String, Signature>,
+        generic_functions: &'context mut GenericFunctionRegistry,
+        types: &'context mut TypeRegistry,
+        diagnostics: &'context mut Vec<Diagnostic>,
+        signature: Signature,
+        generic_environment: GenericEnvironment,
+        module_identity: Option<String>,
+    ) -> Self {
+        Self {
+            signatures,
+            generic_functions,
+            types,
+            diagnostics,
+            signature,
+            generic_environment,
+            scopes: vec![HashMap::new()],
+            next_local: 0,
+            loops: Vec::new(),
+            unsafe_depth: 0,
+            parameter_count: 0,
+            borrow_states: HashMap::new(),
+            borrow_scopes: vec![Vec::new()],
+            persistent_borrow: false,
+            defer_depth: 0,
+            moved_locals: HashMap::new(),
+            deferred_uses: HashMap::new(),
+            deferred_use_scopes: vec![Vec::new()],
+            consuming_value: true,
+            reborrow_argument: false,
+            module_identity,
+        }
+    }
+
+    fn analyze(&mut self, function: &ast::Function, resolved_name: String) -> hir::Function {
+        let mut parameters = Vec::with_capacity(function.parameters.len());
+        let parameter_types = self.signature.parameter_types.clone();
+        for (parameter, ty) in function.parameters.iter().zip(parameter_types) {
+            let local = self.new_local(parameter.span);
+            if self.scopes[0]
+                .insert(
+                    parameter.name.name.clone(),
+                    Binding {
+                        local,
+                        ty,
+                        mutable: false,
+                    },
+                )
+                .is_some()
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3101",
+                        format!(
+                            "parameter `{}` is declared more than once",
+                            parameter.name.name
+                        ),
+                        parameter.name.span,
+                    )
+                    .with_help("give each parameter a unique name"),
+                );
+            }
+            parameters.push(hir::Parameter {
+                local,
+                name: parameter.name.name.clone(),
+                ty,
+                span: parameter.span,
+            });
+        }
+        self.parameter_count = self.next_local;
+
+        let analyzed = self.analyze_block(&function.body, Some(self.signature.return_type));
+        if let Some(tail) = function.body.tail.as_deref() {
+            self.validate_scoped_return(tail, tail.span());
+        }
+        if !self.signature.return_type.accepts(analyzed.ty) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3111",
+                    format!(
+                        "function `{}` returns `{}`, but its body produces `{}`",
+                        function.name.name, self.signature.return_type, analyzed.ty
+                    ),
+                    function.body.span,
+                )
+                .with_help(format!(
+                    "return a `{}` value on every reachable path",
+                    self.signature.return_type
+                )),
+            );
+        }
+
+        hir::Function {
+            id: self.signature.id,
+            name: resolved_name,
+            is_public: function.is_public,
+            parameters,
+            return_type: self.signature.return_type,
+            body: analyzed,
+            span: function.span,
+        }
+    }
+
+    fn analyze_block(&mut self, block: &ast::Block, expected_tail: Option<Type>) -> hir::Block {
+        self.push_scope();
+        let mut statements = Vec::with_capacity(block.statements.len());
+        let mut flow = Flow::Continues;
+
+        for statement in &block.statements {
+            let (statement, statement_flow) = self.analyze_statement(statement);
+            statements.push(statement);
+            if flow == Flow::Continues && statement_flow == Flow::Stops {
+                flow = Flow::Stops;
+            }
+        }
+
+        let tail = block.tail.as_deref().map(|expression| {
+            Box::new(self.analyze_expression_expected(expression, expected_tail))
+        });
+        let ty = if flow == Flow::Stops {
+            Type::Never
+        } else {
+            tail.as_ref().map_or(Type::Unit, |expression| expression.ty)
+        };
+        self.pop_scope();
+
+        hir::Block {
+            statements,
+            tail,
+            ty,
+            span: block.span,
+        }
+    }
+
+    fn analyze_statement(&mut self, statement: &AstStatement) -> (hir::Statement, Flow) {
+        match statement {
+            AstStatement::Let(binding) => self.analyze_let_statement(binding),
+            AstStatement::Expression(statement) => {
+                let expression = self.analyze_expression(&statement.expression);
+                let flow = if expression.ty == Type::Never {
+                    Flow::Stops
+                } else {
+                    Flow::Continues
+                };
+                (hir::Statement::Expression(expression), flow)
+            }
+            AstStatement::Defer(statement) => {
+                self.defer_depth += 1;
+                let action = self.analyze_expression_expected(&statement.action, Some(Type::Unit));
+                self.defer_depth -= 1;
+                self.require_type(Type::Unit, action.ty, action.span, "deferred action");
+                (
+                    hir::Statement::Defer {
+                        action,
+                        span: statement.span,
+                    },
+                    Flow::Continues,
+                )
+            }
+            AstStatement::Return(statement) => {
+                self.reject_deferred_control_flow("`return`", statement.span);
+                if let Some(value) = &statement.value {
+                    self.validate_scoped_return(value, statement.span);
+                }
+                let value = statement.value.as_ref().map(|value| {
+                    self.analyze_expression_expected(value, Some(self.signature.return_type))
+                });
+                let actual = value.as_ref().map_or(Type::Unit, |value| value.ty);
+                self.require_type(
+                    self.signature.return_type,
+                    actual,
+                    statement.span,
+                    "return value",
+                );
+                (
+                    hir::Statement::Return {
+                        value,
+                        span: statement.span,
+                    },
+                    Flow::Stops,
+                )
+            }
+            AstStatement::While(statement) => self.analyze_while_statement(statement),
+            AstStatement::For(statement) => self.analyze_for_statement(statement),
+            AstStatement::Break(statement) => {
+                self.reject_deferred_control_flow("`break`", statement.span);
+                let expected = self.loops.last().and_then(|context| context.expected);
+                let value = statement
+                    .value
+                    .as_ref()
+                    .map(|value| self.analyze_expression_expected(value, expected));
+                let actual = value.as_ref().map_or(Type::Unit, |value| value.ty);
+                if self.loops.is_empty() {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E3109",
+                        "`break` can only be used inside a loop",
+                        statement.span,
+                    ));
+                } else {
+                    self.record_break_type(actual, statement.span);
+                }
+                (
+                    hir::Statement::Break {
+                        value,
+                        span: statement.span,
+                    },
+                    Flow::Stops,
+                )
+            }
+            AstStatement::Continue(span) => {
+                self.reject_deferred_control_flow("`continue`", *span);
+                if self.loops.is_empty() {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E3110",
+                        "`continue` can only be used inside a loop",
+                        *span,
+                    ));
+                }
+                (hir::Statement::Continue(*span), Flow::Stops)
+            }
+        }
+    }
+
+    fn reject_deferred_control_flow(&mut self, operation: &str, span: Span) {
+        if self.defer_depth > 0 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3142",
+                    format!("{operation} cannot transfer control from a deferred action"),
+                    span,
+                )
+                .with_help("move the control-flow operation outside the `defer` action"),
+            );
+        }
+    }
+
+    fn analyze_let_statement(&mut self, binding: &ast::LetStatement) -> (hir::Statement, Flow) {
+        let declared_type = binding.ty.as_ref().and_then(|ty| {
+            self.types
+                .resolve_type_name_in(ty, &self.generic_environment, self.diagnostics)
+        });
+        let previous_persistence = self.persistent_borrow;
+        self.persistent_borrow = initializer_stores_borrow(&binding.initializer);
+        let initializer = self.analyze_expression_expected(&binding.initializer, declared_type);
+        self.persistent_borrow = previous_persistence;
+        let ty = declared_type.unwrap_or(initializer.ty);
+        if let Some(declared_type) = declared_type {
+            self.require_type(
+                declared_type,
+                initializer.ty,
+                binding.initializer.span(),
+                "binding initializer",
+            );
+        }
+        let local = self.new_local(binding.name.span);
+        self.current_scope().insert(
+            binding.name.name.clone(),
+            Binding {
+                local,
+                ty,
+                mutable: binding.mutable,
+            },
+        );
+        let flow = if initializer.ty == Type::Never {
+            Flow::Stops
+        } else {
+            Flow::Continues
+        };
+        (
+            hir::Statement::Let {
+                local,
+                name: binding.name.name.clone(),
+                mutable: binding.mutable,
+                ty,
+                initializer,
+                span: binding.span,
+            },
+            flow,
+        )
+    }
+
+    fn validate_scoped_return(&mut self, expression: &AstExpression, span: Span) {
+        if !self.types.is_scoped(self.signature.return_type) {
+            return;
+        }
+        match expression {
+            AstExpression::Match(expression) => {
+                for arm in &expression.arms {
+                    if !scoped_return_is_empty(&arm.body) {
+                        self.validate_scoped_return(&arm.body, arm.span);
+                    }
+                }
+                return;
+            }
+            AstExpression::If(expression) => {
+                if let Some(tail) = expression.then_branch.tail.as_deref()
+                    && !scoped_return_is_empty(tail)
+                {
+                    self.validate_scoped_return(tail, tail.span());
+                }
+                if let Some(else_branch) = expression.else_branch.as_ref()
+                    && !scoped_return_is_empty(else_branch)
+                {
+                    self.validate_scoped_return(else_branch, else_branch.span());
+                }
+                return;
+            }
+            AstExpression::Block(block) => {
+                if let Some(tail) = block.tail.as_deref()
+                    && !scoped_return_is_empty(tail)
+                {
+                    self.validate_scoped_return(tail, tail.span());
+                }
+                return;
+            }
+            _ if scoped_return_is_empty(expression) => return,
+            _ => {}
+        }
+        let scoped_parameters = self
+            .signature
+            .parameter_types
+            .iter()
+            .filter(|ty| self.types.is_scoped(**ty))
+            .count();
+        if scoped_parameters != 1
+            || !self
+                .signature
+                .parameter_types
+                .first()
+                .is_some_and(|ty| self.types.is_scoped(*ty))
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3137",
+                    "a scoped return requires exactly one scoped source as its first parameter",
+                    span,
+                )
+                .with_help(
+                    "place the owner or borrowed source first and return owned data when multiple lifetimes are involved",
+                ),
+            );
+            return;
+        }
+        let safe_parameter = scoped_return_root(expression)
+            .and_then(|path| single_path_name(path))
+            .and_then(|name| self.lookup(name))
+            .is_some_and(|binding| {
+                if binding.local.0 >= self.parameter_count {
+                    return false;
+                }
+                binding.ty == self.signature.return_type
+                    || self
+                        .types
+                        .pointer_shape(binding.ty)
+                        .is_some_and(|(_, _, raw)| !raw)
+            });
+        if !safe_parameter {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3137",
+                    "a scoped reference or view cannot escape this function",
+                    span,
+                )
+                .with_help("return a reference parameter directly or return owned data"),
+            );
+        }
+    }
+
+    fn analyze_while_statement(
+        &mut self,
+        statement: &ast::WhileStatement,
+    ) -> (hir::Statement, Flow) {
+        let condition = self.analyze_expression_expected(&statement.condition, Some(Type::Bool));
+        self.require_type(
+            Type::Bool,
+            condition.ty,
+            statement.condition.span(),
+            "while condition",
+        );
+        self.loops.push(LoopContext {
+            kind: LoopKind::Statement,
+            expected: Some(Type::Unit),
+            break_type: None,
+        });
+        let body = self.analyze_block(&statement.body, None);
+        self.loops.pop();
+        (
+            hir::Statement::While {
+                condition,
+                body,
+                span: statement.span,
+            },
+            Flow::Continues,
+        )
+    }
+
+    fn analyze_for_statement(&mut self, statement: &ast::ForStatement) -> (hir::Statement, Flow) {
+        let iterable = self.analyze_expression(&statement.iterable);
+        let element_type = self
+            .array_shape(iterable.ty)
+            .map(|(element, _)| element)
+            .or_else(|| {
+                self.types
+                    .slice_shape(iterable.ty)
+                    .map(|(element, _)| element)
+            })
+            .or_else(|| {
+                let (target, _, _) = self.types.pointer_shape(iterable.ty)?;
+                self.array_shape(target).map(|(element, _)| element)
+            });
+        let Some(element_type) = element_type else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3130",
+                    format!("`for` cannot iterate over `{}`", iterable.ty),
+                    statement.iterable.span(),
+                )
+                .with_help("iteration requires an array, array reference, or slice"),
+            );
+            return (
+                hir::Statement::Expression(invalid_composite_expression(statement.span)),
+                Flow::Continues,
+            );
+        };
+        self.push_scope();
+        let pattern = self.analyze_pattern(&statement.pattern, element_type);
+        if !pattern_is_irrefutable(&pattern) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3131",
+                    "`for` requires an irrefutable pattern",
+                    statement.pattern.span(),
+                )
+                .with_help("use bindings, `_`, or tuple patterns containing only those forms"),
+            );
+        }
+        self.loops.push(LoopContext {
+            kind: LoopKind::Statement,
+            expected: Some(Type::Unit),
+            break_type: None,
+        });
+        let body = self.analyze_block(&statement.body, None);
+        self.loops.pop();
+        self.pop_scope();
+        (
+            hir::Statement::For {
+                pattern,
+                element_type,
+                iterable,
+                body,
+                span: statement.span,
+            },
+            Flow::Continues,
+        )
+    }
+
+    fn record_break_type(&mut self, actual: Type, span: Span) {
+        let Some(index) = self.loops.len().checked_sub(1) else {
+            return;
+        };
+        let context = self.loops[index];
+        if context.kind == LoopKind::Statement {
+            if actual != Type::Never && actual != Type::Unit {
+                self.type_mismatch(Type::Unit, actual, span, "statement loop break");
+            }
+            return;
+        }
+        let expected = context.expected.or(context.break_type);
+        if let Some(expected) = expected
+            && !expected.accepts(actual)
+        {
+            self.type_mismatch(expected, actual, span, "loop break value");
+            return;
+        }
+        if actual != Type::Never && context.break_type.is_none() {
+            self.loops[index].break_type = Some(actual);
+        }
+    }
+
+    fn analyze_expression(&mut self, expression: &AstExpression) -> Expression {
+        self.analyze_expression_expected(expression, None)
+    }
+
+    fn analyze_expression_non_consuming(&mut self, expression: &AstExpression) -> Expression {
+        let previous = self.consuming_value;
+        self.consuming_value = false;
+        let analyzed = self.analyze_expression(expression);
+        self.consuming_value = previous;
+        analyzed
+    }
+
+    fn analyze_expression_expected(
+        &mut self,
+        expression: &AstExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        match expression {
+            AstExpression::Integer(literal) => self.analyze_integer_literal(literal, expected),
+            AstExpression::Float(literal) => self.analyze_float_literal(literal, expected),
+            AstExpression::Character(literal) => Expression {
+                kind: ExpressionKind::Character(literal.value),
+                ty: Type::Char,
+                span: literal.span,
+            },
+            AstExpression::String(literal) => {
+                if let Some(expected) = expected {
+                    self.require_type(expected, Type::Str, literal.span, "string literal");
+                }
+                Expression {
+                    kind: ExpressionKind::String(literal.value.clone()),
+                    ty: Type::Str,
+                    span: literal.span,
+                }
+            }
+            AstExpression::CString(literal) => {
+                if let Some(expected) = expected {
+                    self.require_type(expected, Type::CStr, literal.span, "C string literal");
+                }
+                Expression {
+                    kind: ExpressionKind::CString(literal.value.clone()),
+                    ty: Type::CStr,
+                    span: literal.span,
+                }
+            }
+            AstExpression::Boolean(literal) => Expression {
+                kind: ExpressionKind::Boolean(literal.value),
+                ty: Type::Bool,
+                span: literal.span,
+            },
+            AstExpression::Unit(span) => Expression {
+                kind: ExpressionKind::Unit,
+                ty: Type::Unit,
+                span: *span,
+            },
+            AstExpression::Path(path) => self.analyze_path(path, expected),
+            AstExpression::Unary(expression) => self.analyze_unary(expression, expected),
+            AstExpression::Binary(expression) => self.analyze_binary(expression, expected),
+            AstExpression::Call(expression) => self.analyze_call(expression, expected),
+            AstExpression::If(expression) => self.analyze_if(expression, expected),
+            AstExpression::Match(expression) => self.analyze_match(expression, expected),
+            AstExpression::Loop(expression) => self.analyze_loop(expression, expected),
+            AstExpression::Unsafe(block) => {
+                self.unsafe_depth += 1;
+                let block = self.analyze_block(block, expected);
+                self.unsafe_depth -= 1;
+                let ty = block.ty;
+                Expression {
+                    kind: ExpressionKind::Block(Box::new(block)),
+                    ty,
+                    span: expression.span(),
+                }
+            }
+            AstExpression::Block(block) => {
+                let block = self.analyze_block(block, expected);
+                let ty = block.ty;
+                Expression {
+                    kind: ExpressionKind::Block(Box::new(block)),
+                    ty,
+                    span: expression.span(),
+                }
+            }
+            AstExpression::Assignment(expression) => self.analyze_assignment(expression),
+            AstExpression::Cast(expression) => self.analyze_cast(expression),
+            AstExpression::Tuple(expression) => self.analyze_tuple(expression, expected),
+            AstExpression::Array(expression) => self.analyze_array(expression, expected),
+            AstExpression::Struct(expression) => self.analyze_struct(expression, expected),
+            AstExpression::Field(expression) => self.analyze_field(expression),
+            AstExpression::Index(expression) => self.analyze_index(expression),
+            AstExpression::Try { value, span } => self.analyze_try(value, *span),
+        }
+    }
+
+    fn analyze_integer_literal(
+        &mut self,
+        literal: &ast::IntegerLiteral,
+        expected: Option<Type>,
+    ) -> Expression {
+        let ty = expected.filter(|ty| ty.is_integer()).unwrap_or(Type::I32);
+        let maximum = integer_positive_maximum(ty);
+        let value = if literal.value <= maximum {
+            literal.value
+        } else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3104",
+                    format!("integer literal does not fit in `{ty}`"),
+                    literal.span,
+                )
+                .with_help(format!("use a value no greater than {maximum}")),
+            );
+            0
+        };
+        Expression {
+            kind: ExpressionKind::Integer(value),
+            ty,
+            span: literal.span,
+        }
+    }
+
+    fn analyze_float_literal(
+        &mut self,
+        literal: &ast::FloatLiteral,
+        expected: Option<Type>,
+    ) -> Expression {
+        let ty = expected.filter(|ty| ty.is_float()).unwrap_or(Type::F64);
+        let value = literal.value();
+        let kind = if ty == Type::F32 {
+            let narrowed = narrow_f64_to_f32(value);
+            if narrowed.is_finite() {
+                ExpressionKind::Float32(narrowed.to_bits())
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3104",
+                    "floating-point literal does not fit in `f32`",
+                    literal.span,
+                ));
+                ExpressionKind::Float32(0.0_f32.to_bits())
+            }
+        } else {
+            ExpressionKind::Float64(literal.bits)
+        };
+        Expression {
+            kind,
+            ty,
+            span: literal.span,
+        }
+    }
+
+    fn analyze_tuple(
+        &mut self,
+        tuple: &ast::TupleExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        let expected_elements = expected.and_then(|ty| {
+            let definition = self.types.definition(ty)?;
+            let hir::TypeDefinitionKind::Tuple { elements } = &definition.kind else {
+                return None;
+            };
+            Some(elements.clone())
+        });
+        if let Some(elements) = &expected_elements
+            && elements.len() != tuple.elements.len()
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E3115",
+                format!(
+                    "tuple requires {} element(s), found {}",
+                    elements.len(),
+                    tuple.elements.len()
+                ),
+                tuple.span,
+            ));
+        }
+        let elements: Vec<_> = tuple
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(index, element)| {
+                self.analyze_expression_expected(
+                    element,
+                    expected_elements
+                        .as_ref()
+                        .and_then(|types| types.get(index).copied()),
+                )
+            })
+            .collect();
+        let ty = expected
+            .filter(|ty| matches!(ty, Type::Tuple(_)))
+            .or_else(|| {
+                self.types.intern_tuple(
+                    elements.iter().map(|element| element.ty).collect(),
+                    tuple.span,
+                    self.diagnostics,
+                )
+            })
+            .unwrap_or(Type::Unit);
+        Expression {
+            kind: ExpressionKind::Tuple(elements),
+            ty,
+            span: tuple.span,
+        }
+    }
+
+    fn analyze_array(
+        &mut self,
+        array: &ast::ArrayExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        let expected_shape = expected.and_then(|ty| {
+            let definition = self.types.definition(ty)?;
+            let hir::TypeDefinitionKind::Array { element, length } = definition.kind else {
+                return None;
+            };
+            Some((element, length))
+        });
+        if let Some((_, length)) = expected_shape
+            && usize::try_from(length).ok() != Some(array.elements.len())
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E3116",
+                format!(
+                    "array requires {length} element(s), found {}",
+                    array.elements.len()
+                ),
+                array.span,
+            ));
+        }
+        let mut elements = Vec::with_capacity(array.elements.len());
+        let mut element_type = expected_shape.map(|shape| shape.0);
+        for element in &array.elements {
+            let analyzed = self.analyze_expression_expected(element, element_type);
+            if let Some(expected) = element_type {
+                self.require_type(expected, analyzed.ty, analyzed.span, "array element");
+            } else {
+                element_type = Some(analyzed.ty);
+            }
+            elements.push(analyzed);
+        }
+        let Some(element_type) = element_type else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3117",
+                    "cannot infer the element type of an empty array",
+                    array.span,
+                )
+                .with_help("add an explicit array type annotation"),
+            );
+            return Expression {
+                kind: ExpressionKind::Array(elements),
+                ty: Type::Unit,
+                span: array.span,
+            };
+        };
+        let length = u64::try_from(array.elements.len()).unwrap_or(u64::MAX);
+        let ty = expected
+            .filter(|ty| matches!(ty, Type::Array(_)))
+            .or_else(|| {
+                self.types
+                    .intern_array(element_type, length, array.span, self.diagnostics)
+            })
+            .unwrap_or(Type::Unit);
+        Expression {
+            kind: ExpressionKind::Array(elements),
+            ty,
+            span: array.span,
+        }
+    }
+
+    fn analyze_struct(
+        &mut self,
+        structure: &ast::StructExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        match structure.path.segments.as_slice() {
+            [name] => {
+                let ty = self
+                    .types
+                    .names
+                    .get(&name.name)
+                    .copied()
+                    .filter(|ty| matches!(ty, Type::Struct(_)))
+                    .or_else(|| {
+                        expected.filter(|ty| {
+                            matches!(ty, Type::Struct(_))
+                                && self
+                                    .types
+                                    .generic_instance(*ty)
+                                    .is_some_and(|instance| instance.base_name == name.name)
+                        })
+                    });
+                let Some(ty) = ty else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E3118",
+                        format!("`{}` is not a struct type", structure.path.display()),
+                        structure.path.span,
+                    ));
+                    return invalid_composite_expression(structure.span);
+                };
+                let fields = self.struct_fields(ty);
+                self.reject_external_private_construction(ty, &fields, structure.path.span);
+                let values = self.analyze_named_fields(&structure.fields, &fields);
+                Expression {
+                    kind: ExpressionKind::Struct(values),
+                    ty,
+                    span: structure.span,
+                }
+            }
+            [enum_name, variant_name] => {
+                let Some(ty @ Type::Enum(_)) = self.types.names.get(&enum_name.name).copied()
+                else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E3118",
+                        format!("`{}` is not an enum type", enum_name.name),
+                        enum_name.span,
+                    ));
+                    return invalid_composite_expression(structure.span);
+                };
+                let Some((variant, hir::EnumVariantFields::Struct(fields))) =
+                    self.enum_variant(ty, &variant_name.name)
+                else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E3119",
+                        format!(
+                            "`{}` is not a struct-like enum variant",
+                            structure.path.display()
+                        ),
+                        structure.path.span,
+                    ));
+                    return invalid_composite_expression(structure.span);
+                };
+                self.reject_external_private_construction(ty, &fields, structure.path.span);
+                let values = self.analyze_named_fields(&structure.fields, &fields);
+                Expression {
+                    kind: ExpressionKind::Enum {
+                        variant,
+                        fields: values,
+                    },
+                    ty,
+                    span: structure.span,
+                }
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3118",
+                    "aggregate construction requires a local type or enum variant path",
+                    structure.path.span,
+                ));
+                invalid_composite_expression(structure.span)
+            }
+        }
+    }
+
+    fn analyze_named_fields(
+        &mut self,
+        initializers: &[ast::FieldInitializer],
+        fields: &[hir::TypeField],
+    ) -> Vec<Expression> {
+        let mut by_name = HashMap::new();
+        for initializer in initializers {
+            if by_name
+                .insert(initializer.name.name.as_str(), initializer)
+                .is_some()
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3120",
+                    format!(
+                        "field `{}` is initialized more than once",
+                        initializer.name.name
+                    ),
+                    initializer.name.span,
+                ));
+            }
+        }
+        for initializer in initializers {
+            if !fields
+                .iter()
+                .any(|field| field.name == initializer.name.name)
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3121",
+                    format!("unknown field `{}`", initializer.name.name),
+                    initializer.name.span,
+                ));
+            }
+        }
+        fields
+            .iter()
+            .map(|field| {
+                let Some(initializer) = by_name.get(field.name.as_str()) else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E3122",
+                        format!("missing initializer for field `{}`", field.name),
+                        field.span,
+                    ));
+                    return Expression {
+                        kind: ExpressionKind::Unit,
+                        ty: field.ty,
+                        span: field.span,
+                    };
+                };
+                let value = self.analyze_expression_expected(&initializer.value, Some(field.ty));
+                self.require_type(field.ty, value.ty, value.span, "field initializer");
+                value
+            })
+            .collect()
+    }
+
+    fn analyze_field(&mut self, field: &ast::FieldExpression) -> Expression {
+        let base = self.analyze_expression_non_consuming(&field.base);
+        let (base, aggregate_type) =
+            if let Some((target, _, false)) = self.types.pointer_shape(base.ty) {
+                (
+                    Expression {
+                        kind: ExpressionKind::Dereference(Box::new(base)),
+                        ty: target,
+                        span: field.base.span(),
+                    },
+                    target,
+                )
+            } else {
+                let ty = base.ty;
+                (base, ty)
+            };
+        let selection = match (aggregate_type, &field.field) {
+            (Type::Struct(_), ast::FieldName::Named(name)) => self
+                .struct_fields(aggregate_type)
+                .iter()
+                .enumerate()
+                .find(|(_, candidate)| candidate.name == name.name)
+                .and_then(|(index, candidate)| {
+                    u32::try_from(index)
+                        .ok()
+                        .map(|index| (index, candidate.ty, candidate.is_public))
+                }),
+            (Type::Tuple(_), ast::FieldName::TupleIndex { index, .. }) => {
+                self.tuple_elements(base.ty).and_then(|elements| {
+                    usize::try_from(*index)
+                        .ok()
+                        .and_then(|index| elements.get(index).copied())
+                        .map(|ty| (*index, ty, true))
+                })
+            }
+            _ => None,
+        };
+        let Some((field_index, ty, is_public)) = selection else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3123",
+                "field does not exist on this value",
+                field.span,
+            ));
+            return invalid_composite_expression(field.span);
+        };
+        if !is_public && self.type_is_external(aggregate_type) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E4005",
+                    "field is private to its defining module",
+                    field.span,
+                )
+                .with_help("access it through a public method or function"),
+            );
+        }
+        if self.consuming_value {
+            self.consume_expression_root(&field.base, ty, field.span);
+        }
+        Expression {
+            kind: ExpressionKind::Field {
+                base: Box::new(base),
+                field: field_index,
+            },
+            ty,
+            span: field.span,
+        }
+    }
+
+    fn analyze_index(&mut self, index: &ast::IndexExpression) -> Expression {
+        if self.supports_index_method(&index.base, "index") {
+            return self.analyze_index_method_call(index, "index", None);
+        }
+        let base = self.analyze_expression_non_consuming(&index.base);
+        let element = self
+            .array_shape(base.ty)
+            .map(|(element, _)| element)
+            .or_else(|| self.types.slice_shape(base.ty).map(|(element, _)| element))
+            .or_else(|| {
+                let (target, _, _) = self.types.pointer_shape(base.ty)?;
+                self.array_shape(target).map(|(element, _)| element)
+            });
+        let Some(element) = element else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3124",
+                "indexing requires an array, array reference, or slice",
+                index.base.span(),
+            ));
+            return invalid_composite_expression(index.span);
+        };
+        if index.indices.len() != 1 {
+            self.diagnostics.push(Diagnostic::error(
+                "E3125",
+                "array indexing requires exactly one index",
+                index.span,
+            ));
+        }
+        let Some(index_expression) = index.indices.first() else {
+            return invalid_composite_expression(index.span);
+        };
+        let index_expression =
+            self.analyze_expression_expected(index_expression, Some(Type::Usize));
+        self.require_type(
+            Type::Usize,
+            index_expression.ty,
+            index_expression.span,
+            "array index",
+        );
+        if self.consuming_value {
+            self.consume_expression_root(&index.base, element, index.span);
+        }
+        Expression {
+            kind: ExpressionKind::Index {
+                base: Box::new(base),
+                index: Box::new(index_expression),
+            },
+            ty: element,
+            span: index.span,
+        }
+    }
+
+    fn supports_index_method(&self, base: &AstExpression, method: &str) -> bool {
+        let Some(receiver_type) = self.place_expression_type(base) else {
+            return false;
+        };
+        let Some(owner) = self.types.nominal_name(receiver_type) else {
+            return false;
+        };
+        let resolved_name = format!("{owner}::{method}");
+        if self.signatures.contains_key(&resolved_name) {
+            return true;
+        }
+        let template_name = self.types.generic_instance(receiver_type).map_or_else(
+            || resolved_name,
+            |instance| format!("{}::{method}", instance.base_name),
+        );
+        self.generic_functions
+            .templates
+            .contains_key(&template_name)
+    }
+
+    fn analyze_index_method_call(
+        &mut self,
+        index: &ast::IndexExpression,
+        method: &str,
+        value: Option<&AstExpression>,
+    ) -> Expression {
+        let method = ast::Identifier {
+            name: method.to_owned(),
+            span: index.span,
+        };
+        let field = ast::FieldExpression {
+            base: index.base.clone(),
+            field: ast::FieldName::Named(method),
+            span: index.span,
+        };
+        let mut arguments = vec![AstExpression::Array(ast::ArrayExpression {
+            elements: index.indices.clone(),
+            span: index.span,
+        })];
+        if let Some(value) = value {
+            arguments.push(value.clone());
+        }
+        let call = ast::CallExpression {
+            callee: AstExpression::Field(Box::new(field.clone())),
+            arguments,
+            span: index.span,
+        };
+        self.analyze_method_call(&call, &field, None)
+    }
+
+    fn analyze_path(&mut self, path: &ast::Path, expected: Option<Type>) -> Expression {
+        let binding = single_path_name(path).and_then(|name| self.lookup(name));
+        if let Some(binding) = binding {
+            return self.analyze_local_path(binding, path.span);
+        }
+
+        if let Some(constant) = self.analyze_const_path(path, expected) {
+            return constant;
+        }
+
+        if let Some(expected) = expected
+            && self.types.intrinsic(expected).is_some()
+            && let Some(name) = single_path_name(path)
+            && let Some((variant, hir::EnumVariantFields::Unit)) = self.enum_variant(expected, name)
+        {
+            return Expression {
+                kind: ExpressionKind::Enum {
+                    variant,
+                    fields: Vec::new(),
+                },
+                ty: expected,
+                span: path.span,
+            };
+        }
+
+        if single_path_name(path) == Some("None") {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3139",
+                    "`None` requires an expected `Option<T>` type",
+                    path.span,
+                )
+                .with_help("add an `Option<T>` type annotation or use `None` in a typed context"),
+            );
+            return invalid_composite_expression(path.span);
+        }
+
+        if let [enum_name, variant_name] = path.segments.as_slice()
+            && let Some(ty @ Type::Enum(_)) = self.types.names.get(&enum_name.name).copied()
+            && let Some((variant, hir::EnumVariantFields::Unit)) =
+                self.enum_variant(ty, &variant_name.name)
+        {
+            return Expression {
+                kind: ExpressionKind::Enum {
+                    variant,
+                    fields: Vec::new(),
+                },
+                ty,
+                span: path.span,
+            };
+        }
+
+        if let Some(resolved_name) = function_path_name(path)
+            && let Some(signature) = self.signatures.get(&resolved_name).cloned()
+        {
+            self.validate_function_access(path, path.span, &resolved_name, &signature);
+            let ty = self
+                .types
+                .intern_function(
+                    signature.parameter_types.clone(),
+                    signature.return_type,
+                    path.span,
+                    self.diagnostics,
+                )
+                .unwrap_or(Type::Unit);
+            if let Some(expected) = expected {
+                self.require_type(expected, ty, path.span, "function value");
+            }
+            return Expression {
+                kind: ExpressionKind::Function(signature.id),
+                ty,
+                span: path.span,
+            };
+        }
+
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3102",
+                format!("cannot resolve value `{}`", path.display()),
+                path.span,
+            )
+            .with_help("declare a local binding before using it"),
+        );
+        Expression {
+            kind: ExpressionKind::Unit,
+            ty: Type::Unit,
+            span: path.span,
+        }
+    }
+
+    fn analyze_local_path(&mut self, binding: Binding, span: Span) -> Expression {
+        self.require_local_available(binding, span);
+        let borrow_state = self
+            .borrow_states
+            .get(&binding.local)
+            .copied()
+            .unwrap_or_default();
+        if borrow_state.mutable {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3138",
+                    "cannot read a value while it is mutably borrowed",
+                    span,
+                )
+                .with_help("read through the mutable reference instead"),
+            );
+        }
+        let implicit_reborrow = self.reborrow_argument && self.types.is_mutable_view(binding.ty);
+        if self.defer_depth > 0 && !self.types.is_copy(binding.ty) {
+            self.record_deferred_use(
+                binding.local,
+                span,
+                self.consuming_value && !implicit_reborrow,
+            );
+        } else if self.consuming_value && !self.types.is_copy(binding.ty) && !implicit_reborrow {
+            if borrow_state.mutable || borrow_state.shared != 0 {
+                self.diagnostics.push(
+                    Diagnostic::error("E3138", "cannot move a value while it is borrowed", span)
+                        .with_help("let the reference scope end before moving the value"),
+                );
+            }
+            if self.require_not_reserved_by_defer(binding.local, span) {
+                self.moved_locals.insert(binding.local, span);
+            }
+        }
+        Expression {
+            kind: ExpressionKind::Local(binding.local),
+            ty: binding.ty,
+            span,
+        }
+    }
+
+    fn analyze_const_path(
+        &mut self,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Option<Expression> {
+        let value = single_path_name(path)
+            .and_then(|name| self.generic_environment.constants.get(name))
+            .copied()?;
+        Some(self.analyze_integer_literal(
+            &ast::IntegerLiteral {
+                value: u128::from(value),
+                span: path.span,
+            },
+            expected.or(Some(Type::Usize)),
+        ))
+    }
+
+    fn require_local_available(&mut self, binding: Binding, span: Span) {
+        let Some(moved_at) = self.moved_locals.get(&binding.local).copied() else {
+            return;
+        };
+        self.diagnostics.push(
+            Diagnostic::error("E3143", "use of a value after it was moved", span).with_help(
+                format!(
+                    "the earlier consuming use starts at source byte {}; borrow the value or create a new owned value",
+                    moved_at.start
+                ),
+            ),
+        );
+    }
+
+    fn record_deferred_use(&mut self, local: LocalId, span: Span, consuming: bool) {
+        if let Some(existing) = self.deferred_uses.get(&local).copied() {
+            if consuming {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3147",
+                        "deferred action would consume a value needed by another deferred action",
+                        span,
+                    )
+                    .with_help(format!(
+                        "the earlier deferred use starts at source byte {}; register the consuming cleanup first",
+                        existing.span.start
+                    )),
+                );
+            }
+            return;
+        }
+        self.deferred_uses
+            .insert(local, DeferredUse { span, consuming });
+        if let Some(scope) = self.deferred_use_scopes.last_mut() {
+            scope.push(local);
+        }
+    }
+
+    fn require_not_reserved_by_defer(&mut self, local: LocalId, span: Span) -> bool {
+        let Some(deferred) = self.deferred_uses.get(&local).copied() else {
+            return true;
+        };
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3147",
+                "cannot invalidate a value that is reserved by a deferred action",
+                span,
+            )
+            .with_help(format!(
+                "the deferred {} starts at source byte {}; borrow the value until the scope exits",
+                if deferred.consuming { "cleanup" } else { "use" },
+                deferred.span.start
+            )),
+        );
+        false
+    }
+
+    fn consume_expression_root(&mut self, expression: &AstExpression, ty: Type, span: Span) {
+        if self.types.is_copy(ty) {
+            return;
+        }
+        let Some(path) = assignment_root_path(expression) else {
+            return;
+        };
+        let Some(binding) = single_path_name(path).and_then(|name| self.lookup(name)) else {
+            return;
+        };
+        self.require_local_available(binding, span);
+        if self.defer_depth > 0 {
+            self.record_deferred_use(binding.local, span, true);
+        } else if self.require_not_reserved_by_defer(binding.local, span) {
+            self.moved_locals.insert(binding.local, span);
+        }
+    }
+
+    fn require_expression_root_available(&mut self, expression: &AstExpression, span: Span) {
+        let Some(path) = assignment_root_path(expression) else {
+            return;
+        };
+        let Some(binding) = single_path_name(path).and_then(|name| self.lookup(name)) else {
+            return;
+        };
+        self.require_local_available(binding, span);
+    }
+
+    fn analyze_unary(
+        &mut self,
+        expression: &ast::UnaryExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        match expression.operator {
+            AstUnaryOperator::Borrow | AstUnaryOperator::BorrowMut => {
+                return self.analyze_borrow(expression, expected);
+            }
+            AstUnaryOperator::Dereference => return self.analyze_dereference(expression),
+            AstUnaryOperator::Negate | AstUnaryOperator::Not => {}
+        }
+        if expression.operator == AstUnaryOperator::Negate
+            && let AstExpression::Integer(literal) = &expression.operand
+        {
+            let ty = expected
+                .filter(|ty| ty.is_signed_integer())
+                .unwrap_or(Type::I32);
+            let minimum_magnitude = integer_minimum_magnitude(ty);
+            if literal.value == minimum_magnitude {
+                return Expression {
+                    kind: ExpressionKind::Integer(minimum_magnitude),
+                    ty,
+                    span: expression.span,
+                };
+            }
+            if literal.value > minimum_magnitude {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3104",
+                        format!("negative integer literal does not fit in `{ty}`"),
+                        expression.span,
+                    )
+                    .with_help(format!(
+                        "use a magnitude no greater than {minimum_magnitude}"
+                    )),
+                );
+                return Expression {
+                    kind: ExpressionKind::Integer(0),
+                    ty,
+                    span: expression.span,
+                };
+            }
+        }
+
+        let operand = self.analyze_expression_expected(&expression.operand, expected);
+        let (operator, valid) = match expression.operator {
+            AstUnaryOperator::Negate => (
+                UnaryOperator::Negate,
+                operand.ty.is_signed_integer() || operand.ty.is_float(),
+            ),
+            AstUnaryOperator::Not => (
+                UnaryOperator::Not,
+                operand.ty == Type::Bool || operand.ty.is_integer(),
+            ),
+            AstUnaryOperator::Borrow
+            | AstUnaryOperator::BorrowMut
+            | AstUnaryOperator::Dereference => {
+                unreachable!("indirection operators return before scalar unary analysis")
+            }
+        };
+        if !valid && operand.ty != Type::Never {
+            self.invalid_operator("unary", operand.ty, expression.span);
+        }
+        let result = operand.ty;
+        Expression {
+            kind: ExpressionKind::Unary {
+                operator,
+                operand: Box::new(operand),
+            },
+            ty: result,
+            span: expression.span,
+        }
+    }
+
+    fn analyze_borrow(
+        &mut self,
+        expression: &ast::UnaryExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        let mutable = expression.operator == AstUnaryOperator::BorrowMut;
+        let Some(place) = self.analyze_place(&expression.operand) else {
+            return invalid_composite_expression(expression.span);
+        };
+        self.require_expression_root_available(&expression.operand, expression.span);
+        if mutable {
+            self.require_mutable_place(&expression.operand);
+        }
+        self.check_and_record_borrow(&expression.operand, mutable, expression.span);
+        if let Some(expected) = expected
+            && let Some((element, slice_mutable)) = self.types.slice_shape(expected)
+            && let Some((actual_element, length)) = self.array_shape(place.ty)
+        {
+            if element != actual_element || (slice_mutable && !mutable) {
+                self.type_mismatch(expected, place.ty, expression.span, "slice borrow");
+            }
+            return Expression {
+                kind: ExpressionKind::Borrow {
+                    place,
+                    mutable: slice_mutable,
+                    slice_length: Some(length),
+                },
+                ty: expected,
+                span: expression.span,
+            };
+        }
+        let ty = self
+            .types
+            .intern_reference(place.ty, mutable, expression.span, self.diagnostics)
+            .unwrap_or(Type::Unit);
+        if let Some(expected) = expected {
+            self.require_type(expected, ty, expression.span, "borrow expression");
+        }
+        Expression {
+            kind: ExpressionKind::Borrow {
+                place,
+                mutable,
+                slice_length: None,
+            },
+            ty,
+            span: expression.span,
+        }
+    }
+
+    fn check_and_record_borrow(&mut self, operand: &AstExpression, mutable: bool, span: Span) {
+        let Some(path) = assignment_root_path(operand) else {
+            return;
+        };
+        let Some(binding) = single_path_name(path).and_then(|name| self.lookup(name)) else {
+            return;
+        };
+        let state = self
+            .borrow_states
+            .get(&binding.local)
+            .copied()
+            .unwrap_or_default();
+        let conflicts = if mutable {
+            state.mutable || state.shared != 0
+        } else {
+            state.mutable
+        };
+        if conflicts {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3138",
+                    "borrow conflicts with an active scoped borrow",
+                    span,
+                )
+                .with_help("end the earlier reference's scope before borrowing again"),
+            );
+            return;
+        }
+        if !self.persistent_borrow {
+            return;
+        }
+        let state = self.borrow_states.entry(binding.local).or_default();
+        if mutable {
+            state.mutable = true;
+        } else {
+            state.shared = state.shared.saturating_add(1);
+        }
+        if let Some(scope) = self.borrow_scopes.last_mut() {
+            scope.push((binding.local, mutable));
+        }
+    }
+
+    fn analyze_dereference(&mut self, expression: &ast::UnaryExpression) -> Expression {
+        let pointer = self.analyze_expression_non_consuming(&expression.operand);
+        let Some((target, _, is_raw)) = self.types.pointer_shape(pointer.ty) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3135",
+                format!("cannot dereference `{}`", pointer.ty),
+                expression.span,
+            ));
+            return invalid_composite_expression(expression.span);
+        };
+        if is_raw && self.unsafe_depth == 0 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3136",
+                    "raw pointers can only be dereferenced inside `unsafe`",
+                    expression.span,
+                )
+                .with_help("wrap the operation in `unsafe { ... }`"),
+            );
+        }
+        if self.consuming_value && !self.types.is_copy(target) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3144",
+                    "cannot move an owned value through a reference or raw pointer",
+                    expression.span,
+                )
+                .with_help("borrow the pointee or move its owning local instead"),
+            );
+        }
+        Expression {
+            kind: ExpressionKind::Dereference(Box::new(pointer)),
+            ty: target,
+            span: expression.span,
+        }
+    }
+
+    fn analyze_binary(
+        &mut self,
+        expression: &ast::BinaryExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        let logical = matches!(
+            expression.operator,
+            AstBinaryOperator::And | AstBinaryOperator::Or
+        );
+        let preferred = if logical { Some(Type::Bool) } else { expected };
+        let left = self.analyze_expression_expected(&expression.left, preferred);
+        let right = self.analyze_expression_expected(&expression.right, Some(left.ty));
+        if left.ty != right.ty && left.ty != Type::Never && right.ty != Type::Never {
+            self.type_mismatch(
+                left.ty,
+                right.ty,
+                expression.right.span(),
+                "binary operands",
+            );
+        }
+
+        let (operator, valid, result_type) = match expression.operator {
+            AstBinaryOperator::Add => (BinaryOperator::Add, left.ty.is_numeric(), left.ty),
+            AstBinaryOperator::Subtract => {
+                (BinaryOperator::Subtract, left.ty.is_numeric(), left.ty)
+            }
+            AstBinaryOperator::Multiply => {
+                (BinaryOperator::Multiply, left.ty.is_numeric(), left.ty)
+            }
+            AstBinaryOperator::Divide => (BinaryOperator::Divide, left.ty.is_numeric(), left.ty),
+            AstBinaryOperator::Remainder => {
+                (BinaryOperator::Remainder, left.ty.is_integer(), left.ty)
+            }
+            AstBinaryOperator::BitAnd => (BinaryOperator::BitAnd, left.ty.is_integer(), left.ty),
+            AstBinaryOperator::BitXor => (BinaryOperator::BitXor, left.ty.is_integer(), left.ty),
+            AstBinaryOperator::BitOr => (BinaryOperator::BitOr, left.ty.is_integer(), left.ty),
+            AstBinaryOperator::ShiftLeft => {
+                (BinaryOperator::ShiftLeft, left.ty.is_integer(), left.ty)
+            }
+            AstBinaryOperator::ShiftRight => {
+                (BinaryOperator::ShiftRight, left.ty.is_integer(), left.ty)
+            }
+            AstBinaryOperator::Equal => {
+                (BinaryOperator::Equal, is_equality_type(left.ty), Type::Bool)
+            }
+            AstBinaryOperator::NotEqual => (
+                BinaryOperator::NotEqual,
+                is_equality_type(left.ty),
+                Type::Bool,
+            ),
+            AstBinaryOperator::Less => (BinaryOperator::Less, is_ordered_type(left.ty), Type::Bool),
+            AstBinaryOperator::LessEqual => (
+                BinaryOperator::LessEqual,
+                is_ordered_type(left.ty),
+                Type::Bool,
+            ),
+            AstBinaryOperator::Greater => (
+                BinaryOperator::Greater,
+                is_ordered_type(left.ty),
+                Type::Bool,
+            ),
+            AstBinaryOperator::GreaterEqual => (
+                BinaryOperator::GreaterEqual,
+                is_ordered_type(left.ty),
+                Type::Bool,
+            ),
+            AstBinaryOperator::And => (BinaryOperator::And, left.ty == Type::Bool, Type::Bool),
+            AstBinaryOperator::Or => (BinaryOperator::Or, left.ty == Type::Bool, Type::Bool),
+        };
+        if !valid && left.ty != Type::Never {
+            self.invalid_operator("binary", left.ty, expression.span);
+        }
+        Expression {
+            kind: ExpressionKind::Binary {
+                operator,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            ty: result_type,
+            span: expression.span,
+        }
+    }
+
+    fn analyze_call(&mut self, call: &ast::CallExpression, expected: Option<Type>) -> Expression {
+        if let AstExpression::Field(field) = &call.callee
+            && matches!(field.field, ast::FieldName::Named(_))
+        {
+            return self.analyze_method_call(call, field, expected);
+        }
+        let AstExpression::Path(path) = &call.callee else {
+            return self.analyze_indirect_call(call, expected);
+        };
+        if single_path_name(path).is_some_and(|name| self.lookup(name).is_some()) {
+            return self.analyze_indirect_call(call, expected);
+        }
+        if single_path_name(path) == Some("panic") {
+            return self.analyze_panic_call(call, path);
+        }
+        if let Some(expression) = self.analyze_runtime_intrinsic_call(call, path, expected) {
+            return expression;
+        }
+        if let Some(expression) = self.analyze_intrinsic_call(call, path, expected) {
+            return expression;
+        }
+        if let [enum_name, variant_name] = path.segments.as_slice()
+            && let Some(ty @ Type::Enum(_)) = self.types.names.get(&enum_name.name).copied()
+            && self.enum_variant(ty, &variant_name.name).is_some()
+        {
+            return self.analyze_enum_tuple_call(call, path, ty, &variant_name.name);
+        }
+        self.analyze_function_call(call, path, expected)
+    }
+
+    fn analyze_indirect_call(
+        &mut self,
+        call: &ast::CallExpression,
+        _expected_return: Option<Type>,
+    ) -> Expression {
+        let callee = self.analyze_expression(&call.callee);
+        let Some((parameter_types, return_type)) = self
+            .types
+            .function_shape(callee.ty)
+            .map(|(parameters, return_type)| (parameters.to_vec(), return_type))
+        else {
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3106",
+                    format!("value of type `{}` is not callable", callee.ty),
+                    call.callee.span(),
+                )
+                .with_help("call a function path or a value with type `fn(...) -> ...`"),
+            );
+            return invalid_composite_expression(call.span);
+        };
+        let signature = Signature {
+            id: FunctionId(u32::MAX),
+            parameter_types,
+            return_type,
+            requires_unsafe: false,
+            is_public: true,
+        };
+        let previous_persistence = self.persistent_borrow;
+        self.persistent_borrow |= self.types.is_scoped(return_type);
+        let arguments = self.analyze_typed_call_arguments(&call.arguments, &signature);
+        self.persistent_borrow = previous_persistence;
+        self.validate_call_arguments("function value", call.span, &signature, &arguments);
+        Expression {
+            kind: ExpressionKind::IndirectCall {
+                callee: Box::new(callee),
+                arguments,
+            },
+            ty: return_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_method_call(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        expected_return: Option<Type>,
+    ) -> Expression {
+        let ast::FieldName::Named(method) = &field.field else {
+            return invalid_composite_expression(call.span);
+        };
+        let Some(receiver_type) = self.place_expression_type(&field.base) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6002",
+                    "method receiver must be an addressable value in M6",
+                    field.base.span(),
+                )
+                .with_help("bind the value to a local before calling a borrowed method"),
+            );
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            return invalid_composite_expression(call.span);
+        };
+        let Some(owner) = self.types.nominal_name(receiver_type).map(str::to_owned) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E6002",
+                format!("type `{receiver_type}` has no inherent methods"),
+                field.span,
+            ));
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            return invalid_composite_expression(call.span);
+        };
+        let resolved_name = format!("{owner}::{}", method.name);
+        let signature = self.signatures.get(&resolved_name).cloned();
+        if signature.is_none()
+            && let Some(expression) = self.try_analyze_generic_method_call(
+                call,
+                field,
+                method,
+                receiver_type,
+                &resolved_name,
+                expected_return,
+            )
+        {
+            return expression;
+        }
+        let Some(signature) = signature else {
+            self.diagnostics.push(Diagnostic::error(
+                "E6002",
+                format!("method `{}` does not exist on `{owner}`", method.name),
+                method.span,
+            ));
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            return invalid_composite_expression(call.span);
+        };
+        if !signature.is_public && self.type_is_external(receiver_type) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E4005",
+                    format!("method `{}` is private to its defining module", method.name),
+                    method.span,
+                )
+                .with_help("mark the method `pub` or expose a public wrapper"),
+            );
+        }
+        let Some(expected_receiver) = signature.parameter_types.first().copied() else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6002",
+                    format!("associated function `{resolved_name}` has no `self` receiver"),
+                    method.span,
+                )
+                .with_help("call it with `Type::function(...)`"),
+            );
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            return invalid_composite_expression(call.span);
+        };
+        let previous_persistence = self.persistent_borrow;
+        self.persistent_borrow |= self.types.is_scoped(signature.return_type);
+        let receiver = self.analyze_method_receiver(&field.base, receiver_type, expected_receiver);
+        let mut arguments = Vec::with_capacity(call.arguments.len() + 1);
+        arguments.push(receiver);
+        for (index, argument) in call.arguments.iter().enumerate() {
+            let expected = signature.parameter_types.get(index + 1).copied();
+            arguments.push(self.analyze_expression_expected(argument, expected));
+        }
+        self.persistent_borrow = previous_persistence;
+        self.validate_call_arguments(&resolved_name, call.span, &signature, &arguments);
+        Expression {
+            kind: ExpressionKind::Call {
+                function: signature.id,
+                arguments,
+            },
+            ty: signature.return_type,
+            span: call.span,
+        }
+    }
+
+    fn try_analyze_generic_method_call(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        receiver_type: Type,
+        resolved_name: &str,
+        expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        let template_name = self.types.generic_instance(receiver_type).map_or_else(
+            || resolved_name.to_owned(),
+            |instance| format!("{}::{}", instance.base_name, method.name),
+        );
+        let template = self
+            .generic_functions
+            .templates
+            .get(&template_name)
+            .cloned()?;
+        if !template.function.is_public && self.type_is_external(receiver_type) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E4005",
+                    format!("method `{}` is private to its defining module", method.name),
+                    method.span,
+                )
+                .with_help("mark the method `pub` or expose a public wrapper"),
+            );
+        }
+        let Some(receiver_parameter) = template.function.parameters.first() else {
+            self.missing_receiver_diagnostic(&template_name, method.span, false);
+            return Some(invalid_composite_expression(call.span));
+        };
+        if receiver_parameter.name.name != "self" {
+            self.missing_receiver_diagnostic(&template_name, method.span, true);
+            return Some(invalid_composite_expression(call.span));
+        }
+        let receiver = match &receiver_parameter.ty.kind {
+            TypeNameKind::Reference { mutable, .. } => {
+                AstExpression::Unary(Box::new(ast::UnaryExpression {
+                    operator: if *mutable {
+                        AstUnaryOperator::BorrowMut
+                    } else {
+                        AstUnaryOperator::Borrow
+                    },
+                    operand: field.base.clone(),
+                    span: field.base.span(),
+                }))
+            }
+            _ => field.base.clone(),
+        };
+        let mut arguments = Vec::with_capacity(call.arguments.len() + 1);
+        arguments.push(receiver);
+        arguments.extend(call.arguments.iter().cloned());
+        let generic_call = ast::CallExpression {
+            callee: AstExpression::Path(ast::Path {
+                segments: vec![method.clone()],
+                span: method.span,
+            }),
+            arguments,
+            span: call.span,
+        };
+        Some(self.analyze_generic_function_call(
+            &generic_call,
+            &template_name,
+            &template,
+            expected_return,
+        ))
+    }
+
+    fn missing_receiver_diagnostic(&mut self, name: &str, span: Span, add_help: bool) {
+        let diagnostic = Diagnostic::error(
+            "E6002",
+            format!("associated function `{name}` has no `self` receiver"),
+            span,
+        );
+        self.diagnostics.push(if add_help {
+            diagnostic.with_help("call it with `Type::function(...)`")
+        } else {
+            diagnostic
+        });
+    }
+
+    fn analyze_method_receiver(
+        &mut self,
+        receiver: &AstExpression,
+        receiver_type: Type,
+        expected: Type,
+    ) -> Expression {
+        if let Some((target, mutable, false)) = self.types.pointer_shape(expected)
+            && target == receiver_type
+        {
+            let unary = ast::UnaryExpression {
+                operator: if mutable {
+                    AstUnaryOperator::BorrowMut
+                } else {
+                    AstUnaryOperator::Borrow
+                },
+                operand: receiver.clone(),
+                span: receiver.span(),
+            };
+            return self.analyze_borrow(&unary, Some(expected));
+        }
+        self.analyze_expression_expected(receiver, Some(expected))
+    }
+
+    fn analyze_panic_call(&mut self, call: &ast::CallExpression, path: &ast::Path) -> Expression {
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let message = call.arguments.first().map_or_else(
+            || Expression {
+                kind: ExpressionKind::Unit,
+                ty: Type::Unit,
+                span: call.span,
+            },
+            |argument| self.analyze_expression_expected(argument, Some(Type::Str)),
+        );
+        self.require_type(Type::Str, message.ty, message.span, "panic message");
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        Expression {
+            kind: ExpressionKind::Panic {
+                message: Box::new(message),
+            },
+            ty: Type::Never,
+            span: call.span,
+        }
+    }
+
+    fn analyze_runtime_intrinsic_call(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Option<Expression> {
+        match single_path_name(path)? {
+            "__string_data" => {
+                Some(self.analyze_string_view_part(call, path, StringViewIntrinsic::Data))
+            }
+            "__string_length" => {
+                Some(self.analyze_string_view_part(call, path, StringViewIntrinsic::Length))
+            }
+            "__slice_length" => Some(self.analyze_slice_length(call, path)),
+            "__str_from_parts" => Some(self.analyze_string_from_parts(call, path)),
+            "__slice_from_parts" => Some(self.analyze_slice_from_parts(call, path, expected)),
+            "__pointee_stride" => Some(self.analyze_pointee_stride(call, path)),
+            "__allocate_bytes" => Some(self.analyze_allocate_bytes(call, path, expected)),
+            "__deallocate_bytes" => Some(self.analyze_deallocate_bytes(call, path)),
+            "__thread_spawn" => Some(self.analyze_thread_spawn(call, path, expected, false)),
+            "__thread_join" => Some(self.analyze_thread_join(call, path, expected)),
+            "__thread_scope" => Some(self.analyze_thread_spawn(call, path, expected, true)),
+            "__mutex_create" => Some(self.analyze_synchronization_create(
+                call,
+                path,
+                hir::SynchronizationKind::Mutex,
+            )),
+            "__mutex_load" => Some(self.analyze_synchronization_load(
+                call,
+                path,
+                expected,
+                hir::SynchronizationKind::Mutex,
+            )),
+            "__mutex_replace" => Some(self.analyze_synchronization_replace(
+                call,
+                path,
+                expected,
+                hir::SynchronizationKind::Mutex,
+            )),
+            "__rwlock_create" => Some(self.analyze_synchronization_create(
+                call,
+                path,
+                hir::SynchronizationKind::RwLock,
+            )),
+            "__rwlock_load" => Some(self.analyze_synchronization_load(
+                call,
+                path,
+                expected,
+                hir::SynchronizationKind::RwLock,
+            )),
+            "__rwlock_replace" => Some(self.analyze_synchronization_replace(
+                call,
+                path,
+                expected,
+                hir::SynchronizationKind::RwLock,
+            )),
+            "__thread_local_create" => Some(self.analyze_synchronization_create(
+                call,
+                path,
+                hir::SynchronizationKind::ThreadLocal,
+            )),
+            "__thread_local_get" => Some(self.analyze_synchronization_load(
+                call,
+                path,
+                expected,
+                hir::SynchronizationKind::ThreadLocal,
+            )),
+            "__thread_local_set" => Some(self.analyze_thread_local_store(call, path)),
+            "__channel_create" => Some(self.analyze_channel_create(call, path)),
+            "__channel_send" => Some(self.analyze_channel_send(call, path, expected)),
+            "__channel_receive" => Some(self.analyze_channel_receive(call, path, expected)),
+            "__job_submit" => Some(self.analyze_job_submit(call, path, expected)),
+            "__job_wait" => Some(self.analyze_job_wait(call, path, expected)),
+            "__parallel_for_mut" => {
+                Some(self.analyze_parallel_for_mut(call, path, expected, ParallelInputKind::Slice))
+            }
+            "__parallel_for_array_mut" => {
+                Some(self.analyze_parallel_for_mut(call, path, expected, ParallelInputKind::Array))
+            }
+            _ => None,
+        }
+    }
+
+    fn analyze_string_view_part(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        part: StringViewIntrinsic,
+    ) -> Expression {
+        self.require_standard_io_intrinsic(call.span);
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let value = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Str)),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Str, value.ty, value.span, "string view");
+        let (kind, ty) = match part {
+            StringViewIntrinsic::Data => {
+                let ty = self
+                    .types
+                    .intern_raw_pointer(Type::U8, false, call.span, self.diagnostics)
+                    .unwrap_or(Type::Unit);
+                (ExpressionKind::StringData(Box::new(value)), ty)
+            }
+            StringViewIntrinsic::Length => {
+                (ExpressionKind::StringLength(Box::new(value)), Type::Usize)
+            }
+        };
+        Expression {
+            kind,
+            ty,
+            span: call.span,
+        }
+    }
+
+    fn analyze_slice_length(&mut self, call: &ast::CallExpression, path: &ast::Path) -> Expression {
+        self.require_standard_job_intrinsic(call.span);
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let slice = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        if self.types.slice_shape(slice.ty).is_none() {
+            self.diagnostics.push(Diagnostic::error(
+                "E3154",
+                format!("slice length requires a slice view, found `{}`", slice.ty),
+                slice.span,
+            ));
+        }
+        Expression {
+            kind: ExpressionKind::SliceLength(Box::new(slice)),
+            ty: Type::Usize,
+            span: call.span,
+        }
+    }
+
+    fn analyze_string_from_parts(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+    ) -> Expression {
+        self.require_standard_string_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let data = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let length = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        let valid_data = self
+            .types
+            .pointer_shape(data.ty)
+            .is_some_and(|(target, _, raw)| target == Type::U8 && raw);
+        if !valid_data {
+            self.diagnostics.push(Diagnostic::error(
+                "E3149",
+                format!(
+                    "string construction requires a raw byte pointer, found `{}`",
+                    data.ty
+                ),
+                data.span,
+            ));
+        }
+        self.require_type(Type::Usize, length.ty, length.span, "string byte length");
+        Expression {
+            kind: ExpressionKind::StringFromParts {
+                data: Box::new(data),
+                length: Box::new(length),
+            },
+            ty: Type::Str,
+            span: call.span,
+        }
+    }
+
+    fn analyze_slice_from_parts(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Expression {
+        self.require_standard_collections_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let data = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let length = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        let Some(slice_type) = expected.filter(|ty| self.types.slice_shape(*ty).is_some()) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3151",
+                    "`__slice_from_parts` requires an expected borrowed slice type",
+                    call.span,
+                )
+                .with_help("call the intrinsic only from a typed standard collection wrapper"),
+            );
+            return invalid_composite_expression(call.span);
+        };
+        let (element, mutable) = self
+            .types
+            .slice_shape(slice_type)
+            .expect("the expected type was checked as a slice");
+        let valid_data =
+            self.types
+                .pointer_shape(data.ty)
+                .is_some_and(|(target, pointer_mutable, raw)| {
+                    target == element && raw && (!mutable || pointer_mutable)
+                });
+        if !valid_data {
+            self.diagnostics.push(Diagnostic::error(
+                "E3151",
+                format!(
+                    "slice construction requires a compatible raw element pointer, found `{}`",
+                    data.ty
+                ),
+                data.span,
+            ));
+        }
+        self.require_type(Type::Usize, length.ty, length.span, "slice element count");
+        Expression {
+            kind: ExpressionKind::SliceFromParts {
+                data: Box::new(data),
+                length: Box::new(length),
+            },
+            ty: slice_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_pointee_stride(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+    ) -> Expression {
+        self.require_standard_collections_intrinsic(call.span);
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let pointer = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        let Some((target, _, raw)) = self.types.pointer_shape(pointer.ty) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3150",
+                format!(
+                    "pointee stride requires a raw pointer, found `{}`",
+                    pointer.ty
+                ),
+                pointer.span,
+            ));
+            return invalid_composite_expression(call.span);
+        };
+        if !raw {
+            self.diagnostics.push(Diagnostic::error(
+                "E3150",
+                "pointee stride requires a raw pointer",
+                pointer.span,
+            ));
+        }
+        Expression {
+            kind: ExpressionKind::TypeStride { target },
+            ty: Type::Usize,
+            span: call.span,
+        }
+    }
+
+    fn analyze_allocate_bytes(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Expression {
+        self.require_standard_allocator_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let allocator = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        let length = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(
+            Type::Usize,
+            allocator.ty,
+            allocator.span,
+            "allocator handle",
+        );
+        self.require_type(Type::Usize, length.ty, length.span, "allocation length");
+
+        let Some(result_type) = expected else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3145",
+                    "`__allocate_bytes` requires an expected `Result<OwnedBytes, AllocError>` type",
+                    call.span,
+                )
+                .with_help("call the intrinsic only from the typed standard allocator wrapper"),
+            );
+            return invalid_composite_expression(call.span);
+        };
+        let Some(IntrinsicType::Result {
+            success: allocation_type,
+            error: error_type,
+        }) = self.types.intrinsic(result_type)
+        else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3145",
+                "`__allocate_bytes` must return a Result",
+                call.span,
+            ));
+            return invalid_composite_expression(call.span);
+        };
+        let Some(error_variant) =
+            self.validate_allocation_result_types(allocation_type, error_type, call.span)
+        else {
+            return invalid_composite_expression(call.span);
+        };
+
+        Expression {
+            kind: ExpressionKind::AllocateBytes {
+                allocator: Box::new(allocator),
+                length: Box::new(length),
+                allocation_type,
+                error_type,
+                error_variant,
+            },
+            ty: result_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_deallocate_bytes(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+    ) -> Expression {
+        self.require_standard_allocator_intrinsic(call.span);
+        if self.unsafe_depth == 0 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3146",
+                    "the raw deallocation intrinsic requires `unsafe`",
+                    call.span,
+                )
+                .with_help("keep the intrinsic inside the owned standard-library wrapper"),
+            );
+        }
+        if call.arguments.len() != 3 {
+            self.intrinsic_arity_diagnostic(path, call, 3);
+        }
+        let allocator = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        let data = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let length = call.arguments.get(2).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(3) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(
+            Type::Usize,
+            allocator.ty,
+            allocator.span,
+            "allocator handle",
+        );
+        self.require_type(Type::Usize, length.ty, length.span, "allocation length");
+        let valid_data = self
+            .types
+            .pointer_shape(data.ty)
+            .is_some_and(|(target, mutable, raw)| target == Type::U8 && mutable && raw);
+        if !valid_data {
+            self.diagnostics.push(Diagnostic::error(
+                "E3146",
+                format!("deallocation requires `*mut u8`, found `{}`", data.ty),
+                data.span,
+            ));
+        }
+        Expression {
+            kind: ExpressionKind::DeallocateBytes {
+                allocator: Box::new(allocator),
+                data: Box::new(data),
+                length: Box::new(length),
+            },
+            ty: Type::Unit,
+            span: call.span,
+        }
+    }
+
+    fn analyze_thread_spawn(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+        scoped: bool,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let callback = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let function_shape = self
+            .types
+            .function_shape(callback.ty)
+            .map(|(parameters, output)| (parameters.to_vec(), output));
+        let (parameter_type, output_type) = match function_shape {
+            Some((parameters, output)) if parameters.len() == 1 => (parameters[0], output),
+            Some((parameters, _)) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3151",
+                        format!(
+                            "thread callbacks require exactly one parameter, found {}",
+                            parameters.len()
+                        ),
+                        callback.span,
+                    )
+                    .with_help("bundle multiple inputs in a struct or tuple"),
+                );
+                (Type::Unit, Type::Unit)
+            }
+            None => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3151",
+                        format!(
+                            "thread callback must be a function value, found `{}`",
+                            callback.ty
+                        ),
+                        callback.span,
+                    )
+                    .with_help("pass a function with type `fn(Input) -> Output`"),
+                );
+                (Type::Unit, Type::Unit)
+            }
+        };
+        let argument = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(parameter_type)),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(
+            parameter_type,
+            argument.ty,
+            argument.span,
+            "thread argument",
+        );
+        self.require_thread_transfer(argument.ty, argument.span, scoped, "argument");
+        self.require_thread_transfer(output_type, callback.span, scoped, "result");
+
+        let Some((result_type, success_type, error_type)) =
+            self.expected_result_parts(expected, call.span, "thread operation")
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        let expected_success = if scoped { output_type } else { Type::Usize };
+        self.require_type(
+            expected_success,
+            success_type,
+            call.span,
+            "thread operation success",
+        );
+        let Some(variants) = self.thread_error_variants(error_type, call.span) else {
+            return invalid_composite_expression(call.span);
+        };
+        let kind = if scoped {
+            ExpressionKind::ThreadScope {
+                callback: Box::new(callback),
+                argument: Box::new(argument),
+                output_type,
+                error_type,
+                spawn_failed_variant: variants.spawn_failed,
+                invalid_handle_variant: variants.invalid_handle,
+                worker_panicked_variant: variants.worker_panicked,
+                result_mismatch_variant: variants.result_mismatch,
+            }
+        } else {
+            ExpressionKind::ThreadSpawn {
+                callback: Box::new(callback),
+                argument: Box::new(argument),
+                output_type,
+                error_type,
+                spawn_failed_variant: variants.spawn_failed,
+            }
+        };
+        Expression {
+            kind,
+            ty: result_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_thread_join(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let handle = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, handle.ty, handle.span, "thread handle");
+        let Some((result_type, output_type, error_type)) =
+            self.expected_result_parts(expected, call.span, "thread join")
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        let Some(variants) = self.thread_error_variants(error_type, call.span) else {
+            return invalid_composite_expression(call.span);
+        };
+        Expression {
+            kind: ExpressionKind::ThreadJoin {
+                handle: Box::new(handle),
+                output_type,
+                error_type,
+                invalid_handle_variant: variants.invalid_handle,
+                worker_panicked_variant: variants.worker_panicked,
+                result_mismatch_variant: variants.result_mismatch,
+            },
+            ty: result_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_synchronization_create(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        synchronization: hir::SynchronizationKind,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let value = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        self.require_synchronization_value(value.ty, value.span, synchronization);
+        Expression {
+            kind: ExpressionKind::SynchronizationCreate {
+                value: Box::new(value),
+                synchronization,
+            },
+            ty: Type::Usize,
+            span: call.span,
+        }
+    }
+
+    fn analyze_synchronization_load(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+        synchronization: hir::SynchronizationKind,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let handle = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(
+            Type::Usize,
+            handle.ty,
+            handle.span,
+            "synchronization handle",
+        );
+        let Some(value_type) = expected else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3153",
+                    "loading a synchronized value requires an expected result type",
+                    call.span,
+                )
+                .with_help("call the intrinsic only from a typed standard-library method"),
+            );
+            return invalid_composite_expression(call.span);
+        };
+        if !self.types.satisfies_trait(value_type, "Copy") {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3153",
+                    format!("synchronized load type `{value_type}` does not satisfy `Copy`"),
+                    call.span,
+                )
+                .with_help("use `replace` to transfer ownership of a non-Copy value"),
+            );
+        }
+        self.require_synchronization_value(value_type, call.span, synchronization);
+        Expression {
+            kind: ExpressionKind::SynchronizationLoad {
+                handle: Box::new(handle),
+                value_type,
+                synchronization,
+            },
+            ty: value_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_synchronization_replace(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+        synchronization: hir::SynchronizationKind,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let handle = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        let value = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, expected),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(
+            Type::Usize,
+            handle.ty,
+            handle.span,
+            "synchronization handle",
+        );
+        if let Some(expected) = expected {
+            self.require_type(expected, value.ty, value.span, "replacement value");
+        }
+        self.require_synchronization_value(value.ty, value.span, synchronization);
+        let value_type = value.ty;
+        Expression {
+            kind: ExpressionKind::SynchronizationReplace {
+                handle: Box::new(handle),
+                value: Box::new(value),
+                synchronization,
+            },
+            ty: value_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_thread_local_store(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let handle = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        let value = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, handle.ty, handle.span, "thread-local handle");
+        self.require_synchronization_value(
+            value.ty,
+            value.span,
+            hir::SynchronizationKind::ThreadLocal,
+        );
+        Expression {
+            kind: ExpressionKind::ThreadLocalStore {
+                handle: Box::new(handle),
+                value: Box::new(value),
+            },
+            ty: Type::Unit,
+            span: call.span,
+        }
+    }
+
+    fn analyze_channel_create(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let probe = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let capacity = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, capacity.ty, capacity.span, "channel capacity");
+        let Some((element_type, _, raw)) = self.types.pointer_shape(probe.ty) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3153",
+                format!(
+                    "channel type probe must be a raw pointer, found `{}`",
+                    probe.ty
+                ),
+                probe.span,
+            ));
+            return invalid_composite_expression(call.span);
+        };
+        if !raw {
+            self.diagnostics.push(Diagnostic::error(
+                "E3153",
+                "channel type probe must be a raw pointer",
+                probe.span,
+            ));
+        }
+        self.require_channel_value(element_type, probe.span);
+        Expression {
+            kind: ExpressionKind::ChannelCreate {
+                probe: Box::new(probe),
+                capacity: Box::new(capacity),
+                element_type,
+            },
+            ty: Type::Usize,
+            span: call.span,
+        }
+    }
+
+    fn analyze_channel_send(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let handle = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        let value = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, handle.ty, handle.span, "channel handle");
+        self.require_channel_value(value.ty, value.span);
+        let Some((result_type, success_type, error_type)) =
+            self.expected_result_parts(expected, call.span, "channel send")
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        self.require_type(Type::Unit, success_type, call.span, "channel send success");
+        let Some(closed_variant) = self.channel_closed_variant(error_type, call.span) else {
+            return invalid_composite_expression(call.span);
+        };
+        Expression {
+            kind: ExpressionKind::ChannelSend {
+                handle: Box::new(handle),
+                value: Box::new(value),
+                error_type,
+                closed_variant,
+            },
+            ty: result_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_channel_receive(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Expression {
+        self.require_standard_thread_intrinsic(call.span);
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let handle = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, handle.ty, handle.span, "channel handle");
+        let Some((result_type, value_type, error_type)) =
+            self.expected_result_parts(expected, call.span, "channel receive")
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        self.require_channel_value(value_type, call.span);
+        let Some(closed_variant) = self.channel_closed_variant(error_type, call.span) else {
+            return invalid_composite_expression(call.span);
+        };
+        Expression {
+            kind: ExpressionKind::ChannelReceive {
+                handle: Box::new(handle),
+                value_type,
+                error_type,
+                closed_variant,
+            },
+            ty: result_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_job_submit(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Expression {
+        self.require_standard_job_intrinsic(call.span);
+        if call.arguments.len() != 3 {
+            self.intrinsic_arity_diagnostic(path, call, 3);
+        }
+        let pool = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        let callback = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let function_shape = self
+            .types
+            .function_shape(callback.ty)
+            .map(|(parameters, output)| (parameters.to_vec(), output));
+        let (parameter_type, output_type) =
+            self.require_single_parameter_callback(function_shape, &callback, "job");
+        let argument = call.arguments.get(2).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(parameter_type)),
+        );
+        for extra in call.arguments.iter().skip(3) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, pool.ty, pool.span, "job pool handle");
+        self.require_type(parameter_type, argument.ty, argument.span, "job argument");
+        self.require_thread_transfer(argument.ty, argument.span, false, "job argument");
+        self.require_thread_transfer(output_type, callback.span, false, "job result");
+        let Some((result_type, success_type, error_type)) =
+            self.expected_result_parts(expected, call.span, "job submission")
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        self.require_type(
+            Type::Usize,
+            success_type,
+            call.span,
+            "job submission success",
+        );
+        let Some(variants) = self.job_error_variants(error_type, call.span) else {
+            return invalid_composite_expression(call.span);
+        };
+        Expression {
+            kind: ExpressionKind::JobSubmit {
+                pool: Box::new(pool),
+                callback: Box::new(callback),
+                argument: Box::new(argument),
+                output_type,
+                error_type,
+                submit_failed_variant: variants.submit_failed,
+            },
+            ty: result_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_job_wait(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Expression {
+        self.require_standard_job_intrinsic(call.span);
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let handle = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, handle.ty, handle.span, "job handle");
+        let Some((result_type, output_type, error_type)) =
+            self.expected_result_parts(expected, call.span, "job wait")
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        let Some(variants) = self.job_error_variants(error_type, call.span) else {
+            return invalid_composite_expression(call.span);
+        };
+        Expression {
+            kind: ExpressionKind::JobWait {
+                handle: Box::new(handle),
+                output_type,
+                error_type,
+                invalid_handle_variant: variants.invalid_handle,
+                worker_panicked_variant: variants.worker_panicked,
+                result_mismatch_variant: variants.result_mismatch,
+            },
+            ty: result_type,
+            span: call.span,
+        }
+    }
+
+    fn analyze_parallel_for_mut(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+        input_kind: ParallelInputKind,
+    ) -> Expression {
+        self.require_standard_job_intrinsic(call.span);
+        if call.arguments.len() != 4 {
+            self.intrinsic_arity_diagnostic(path, call, 4);
+        }
+        let pool = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        let slice = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let callback = call.arguments.get(2).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let minimum_chunk = call.arguments.get(3).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(4) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, pool.ty, pool.span, "job pool handle");
+        self.require_type(
+            Type::Usize,
+            minimum_chunk.ty,
+            minimum_chunk.span,
+            "minimum parallel chunk",
+        );
+        let Some((element_type, array_length)) = self.parallel_input_shape(&slice, input_kind)
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        self.require_channel_value(element_type, slice.span);
+        let shape = self
+            .types
+            .function_shape(callback.ty)
+            .map(|(parameters, output)| (parameters.to_vec(), output));
+        let (parameter_type, output_type) =
+            self.require_single_parameter_callback(shape, &callback, "parallel");
+        let valid_callback = self
+            .types
+            .slice_shape(parameter_type)
+            .is_some_and(|(element, mutable)| element == element_type && mutable);
+        if !valid_callback {
+            self.diagnostics.push(Diagnostic::error(
+                "E3154",
+                format!("parallel callback must accept `&mut [T]`, found `{parameter_type}`"),
+                callback.span,
+            ));
+        }
+        self.require_type(
+            Type::Unit,
+            output_type,
+            callback.span,
+            "parallel callback result",
+        );
+        let Some((result_type, success_type, error_type)) =
+            self.expected_result_parts(expected, call.span, "parallel iteration")
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        self.require_type(
+            Type::Unit,
+            success_type,
+            call.span,
+            "parallel iteration success",
+        );
+        let Some(variants) = self.job_error_variants(error_type, call.span) else {
+            return invalid_composite_expression(call.span);
+        };
+        Expression {
+            kind: ExpressionKind::ParallelFor {
+                pool: Box::new(pool),
+                slice: Box::new(slice),
+                chunk_type: parameter_type,
+                array_length,
+                callback: Box::new(callback),
+                minimum_chunk: Box::new(minimum_chunk),
+                error_type,
+                submit_failed_variant: variants.submit_failed,
+                worker_panicked_variant: variants.worker_panicked,
+                result_mismatch_variant: variants.result_mismatch,
+            },
+            ty: result_type,
+            span: call.span,
+        }
+    }
+
+    fn parallel_input_shape(
+        &mut self,
+        input: &Expression,
+        kind: ParallelInputKind,
+    ) -> Option<(Type, Option<u64>)> {
+        let shape = match kind {
+            ParallelInputKind::Slice => self
+                .types
+                .slice_shape(input.ty)
+                .filter(|(_, mutable)| *mutable)
+                .map(|(element, _)| (element, None)),
+            ParallelInputKind::Array => self
+                .types
+                .pointer_shape(input.ty)
+                .filter(|(_, mutable, raw)| *mutable && !raw)
+                .and_then(|(target, _, _)| {
+                    self.array_shape(target)
+                        .map(|(element, length)| (element, Some(length)))
+                }),
+        };
+        if shape.is_none() {
+            let required = match kind {
+                ParallelInputKind::Slice => "`&mut [T]`",
+                ParallelInputKind::Array => "`&mut [T; N]`",
+            };
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3154",
+                    format!(
+                        "parallel mutable iteration requires {required}, found `{}`",
+                        input.ty
+                    ),
+                    input.span,
+                )
+                .with_help("borrow an array, vector slice, or tensor storage mutably"),
+            );
+        }
+        shape
+    }
+
+    fn require_single_parameter_callback(
+        &mut self,
+        shape: Option<(Vec<Type>, Type)>,
+        callback: &Expression,
+        role: &str,
+    ) -> (Type, Type) {
+        match shape {
+            Some((parameters, output)) if parameters.len() == 1 => (parameters[0], output),
+            Some((parameters, _)) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3154",
+                        format!(
+                            "{role} callbacks require exactly one parameter, found {}",
+                            parameters.len()
+                        ),
+                        callback.span,
+                    )
+                    .with_help("bundle multiple inputs in a struct or tuple"),
+                );
+                (Type::Unit, Type::Unit)
+            }
+            None => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3154",
+                        format!(
+                            "{role} callback must be a function value, found `{}`",
+                            callback.ty
+                        ),
+                        callback.span,
+                    )
+                    .with_help("pass a function with type `fn(Input) -> Output`"),
+                );
+                (Type::Unit, Type::Unit)
+            }
+        }
+    }
+
+    fn expected_result_parts(
+        &mut self,
+        expected: Option<Type>,
+        span: Span,
+        role: &str,
+    ) -> Option<(Type, Type, Type)> {
+        let Some(result_type) = expected else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3151",
+                    format!("{role} requires an expected `Result<T, E>` type"),
+                    span,
+                )
+                .with_help("add a result type annotation or return the intrinsic directly"),
+            );
+            return None;
+        };
+        let Some(IntrinsicType::Result { success, error }) = self.types.intrinsic(result_type)
+        else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3151",
+                format!("{role} must produce `Result<T, E>`"),
+                span,
+            ));
+            return None;
+        };
+        Some((result_type, success, error))
+    }
+
+    fn thread_error_variants(
+        &mut self,
+        error_type: Type,
+        span: Span,
+    ) -> Option<ThreadErrorVariants> {
+        let variant = |name: &str| {
+            let (index, fields) = self.enum_variant(error_type, name)?;
+            matches!(fields, hir::EnumVariantFields::Unit).then_some(index)
+        };
+        let (
+            Some(spawn_failed),
+            Some(invalid_handle),
+            Some(worker_panicked),
+            Some(result_mismatch),
+        ) = (
+            variant("SpawnFailed"),
+            variant("InvalidHandle"),
+            variant("WorkerPanicked"),
+            variant("ResultMismatch"),
+        )
+        else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3151",
+                    "thread errors require unit variants `SpawnFailed`, `InvalidHandle`, `WorkerPanicked`, and `ResultMismatch`",
+                    span,
+                )
+                .with_help("use `std::thread::ThreadError`"),
+            );
+            return None;
+        };
+        Some(ThreadErrorVariants {
+            spawn_failed,
+            invalid_handle,
+            worker_panicked,
+            result_mismatch,
+        })
+    }
+
+    fn job_error_variants(&mut self, error_type: Type, span: Span) -> Option<JobErrorVariants> {
+        let variant = |name: &str| {
+            let (index, fields) = self.enum_variant(error_type, name)?;
+            matches!(fields, hir::EnumVariantFields::Unit).then_some(index)
+        };
+        let (
+            Some(_pool_create_failed),
+            Some(submit_failed),
+            Some(invalid_handle),
+            Some(worker_panicked),
+            Some(result_mismatch),
+        ) = (
+            variant("PoolCreateFailed"),
+            variant("SubmitFailed"),
+            variant("InvalidHandle"),
+            variant("WorkerPanicked"),
+            variant("ResultMismatch"),
+        )
+        else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3154",
+                    "job errors require unit variants `PoolCreateFailed`, `SubmitFailed`, `InvalidHandle`, `WorkerPanicked`, and `ResultMismatch`",
+                    span,
+                )
+                .with_help("use `std::job::JobError`"),
+            );
+            return None;
+        };
+        Some(JobErrorVariants {
+            submit_failed,
+            invalid_handle,
+            worker_panicked,
+            result_mismatch,
+        })
+    }
+
+    fn channel_closed_variant(&mut self, error_type: Type, span: Span) -> Option<u32> {
+        let closed = self
+            .enum_variant(error_type, "Closed")
+            .and_then(|(index, fields)| {
+                matches!(fields, hir::EnumVariantFields::Unit).then_some(index)
+            });
+        if closed.is_none() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3153",
+                    "channel errors require a unit variant named `Closed`",
+                    span,
+                )
+                .with_help("use `std::thread::ChannelError`"),
+            );
+        }
+        closed
+    }
+
+    fn require_synchronization_value(
+        &mut self,
+        ty: Type,
+        span: Span,
+        synchronization: hir::SynchronizationKind,
+    ) {
+        let requirements: &[&str] = match synchronization {
+            hir::SynchronizationKind::Mutex => &["Send"],
+            hir::SynchronizationKind::RwLock => &["Send", "Sync"],
+            hir::SynchronizationKind::ThreadLocal => &["Copy", "Send"],
+        };
+        for requirement in requirements {
+            if !self.types.satisfies_trait(ty, requirement) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3153",
+                        format!(
+                            "synchronization value type `{ty}` does not satisfy `{requirement}`"
+                        ),
+                        span,
+                    )
+                    .with_help("store an owned value whose fields satisfy the required traits"),
+                );
+            }
+        }
+        if self.types.is_scoped(ty) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3153",
+                    format!("synchronization value type `{ty}` cannot contain a scoped borrow"),
+                    span,
+                )
+                .with_help("store owned data in synchronization resources"),
+            );
+        }
+    }
+
+    fn require_channel_value(&mut self, ty: Type, span: Span) {
+        if !self.types.satisfies_trait(ty, "Send") {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3153",
+                    format!("channel element type `{ty}` does not satisfy `Send`"),
+                    span,
+                )
+                .with_help("send owned thread-safe values"),
+            );
+        }
+        if self.types.is_scoped(ty) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3153",
+                    format!("channel element type `{ty}` cannot contain a scoped borrow"),
+                    span,
+                )
+                .with_help("send owned data or use `scope` with direct arguments"),
+            );
+        }
+    }
+
+    fn require_thread_transfer(&mut self, ty: Type, span: Span, scoped: bool, role: &str) {
+        if !self.types.satisfies_trait(ty, "Send") {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3152",
+                    format!("thread {role} type `{ty}` does not satisfy `Send`"),
+                    span,
+                )
+                .with_help("move owned thread-safe data or use synchronization"),
+            );
+        }
+        if !scoped && self.types.is_scoped(ty) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3152",
+                    format!("native thread {role} cannot contain a scoped borrow"),
+                    span,
+                )
+                .with_help("use `scope` so the worker is joined before the borrow ends"),
+            );
+        }
+    }
+
+    fn require_standard_allocator_intrinsic(&mut self, span: Span) {
+        if self.module_identity.as_deref() == Some("3_std_5_alloc") {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3145",
+                "runtime allocator intrinsics are private to `std::alloc`",
+                span,
+            )
+            .with_help("import and call the public allocator wrapper instead"),
+        );
+    }
+
+    fn require_standard_io_intrinsic(&mut self, span: Span) {
+        if matches!(
+            self.module_identity.as_deref(),
+            Some("3_std_2_io" | "3_std_6_string")
+        ) {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3148",
+                "string-view runtime intrinsics are private to `std::io`",
+                span,
+            )
+            .with_help("import and call the public standard I/O wrapper instead"),
+        );
+    }
+
+    fn require_standard_string_intrinsic(&mut self, span: Span) {
+        if self.module_identity.as_deref() == Some("3_std_6_string") {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3149",
+                "raw string construction is private to `std::string`",
+                span,
+            )
+            .with_help("construct an owned `String` or use a string literal instead"),
+        );
+    }
+
+    fn require_standard_collections_intrinsic(&mut self, span: Span) {
+        if self.module_identity.as_deref() == Some("3_std_11_collections") {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3150",
+                "native element layout is private to `std::collections`",
+                span,
+            )
+            .with_help("use a standard owned collection instead"),
+        );
+    }
+
+    fn require_standard_thread_intrinsic(&mut self, span: Span) {
+        if self.module_identity.as_deref() == Some("3_std_6_thread") {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3151",
+                "native thread intrinsics are private to `std::thread`",
+                span,
+            )
+            .with_help("import and call the safe standard thread wrappers"),
+        );
+    }
+
+    fn require_standard_job_intrinsic(&mut self, span: Span) {
+        if self.module_identity.as_deref() == Some("3_std_3_job") {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error("E3154", "job intrinsics are private to `std::job`", span)
+                .with_help("import and call the safe standard job wrappers"),
+        );
+    }
+
+    fn validate_allocation_result_types(
+        &mut self,
+        allocation_type: Type,
+        error_type: Type,
+        span: Span,
+    ) -> Option<u32> {
+        let allocation_is_valid =
+            self.types
+                .definition(allocation_type)
+                .is_some_and(|definition| {
+                    let hir::TypeDefinitionKind::Struct { fields } = &definition.kind else {
+                        return false;
+                    };
+                    let [data, length, allocator] = fields.as_slice() else {
+                        return false;
+                    };
+                    data.name == "data"
+                        && !data.is_public
+                        && self.types.pointer_shape(data.ty).is_some_and(
+                            |(target, mutable, raw)| target == Type::U8 && mutable && raw,
+                        )
+                        && length.name == "len"
+                        && !length.is_public
+                        && length.ty == Type::Usize
+                        && allocator.name == "allocator"
+                        && !allocator.is_public
+                        && allocator.ty == Type::Usize
+                });
+        let error_variant = self.types.definition(error_type).and_then(|definition| {
+            let hir::TypeDefinitionKind::Enum { variants } = &definition.kind else {
+                return None;
+            };
+            variants
+                .iter()
+                .position(|variant| {
+                    variant.name == "OutOfMemory" && variant.fields == hir::EnumVariantFields::Unit
+                })
+                .and_then(|index| u32::try_from(index).ok())
+        });
+        if allocation_is_valid && error_variant.is_some() {
+            return error_variant;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3145",
+                "invalid standard allocator result representation",
+                span,
+            )
+            .with_help(
+                "`OwnedBytes` must contain private `data`, `len`, and `allocator` fields and `AllocError` must define `OutOfMemory`",
+            ),
+        );
+        None
+    }
+
+    fn analyze_intrinsic_call(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Option<Expression> {
+        let name = single_path_name(path)?;
+        if !matches!(name, "Some" | "Ok" | "Err") {
+            return None;
+        }
+
+        let expected_intrinsic =
+            expected.and_then(|ty| self.types.intrinsic(ty).map(|intrinsic| (ty, intrinsic)));
+        match (name, expected_intrinsic) {
+            ("Some", Some((ty, IntrinsicType::Option { value }))) => {
+                Some(self.analyze_intrinsic_constructor(call, path, ty, 0, value))
+            }
+            ("Ok", Some((ty, IntrinsicType::Result { success, .. }))) => {
+                Some(self.analyze_intrinsic_constructor(call, path, ty, 0, success))
+            }
+            ("Err", Some((ty, IntrinsicType::Result { error, .. }))) => {
+                Some(self.analyze_intrinsic_constructor(call, path, ty, 1, error))
+            }
+            ("Some", None) => Some(self.infer_option_constructor(call, path)),
+            _ => {
+                for argument in &call.arguments {
+                    self.analyze_expression(argument);
+                }
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3139",
+                        format!(
+                            "`{name}` requires an expected {} type",
+                            if name == "Some" {
+                                "`Option<T>`"
+                            } else {
+                                "`Result<T, E>`"
+                            }
+                        ),
+                        call.span,
+                    )
+                    .with_help(
+                        "add a result type annotation or use the constructor in a typed context",
+                    ),
+                );
+                Some(invalid_composite_expression(call.span))
+            }
+        }
+    }
+
+    fn infer_option_constructor(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+    ) -> Expression {
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let Some(argument) = call.arguments.first() else {
+            return invalid_composite_expression(call.span);
+        };
+        let field = self.analyze_expression(argument);
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        let Some(ty) = self
+            .types
+            .intern_option(field.ty, call.span, self.diagnostics)
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        Expression {
+            kind: ExpressionKind::Enum {
+                variant: 0,
+                fields: vec![field],
+            },
+            ty,
+            span: call.span,
+        }
+    }
+
+    fn analyze_intrinsic_constructor(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        ty: Type,
+        variant: u32,
+        field_type: Type,
+    ) -> Expression {
+        if call.arguments.len() != 1 {
+            self.intrinsic_arity_diagnostic(path, call, 1);
+        }
+        let fields = call
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                self.analyze_expression_expected(argument, (index == 0).then_some(field_type))
+            })
+            .collect::<Vec<_>>();
+        if let Some(field) = fields.first() {
+            self.require_type(field_type, field.ty, field.span, "constructor argument");
+        }
+        Expression {
+            kind: ExpressionKind::Enum { variant, fields },
+            ty,
+            span: call.span,
+        }
+    }
+
+    fn intrinsic_arity_diagnostic(
+        &mut self,
+        path: &ast::Path,
+        call: &ast::CallExpression,
+        expected: usize,
+    ) {
+        self.diagnostics.push(Diagnostic::error(
+            "E3105",
+            format!(
+                "constructor `{}` expects {expected} argument(s), but {} were provided",
+                path.display(),
+                call.arguments.len()
+            ),
+            call.span,
+        ));
+    }
+
+    fn analyze_try(&mut self, value: &AstExpression, span: Span) -> Expression {
+        self.reject_deferred_control_flow("`?`", span);
+        let value = self.analyze_expression_expected(value, Some(self.signature.return_type));
+        let Some(intrinsic) = self.types.intrinsic(value.ty) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3140",
+                    format!(
+                        "`?` requires `Option<T>` or `Result<T, E>`, found `{}`",
+                        value.ty
+                    ),
+                    span,
+                )
+                .with_help("apply `?` only to an optional or fallible expression"),
+            );
+            return invalid_composite_expression(span);
+        };
+        let return_intrinsic = self.types.intrinsic(self.signature.return_type);
+        let compatible = match (intrinsic, return_intrinsic) {
+            (IntrinsicType::Option { .. }, Some(IntrinsicType::Option { .. })) => true,
+            (
+                IntrinsicType::Result { error, .. },
+                Some(IntrinsicType::Result {
+                    error: return_error,
+                    ..
+                }),
+            ) => error == return_error,
+            _ => false,
+        };
+        if !compatible {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3140",
+                    format!(
+                        "`?` cannot propagate `{}` from a function returning `{}`",
+                        value.ty, self.signature.return_type
+                    ),
+                    span,
+                )
+                .with_help("use the same Option or Result type as the function return type"),
+            );
+        }
+        let (output_type, failure_type) = match intrinsic {
+            IntrinsicType::Option { value } => (value, None),
+            IntrinsicType::Result { success, error } => (success, Some(error)),
+        };
+        Expression {
+            kind: ExpressionKind::Try {
+                value: Box::new(value),
+                success_variant: 0,
+                output_type,
+                failure_variant: 1,
+                failure_type,
+                return_type: self.signature.return_type,
+            },
+            ty: output_type,
+            span,
+        }
+    }
+
+    fn analyze_enum_tuple_call(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        ty: Type,
+        variant_name: &str,
+    ) -> Expression {
+        let Some((variant, fields)) = self.enum_variant(ty, variant_name) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3119",
+                format!("enum variant `{}` does not exist", path.display()),
+                path.span,
+            ));
+            return invalid_composite_expression(call.span);
+        };
+        let hir::EnumVariantFields::Tuple(field_types) = fields else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3119",
+                format!("enum variant `{}` is not tuple-like", path.display()),
+                path.span,
+            ));
+            return invalid_composite_expression(call.span);
+        };
+        if field_types.len() != call.arguments.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "E3105",
+                format!(
+                    "variant `{}` expects {} argument(s), but {} were provided",
+                    path.display(),
+                    field_types.len(),
+                    call.arguments.len()
+                ),
+                call.span,
+            ));
+        }
+        let fields: Vec<_> = call
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                self.analyze_expression_expected(argument, field_types.get(index).copied())
+            })
+            .collect();
+        for (field, expected) in fields.iter().zip(field_types.iter().copied()) {
+            self.require_type(expected, field.ty, field.span, "variant argument");
+        }
+        Expression {
+            kind: ExpressionKind::Enum { variant, fields },
+            ty,
+            span: call.span,
+        }
+    }
+
+    fn analyze_function_call(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected_return: Option<Type>,
+    ) -> Expression {
+        let Some(resolved_name) = self.resolve_function_path(path) else {
+            return invalid_composite_expression(call.span);
+        };
+        if path.segments.len() == 1 && self.lookup(&resolved_name).is_some() {
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3106",
+                    format!("local binding `{resolved_name}` is not callable"),
+                    path.span,
+                )
+                .with_help("call a declared function or method"),
+            );
+            return Expression {
+                kind: ExpressionKind::Unit,
+                ty: Type::Unit,
+                span: call.span,
+            };
+        }
+        let signature = self.signatures.get(&resolved_name).cloned();
+        if signature.is_none()
+            && let Some(template) = self
+                .generic_functions
+                .templates
+                .get(&resolved_name)
+                .cloned()
+        {
+            return self.analyze_generic_function_call(
+                call,
+                &resolved_name,
+                &template,
+                expected_return,
+            );
+        }
+        let Some(signature) = signature else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3106",
+                format!("cannot resolve function `{}`", path.display()),
+                path.span,
+            ));
+            return Expression {
+                kind: ExpressionKind::Unit,
+                ty: Type::Unit,
+                span: call.span,
+            };
+        };
+        self.validate_function_access(path, call.span, &resolved_name, &signature);
+        let previous_persistence = self.persistent_borrow;
+        self.persistent_borrow |= self.types.is_scoped(signature.return_type);
+        let arguments = self.analyze_typed_call_arguments(&call.arguments, &signature);
+        self.persistent_borrow = previous_persistence;
+        self.validate_call_arguments(&resolved_name, call.span, &signature, &arguments);
+
+        Expression {
+            kind: ExpressionKind::Call {
+                function: signature.id,
+                arguments,
+            },
+            ty: signature.return_type,
+            span: call.span,
+        }
+    }
+
+    fn resolve_function_path(&mut self, path: &ast::Path) -> Option<String> {
+        if let Some(name) = function_path_name(path) {
+            Some(name)
+        } else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3106",
+                    format!(
+                        "qualified call `{}` requires module resolution",
+                        path.display()
+                    ),
+                    path.span,
+                )
+                .with_help("module paths must resolve to one canonical symbol before typing"),
+            );
+            None
+        }
+    }
+
+    fn validate_function_access(
+        &mut self,
+        path: &ast::Path,
+        span: Span,
+        resolved_name: &str,
+        signature: &Signature,
+    ) {
+        if signature.requires_unsafe && self.unsafe_depth == 0 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E5002",
+                    format!("native function `{resolved_name}` can only be called inside `unsafe`"),
+                    span,
+                )
+                .with_help("review the binding contract and wrap the call in `unsafe { ... }`"),
+            );
+        }
+        if let [owner, _] = path.segments.as_slice()
+            && !signature.is_public
+            && self
+                .types
+                .names
+                .get(&owner.name)
+                .is_some_and(|ty| self.type_is_external(*ty))
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E4005",
+                    format!("associated function `{resolved_name}` is private"),
+                    path.span,
+                )
+                .with_help("mark the associated function `pub`"),
+            );
+        }
+    }
+
+    fn analyze_typed_call_arguments(
+        &mut self,
+        source_arguments: &[AstExpression],
+        signature: &Signature,
+    ) -> Vec<Expression> {
+        let mut arguments = Vec::with_capacity(source_arguments.len());
+        for (index, argument) in source_arguments.iter().enumerate() {
+            let expected = signature.parameter_types.get(index).copied();
+            let previous_reborrow = self.reborrow_argument;
+            self.reborrow_argument = expected.is_some_and(|ty| self.types.is_mutable_view(ty));
+            arguments.push(self.analyze_expression_expected(argument, expected));
+            self.reborrow_argument = previous_reborrow;
+        }
+        arguments
+    }
+
+    fn analyze_generic_function_call(
+        &mut self,
+        call: &ast::CallExpression,
+        source_name: &str,
+        template: &GenericFunctionTemplate,
+        expected_return: Option<Type>,
+    ) -> Expression {
+        let parameters = &template.parameters;
+        let mut environment = GenericEnvironment::default();
+        if let (Some(return_type), Some(expected)) =
+            (&template.function.return_type, expected_return)
+        {
+            self.types
+                .infer_type_pattern(return_type, expected, parameters, &mut environment);
+        }
+
+        if call.arguments.len() != template.function.parameters.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "E3105",
+                format!(
+                    "function `{source_name}` expects {} argument(s), but {} were provided",
+                    template.function.parameters.len(),
+                    call.arguments.len()
+                ),
+                call.span,
+            ));
+        }
+
+        let previous_persistence = self.persistent_borrow;
+        self.persistent_borrow |= template
+            .function
+            .return_type
+            .as_ref()
+            .is_some_and(|ty| self.types.type_name_may_be_scoped(ty));
+        let arguments =
+            self.infer_generic_call_arguments(call, source_name, template, &mut environment);
+        self.persistent_borrow = previous_persistence;
+        let Some(values) = self.complete_generic_environment(
+            parameters,
+            &template.where_predicates,
+            &mut environment,
+            template.function.span,
+        ) else {
+            return invalid_composite_expression(call.span);
+        };
+        let Some(signature) =
+            self.instantiate_generic_function(template, values, &environment, call.span)
+        else {
+            return invalid_composite_expression(call.span);
+        };
+        self.validate_call_arguments(source_name, call.span, &signature, &arguments);
+        Expression {
+            kind: ExpressionKind::Call {
+                function: signature.id,
+                arguments,
+            },
+            ty: signature.return_type,
+            span: call.span,
+        }
+    }
+
+    fn infer_generic_call_arguments(
+        &mut self,
+        call: &ast::CallExpression,
+        source_name: &str,
+        template: &GenericFunctionTemplate,
+        environment: &mut GenericEnvironment,
+    ) -> Vec<Expression> {
+        let parameters = &template.parameters;
+        let mut arguments = Vec::with_capacity(call.arguments.len());
+        for (index, argument) in call.arguments.iter().enumerate() {
+            let parameter = template.function.parameters.get(index);
+            let expected = parameter.and_then(|parameter| {
+                if type_pattern_is_bound(&parameter.ty, parameters, environment) {
+                    self.types
+                        .resolve_type_name_in(&parameter.ty, environment, self.diagnostics)
+                } else {
+                    None
+                }
+            });
+            let previous_reborrow = self.reborrow_argument;
+            self.reborrow_argument = expected.is_some_and(|ty| self.types.is_mutable_view(ty))
+                || parameter.is_some_and(|parameter| {
+                    matches!(
+                        &parameter.ty.kind,
+                        TypeNameKind::Reference { mutable: true, .. }
+                    )
+                });
+            let analyzed = self.analyze_expression_expected(argument, expected);
+            self.reborrow_argument = previous_reborrow;
+            if let Some(parameter) = parameter
+                && !self.types.infer_type_pattern(
+                    &parameter.ty,
+                    analyzed.ty,
+                    parameters,
+                    environment,
+                )
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6004",
+                        format!(
+                            "argument {} does not match the generic parameter pattern `{}`",
+                            index + 1,
+                            source_name
+                        ),
+                        argument.span(),
+                    )
+                    .with_help("use one consistent concrete type for each generic parameter"),
+                );
+            }
+            arguments.push(analyzed);
+        }
+        arguments
+    }
+
+    fn instantiate_generic_function(
+        &mut self,
+        template: &GenericFunctionTemplate,
+        values: Vec<GenericValue>,
+        environment: &GenericEnvironment,
+        span: Span,
+    ) -> Option<Signature> {
+        let key = GenericFunctionKey {
+            resolved_name: template.resolved_name.clone(),
+            arguments: values,
+        };
+        if let Some(signature) = self.generic_functions.instances.get(&key) {
+            return Some(signature.clone());
+        }
+        let parameter_types = template
+            .function
+            .parameters
+            .iter()
+            .map(|parameter| {
+                self.types
+                    .resolve_type_name_in(&parameter.ty, environment, self.diagnostics)
+                    .unwrap_or(Type::Unit)
+            })
+            .collect::<Vec<_>>();
+        let return_type = template
+            .function
+            .return_type
+            .as_ref()
+            .map_or(Type::Unit, |ty| {
+                self.types
+                    .resolve_type_name_in(ty, environment, self.diagnostics)
+                    .unwrap_or(Type::Unit)
+            });
+        let id = FunctionId(self.generic_functions.next_id);
+        self.generic_functions.next_id =
+            self.generic_functions.next_id.checked_add(1).or_else(|| {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3999",
+                    "this compilation unit contains too many function instances",
+                    span,
+                ));
+                None
+            })?;
+        let signature = Signature {
+            id,
+            parameter_types,
+            return_type,
+            requires_unsafe: false,
+            is_public: template.function.is_public,
+        };
+        self.generic_functions
+            .instances
+            .insert(key, signature.clone());
+        self.generic_functions.pending.push(PendingFunction {
+            function: template.function.clone(),
+            resolved_name: format!("{}$instance${}", template.resolved_name, id.0),
+            signature: signature.clone(),
+            environment: environment.clone(),
+            module_identity: template.module_identity.clone(),
+        });
+        Some(signature)
+    }
+
+    fn complete_generic_environment(
+        &mut self,
+        parameters: &[ast::GenericParameter],
+        where_predicates: &[ast::WherePredicate],
+        environment: &mut GenericEnvironment,
+        span: Span,
+    ) -> Option<Vec<GenericValue>> {
+        let mut values = Vec::with_capacity(parameters.len());
+        let mut complete = true;
+        for parameter in parameters {
+            match parameter {
+                ast::GenericParameter::Type { name, default, .. } => {
+                    let ty = environment.types.get(&name.name).copied().or_else(|| {
+                        default.as_ref().and_then(|default| {
+                            self.types
+                                .resolve_type_name_in(default, environment, self.diagnostics)
+                        })
+                    });
+                    if let Some(ty) = ty {
+                        environment.types.insert(name.name.clone(), ty);
+                        values.push(GenericValue::Type(ty));
+                    } else {
+                        complete = false;
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "E6004",
+                                format!(
+                                    "cannot infer generic type parameter `{}`",
+                                    name.name
+                                ),
+                                span,
+                            )
+                            .with_help(
+                                "use the parameter in an argument or provide an expected return type",
+                            ),
+                        );
+                    }
+                }
+                ast::GenericParameter::Const {
+                    name, ty, default, ..
+                } => {
+                    let const_type =
+                        self.types
+                            .resolve_type_name_in(ty, environment, self.diagnostics);
+                    if const_type.is_some_and(|ty| !ty.is_integer()) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E6005",
+                            format!("const parameter `{}` must use an integer type", name.name),
+                            ty.span,
+                        ));
+                        complete = false;
+                    }
+                    let value = environment.constants.get(&name.name).copied().or_else(|| {
+                        default.as_ref().and_then(|default| {
+                            evaluate_array_length_in(default, environment, self.diagnostics)
+                        })
+                    });
+                    if let Some(value) = value {
+                        environment.constants.insert(name.name.clone(), value);
+                        values.push(GenericValue::Const(value));
+                    } else {
+                        complete = false;
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "E6004",
+                                format!("cannot infer const generic parameter `{}`", name.name),
+                                span,
+                            )
+                            .with_help("use the const parameter in an array or generic argument"),
+                        );
+                    }
+                }
+            }
+        }
+        if complete
+            && !self.types.validate_bounds(
+                parameters,
+                where_predicates,
+                environment,
+                span,
+                self.diagnostics,
+            )
+        {
+            complete = false;
+        }
+        complete.then_some(values)
+    }
+
+    fn validate_call_arguments(
+        &mut self,
+        name: &str,
+        span: Span,
+        signature: &Signature,
+        arguments: &[Expression],
+    ) {
+        if arguments.len() != signature.parameter_types.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "E3105",
+                format!(
+                    "function `{name}` expects {} argument(s), but {} were provided",
+                    signature.parameter_types.len(),
+                    arguments.len()
+                ),
+                span,
+            ));
+        }
+        for (argument, expected) in arguments
+            .iter()
+            .zip(signature.parameter_types.iter().copied())
+        {
+            self.require_type(expected, argument.ty, argument.span, "function argument");
+        }
+    }
+
+    fn analyze_if(&mut self, expression: &ast::IfExpression, expected: Option<Type>) -> Expression {
+        let condition = self.analyze_expression_expected(&expression.condition, Some(Type::Bool));
+        self.require_type(
+            Type::Bool,
+            condition.ty,
+            expression.condition.span(),
+            "if condition",
+        );
+        let moves_before_branches = self.moved_locals.clone();
+        let then_branch = self.analyze_block(&expression.then_branch, expected);
+        let then_moves = self.moved_locals.clone();
+        self.moved_locals.clone_from(&moves_before_branches);
+        let else_branch = expression
+            .else_branch
+            .as_ref()
+            .map(|branch| Box::new(self.analyze_expression_expected(branch, expected)));
+        let else_moves = self.moved_locals.clone();
+        self.moved_locals = then_moves;
+        self.moved_locals.extend(else_moves);
+        let ty = if let Some(else_branch) = &else_branch {
+            self.unify_branch_types(then_branch.ty, else_branch.ty, expression.span)
+        } else {
+            self.require_type(
+                Type::Unit,
+                then_branch.ty,
+                expression.then_branch.span,
+                "`if` branch without `else`",
+            );
+            Type::Unit
+        };
+
+        Expression {
+            kind: ExpressionKind::If(Box::new(hir::IfExpression {
+                condition,
+                then_branch,
+                else_branch,
+            })),
+            ty,
+            span: expression.span,
+        }
+    }
+
+    fn analyze_match(
+        &mut self,
+        expression: &ast::MatchExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        let scrutinee = self.analyze_expression(&expression.scrutinee);
+        let moves_before_arms = self.moved_locals.clone();
+        let mut moves_after_arms = moves_before_arms.clone();
+        let mut arms = Vec::with_capacity(expression.arms.len());
+        let mut result_type = None;
+        for arm in &expression.arms {
+            self.moved_locals.clone_from(&moves_before_arms);
+            self.push_scope();
+            let pattern = self.analyze_pattern(&arm.pattern, scrutinee.ty);
+            let guard = arm.guard.as_ref().map(|guard| {
+                let guard = self.analyze_expression_expected(guard, Some(Type::Bool));
+                self.require_type(Type::Bool, guard.ty, guard.span, "match guard");
+                guard
+            });
+            let body = self.analyze_expression_expected(&arm.body, expected);
+            result_type = Some(result_type.map_or(body.ty, |previous| {
+                self.unify_branch_types(previous, body.ty, arm.span)
+            }));
+            self.pop_scope();
+            moves_after_arms.extend(self.moved_locals.clone());
+            arms.push(hir::MatchArm {
+                pattern,
+                guard,
+                body,
+                span: arm.span,
+            });
+        }
+        self.moved_locals = moves_after_arms;
+        self.validate_match_coverage(scrutinee.ty, &arms, expression.span);
+        let ty = result_type.unwrap_or(Type::Never);
+        Expression {
+            kind: ExpressionKind::Match(Box::new(hir::MatchExpression { scrutinee, arms })),
+            ty,
+            span: expression.span,
+        }
+    }
+
+    fn analyze_loop(
+        &mut self,
+        expression: &ast::LoopExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        let context_index = self.loops.len();
+        self.loops.push(LoopContext {
+            kind: LoopKind::Expression,
+            expected,
+            break_type: None,
+        });
+        let body = self.analyze_block(&expression.body, None);
+        let ty = self
+            .loops
+            .get(context_index)
+            .and_then(|context| context.break_type)
+            .unwrap_or(Type::Never);
+        self.loops.truncate(context_index);
+        Expression {
+            kind: ExpressionKind::Loop(Box::new(hir::LoopExpression { body })),
+            ty,
+            span: expression.span,
+        }
+    }
+
+    fn analyze_pattern(&mut self, pattern: &ast::Pattern, expected: Type) -> hir::Pattern {
+        let kind = match pattern {
+            ast::Pattern::Wildcard(_) => hir::PatternKind::Wildcard,
+            ast::Pattern::Identifier { mutable, name, .. } => {
+                self.analyze_identifier_pattern(*mutable, name, expected)
+            }
+            ast::Pattern::Integer {
+                value,
+                negative,
+                span,
+            } => hir::PatternKind::Integer(
+                self.analyze_pattern_integer(*value, *negative, expected, *span),
+            ),
+            ast::Pattern::Float {
+                bits,
+                negative,
+                span,
+            } => self.analyze_pattern_float(*bits, *negative, expected, *span),
+            ast::Pattern::Character(literal) => {
+                self.require_type(Type::Char, expected, literal.span, "character pattern");
+                hir::PatternKind::Character(literal.value)
+            }
+            ast::Pattern::Boolean(literal) => {
+                self.require_type(Type::Bool, expected, literal.span, "boolean pattern");
+                hir::PatternKind::Boolean(literal.value)
+            }
+            ast::Pattern::Tuple { elements, span } => {
+                self.analyze_tuple_pattern(elements, expected, *span)
+            }
+            ast::Pattern::Path(path) => self.analyze_unit_variant_pattern(path, expected),
+            ast::Pattern::EnumTuple { path, fields, span } => {
+                self.analyze_enum_tuple_pattern(path, fields, expected, *span)
+            }
+            ast::Pattern::EnumStruct { path, fields, span } => {
+                self.analyze_enum_struct_pattern(path, fields, expected, *span)
+            }
+        };
+        hir::Pattern {
+            kind,
+            ty: expected,
+            span: pattern.span(),
+        }
+    }
+
+    fn analyze_identifier_pattern(
+        &mut self,
+        mutable: bool,
+        name: &ast::Identifier,
+        expected: Type,
+    ) -> hir::PatternKind {
+        if !mutable
+            && matches!(expected, Type::Enum(_))
+            && let Some((variant, fields)) = self.enum_variant(expected, &name.name)
+        {
+            if fields == hir::EnumVariantFields::Unit {
+                return hir::PatternKind::Enum {
+                    variant,
+                    fields: Vec::new(),
+                };
+            }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3134",
+                    format!("variant `{}` requires a payload pattern", name.name),
+                    name.span,
+                )
+                .with_help("add positional patterns in parentheses"),
+            );
+            return hir::PatternKind::Wildcard;
+        }
+        let local = self.new_local(name.span);
+        if self
+            .current_scope()
+            .insert(
+                name.name.clone(),
+                Binding {
+                    local,
+                    ty: expected,
+                    mutable,
+                },
+            )
+            .is_some()
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E3132",
+                format!("pattern binding `{}` is declared more than once", name.name),
+                name.span,
+            ));
+        }
+        hir::PatternKind::Binding {
+            local,
+            name: name.name.clone(),
+            mutable,
+        }
+    }
+
+    fn analyze_pattern_integer(
+        &mut self,
+        value: u128,
+        negative: bool,
+        expected: Type,
+        span: Span,
+    ) -> u128 {
+        if !expected.is_integer() || (negative && !expected.is_signed_integer()) {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("integer pattern is not valid for `{expected}`"),
+                span,
+            ));
+            return 0;
+        }
+        let maximum = if negative {
+            integer_minimum_magnitude(expected)
+        } else {
+            integer_positive_maximum(expected)
+        };
+        if value > maximum {
+            self.diagnostics.push(Diagnostic::error(
+                "E3104",
+                format!("integer pattern does not fit in `{expected}`"),
+                span,
+            ));
+            return 0;
+        }
+        if negative {
+            0_u128.wrapping_sub(value)
+        } else {
+            value
+        }
+    }
+
+    fn analyze_pattern_float(
+        &mut self,
+        bits: u64,
+        negative: bool,
+        expected: Type,
+        span: Span,
+    ) -> hir::PatternKind {
+        if !expected.is_float() {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("floating-point pattern is not valid for `{expected}`"),
+                span,
+            ));
+            return hir::PatternKind::Float64(0);
+        }
+        let value = if negative {
+            -f64::from_bits(bits)
+        } else {
+            f64::from_bits(bits)
+        };
+        if expected == Type::F32 {
+            let value = narrow_f64_to_f32(value);
+            if !value.is_finite() {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3104",
+                    "floating-point pattern does not fit in `f32`",
+                    span,
+                ));
+            }
+            hir::PatternKind::Float32(value.to_bits())
+        } else {
+            hir::PatternKind::Float64(value.to_bits())
+        }
+    }
+
+    fn analyze_tuple_pattern(
+        &mut self,
+        elements: &[ast::Pattern],
+        expected: Type,
+        span: Span,
+    ) -> hir::PatternKind {
+        let Some(types) = self.tuple_elements(expected) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("tuple pattern is not valid for `{expected}`"),
+                span,
+            ));
+            return hir::PatternKind::Tuple(Vec::new());
+        };
+        if types.len() != elements.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!(
+                    "tuple pattern requires {} element(s), found {}",
+                    types.len(),
+                    elements.len()
+                ),
+                span,
+            ));
+        }
+        let patterns = elements
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                self.analyze_pattern(pattern, types.get(index).copied().unwrap_or(Type::Unit))
+            })
+            .collect();
+        hir::PatternKind::Tuple(patterns)
+    }
+
+    fn analyze_unit_variant_pattern(
+        &mut self,
+        path: &ast::Path,
+        expected: Type,
+    ) -> hir::PatternKind {
+        let Some((variant, fields)) = self.resolve_pattern_variant(expected, path) else {
+            return hir::PatternKind::Wildcard;
+        };
+        if fields != hir::EnumVariantFields::Unit {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("variant `{}` requires a payload pattern", path.display()),
+                path.span,
+            ));
+            return hir::PatternKind::Wildcard;
+        }
+        hir::PatternKind::Enum {
+            variant,
+            fields: Vec::new(),
+        }
+    }
+
+    fn analyze_enum_tuple_pattern(
+        &mut self,
+        path: &ast::Path,
+        fields: &[ast::Pattern],
+        expected: Type,
+        span: Span,
+    ) -> hir::PatternKind {
+        let Some((variant, variant_fields)) = self.resolve_pattern_variant(expected, path) else {
+            return hir::PatternKind::Wildcard;
+        };
+        let hir::EnumVariantFields::Tuple(types) = variant_fields else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("variant `{}` is not tuple-like", path.display()),
+                span,
+            ));
+            return hir::PatternKind::Wildcard;
+        };
+        if types.len() != fields.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!(
+                    "variant pattern requires {} field(s), found {}",
+                    types.len(),
+                    fields.len()
+                ),
+                span,
+            ));
+        }
+        let fields = fields
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                self.analyze_pattern(pattern, types.get(index).copied().unwrap_or(Type::Unit))
+            })
+            .collect();
+        hir::PatternKind::Enum { variant, fields }
+    }
+
+    fn analyze_enum_struct_pattern(
+        &mut self,
+        path: &ast::Path,
+        fields: &[ast::PatternField],
+        expected: Type,
+        span: Span,
+    ) -> hir::PatternKind {
+        let Some((variant, variant_fields)) = self.resolve_pattern_variant(expected, path) else {
+            return hir::PatternKind::Wildcard;
+        };
+        let hir::EnumVariantFields::Struct(declared) = variant_fields else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("variant `{}` is not struct-like", path.display()),
+                span,
+            ));
+            return hir::PatternKind::Wildcard;
+        };
+        if self.type_is_external(expected)
+            && fields.iter().any(|provided| {
+                declared
+                    .iter()
+                    .any(|field| field.name == provided.name.name && !field.is_public)
+            })
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E4005",
+                    "enum payload field is private to its defining module",
+                    span,
+                )
+                .with_help("match the variant without naming private fields"),
+            );
+        }
+        let mut provided = HashMap::new();
+        for field in fields {
+            if provided.insert(field.name.name.as_str(), field).is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3132",
+                    format!(
+                        "pattern field `{}` is specified more than once",
+                        field.name.name
+                    ),
+                    field.span,
+                ));
+            }
+            if !declared
+                .iter()
+                .any(|declared| declared.name == field.name.name)
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3121",
+                    format!("variant has no field named `{}`", field.name.name),
+                    field.name.span,
+                ));
+            }
+        }
+        let mut resolved = Vec::with_capacity(declared.len());
+        for field in &declared {
+            if let Some(provided) = provided.get(field.name.as_str()) {
+                resolved.push(self.analyze_pattern(&provided.pattern, field.ty));
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3122",
+                    format!("missing pattern for field `{}`", field.name),
+                    span,
+                ));
+                resolved.push(hir::Pattern {
+                    kind: hir::PatternKind::Wildcard,
+                    ty: field.ty,
+                    span,
+                });
+            }
+        }
+        hir::PatternKind::Enum {
+            variant,
+            fields: resolved,
+        }
+    }
+
+    fn resolve_pattern_variant(
+        &mut self,
+        expected: Type,
+        path: &ast::Path,
+    ) -> Option<(u32, hir::EnumVariantFields)> {
+        let Type::Enum(_) = expected else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("enum pattern is not valid for `{expected}`"),
+                path.span,
+            ));
+            return None;
+        };
+        let variant_name = path.segments.last()?;
+        if path.segments.len() > 2 {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("invalid enum pattern path `{}`", path.display()),
+                path.span,
+            ));
+            return None;
+        }
+        if let [type_name, _] = path.segments.as_slice() {
+            let actual_name = self
+                .types
+                .definition(expected)
+                .and_then(|definition| definition.name.as_deref());
+            if actual_name != Some(type_name.name.as_str()) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3134",
+                    format!("`{}` is not a variant of `{expected}`", path.display()),
+                    path.span,
+                ));
+                return None;
+            }
+        }
+        self.enum_variant(expected, &variant_name.name).or_else(|| {
+            self.diagnostics.push(Diagnostic::error(
+                "E3134",
+                format!("enum variant `{}` does not exist", path.display()),
+                path.span,
+            ));
+            None
+        })
+    }
+
+    fn validate_match_coverage(&mut self, ty: Type, arms: &[hir::MatchArm], span: Span) {
+        if match_is_exhaustive(self.types, ty, arms) {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error("E3133", format!("non-exhaustive match on `{ty}`"), span)
+                .with_help("add the missing cases or a final `_` arm"),
+        );
+    }
+
+    fn analyze_assignment(&mut self, assignment: &ast::AssignmentExpression) -> Expression {
+        if let AstExpression::Index(index) = &assignment.target
+            && self.supports_index_method(&index.base, "set_index")
+        {
+            if assignment.operator != AstAssignmentOperator::Assign {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3125",
+                        "compound tensor indexing assignment is not supported",
+                        assignment.span,
+                    )
+                    .with_help("read the element, compute the value, then assign it with `=`"),
+                );
+                self.analyze_expression(&assignment.value);
+                return invalid_composite_expression(assignment.span);
+            }
+            return self.analyze_index_method_call(index, "set_index", Some(&assignment.value));
+        }
+        let Some(target) = self.analyze_place(&assignment.target) else {
+            self.analyze_expression(&assignment.value);
+            return invalid_composite_expression(assignment.span);
+        };
+        self.require_mutable_place(&assignment.target);
+        let value = self.analyze_expression_expected(&assignment.value, Some(target.ty));
+        let operator = match assignment.operator {
+            AstAssignmentOperator::Assign => AssignmentOperator::Assign,
+            AstAssignmentOperator::Add => AssignmentOperator::Add,
+            AstAssignmentOperator::Subtract => AssignmentOperator::Subtract,
+            AstAssignmentOperator::Multiply => AssignmentOperator::Multiply,
+            AstAssignmentOperator::Divide => AssignmentOperator::Divide,
+            AstAssignmentOperator::Remainder => AssignmentOperator::Remainder,
+            AstAssignmentOperator::BitAnd => AssignmentOperator::BitAnd,
+            AstAssignmentOperator::BitXor => AssignmentOperator::BitXor,
+            AstAssignmentOperator::BitOr => AssignmentOperator::BitOr,
+            AstAssignmentOperator::ShiftLeft => AssignmentOperator::ShiftLeft,
+            AstAssignmentOperator::ShiftRight => AssignmentOperator::ShiftRight,
+        };
+        if let PlaceKind::Local(local) = &target.kind {
+            let available_to_update = self.require_not_reserved_by_defer(*local, target.span);
+            if operator == AssignmentOperator::Assign {
+                if available_to_update {
+                    self.moved_locals.remove(local);
+                }
+            } else {
+                self.require_local_available(
+                    Binding {
+                        local: *local,
+                        ty: target.ty,
+                        mutable: true,
+                    },
+                    target.span,
+                );
+            }
+        }
+        self.require_type(target.ty, value.ty, value.span, "assignment value");
+        let valid = match operator {
+            AssignmentOperator::Assign => true,
+            AssignmentOperator::Add
+            | AssignmentOperator::Subtract
+            | AssignmentOperator::Multiply
+            | AssignmentOperator::Divide => target.ty.is_numeric(),
+            AssignmentOperator::Remainder
+            | AssignmentOperator::BitAnd
+            | AssignmentOperator::BitXor
+            | AssignmentOperator::BitOr
+            | AssignmentOperator::ShiftLeft
+            | AssignmentOperator::ShiftRight => target.ty.is_integer(),
+        };
+        if !valid {
+            self.invalid_operator("compound assignment", target.ty, assignment.span);
+        }
+        Expression {
+            kind: ExpressionKind::Assign {
+                target,
+                operator,
+                value: Box::new(value),
+            },
+            ty: Type::Unit,
+            span: assignment.span,
+        }
+    }
+
+    fn analyze_place(&mut self, expression: &AstExpression) -> Option<Place> {
+        match expression {
+            AstExpression::Path(path) => {
+                let binding = single_path_name(path).and_then(|name| self.lookup(name));
+                let Some(binding) = binding else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E3102",
+                        format!("cannot resolve binding `{}`", path.display()),
+                        path.span,
+                    ));
+                    return None;
+                };
+                Some(Place {
+                    kind: PlaceKind::Local(binding.local),
+                    ty: binding.ty,
+                    span: path.span,
+                })
+            }
+            AstExpression::Field(_) => {
+                let analyzed = self.analyze_expression_non_consuming(expression);
+                let ExpressionKind::Field { base, field } = analyzed.kind else {
+                    return None;
+                };
+                Some(Place {
+                    kind: PlaceKind::Field { base, field },
+                    ty: analyzed.ty,
+                    span: analyzed.span,
+                })
+            }
+            AstExpression::Index(_) => {
+                let analyzed = self.analyze_expression_non_consuming(expression);
+                let ExpressionKind::Index { base, index } = analyzed.kind else {
+                    return None;
+                };
+                Some(Place {
+                    kind: PlaceKind::Index { base, index },
+                    ty: analyzed.ty,
+                    span: analyzed.span,
+                })
+            }
+            AstExpression::Unary(unary) if unary.operator == AstUnaryOperator::Dereference => {
+                let analyzed = self.analyze_expression_non_consuming(expression);
+                let ExpressionKind::Dereference(pointer) = analyzed.kind else {
+                    return None;
+                };
+                Some(Place {
+                    kind: PlaceKind::Dereference { pointer },
+                    ty: analyzed.ty,
+                    span: analyzed.span,
+                })
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3108",
+                        "assignment target must be a local, field, or array element",
+                        expression.span(),
+                    )
+                    .with_help("assign to `name`, `value.field`, or `values[index]`"),
+                );
+                None
+            }
+        }
+    }
+
+    fn place_expression_type(&self, expression: &AstExpression) -> Option<Type> {
+        match expression {
+            AstExpression::Path(path) => {
+                single_path_name(path).and_then(|name| self.lookup(name).map(|binding| binding.ty))
+            }
+            AstExpression::Field(field) => {
+                let base = self.place_expression_type(&field.base)?;
+                let base = self
+                    .types
+                    .pointer_shape(base)
+                    .filter(|(_, _, raw)| !raw)
+                    .map_or(base, |(target, _, _)| target);
+                match (base, &field.field) {
+                    (Type::Struct(_), ast::FieldName::Named(name)) => self
+                        .struct_fields(base)
+                        .iter()
+                        .find(|field| field.name == name.name)
+                        .map(|field| field.ty),
+                    (Type::Tuple(_), ast::FieldName::TupleIndex { index, .. }) => {
+                        self.tuple_elements(base).and_then(|elements| {
+                            usize::try_from(*index)
+                                .ok()
+                                .and_then(|i| elements.get(i).copied())
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            AstExpression::Index(index) if index.indices.len() == 1 => {
+                let base = self.place_expression_type(&index.base)?;
+                self.array_shape(base)
+                    .map(|(element, _)| element)
+                    .or_else(|| self.types.slice_shape(base).map(|(element, _)| element))
+            }
+            AstExpression::Unary(unary) if unary.operator == AstUnaryOperator::Dereference => {
+                let pointer = self.place_expression_type(&unary.operand)?;
+                self.types
+                    .pointer_shape(pointer)
+                    .map(|(target, _, _)| target)
+            }
+            _ => None,
+        }
+    }
+
+    fn require_mutable_place(&mut self, expression: &AstExpression) {
+        if let AstExpression::Unary(unary) = expression
+            && unary.operator == AstUnaryOperator::Dereference
+        {
+            let pointer = self.analyze_expression_non_consuming(&unary.operand);
+            let Some((_, mutable, _)) = self.types.pointer_shape(pointer.ty) else {
+                return;
+            };
+            if !mutable {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3107",
+                    "cannot assign through an immutable reference or pointer",
+                    expression.span(),
+                ));
+            }
+            return;
+        }
+        if let AstExpression::Index(index) = expression
+            && let Some(base_type) = self.place_expression_type(&index.base)
+        {
+            let indirectly_mutable = self
+                .types
+                .slice_shape(base_type)
+                .is_some_and(|(_, mutable)| mutable)
+                || self
+                    .types
+                    .pointer_shape(base_type)
+                    .is_some_and(|(_, mutable, _)| mutable);
+            if indirectly_mutable {
+                return;
+            }
+        }
+        if matches!(expression, AstExpression::Field(_))
+            && let Some(path) = assignment_root_path(expression)
+            && let Some(binding) = single_path_name(path).and_then(|name| self.lookup(name))
+            && self
+                .types
+                .pointer_shape(binding.ty)
+                .is_some_and(|(_, mutable, raw)| mutable && !raw)
+        {
+            return;
+        }
+        let Some(path) = assignment_root_path(expression) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3108",
+                "assignment target is not rooted in a local binding",
+                expression.span(),
+            ));
+            return;
+        };
+        let Some(name) = single_path_name(path) else {
+            return;
+        };
+        let Some(binding) = self.lookup(name) else {
+            return;
+        };
+        if self
+            .borrow_states
+            .get(&binding.local)
+            .is_some_and(|state| state.mutable || state.shared != 0)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3138",
+                    format!("cannot mutate `{name}` while it is borrowed"),
+                    path.span,
+                )
+                .with_help("end the reference's scope before mutating the original binding"),
+            );
+            return;
+        }
+        if !binding.mutable {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3107",
+                    format!("cannot assign through immutable binding `{name}`"),
+                    path.span,
+                )
+                .with_help(format!("declare it as `let mut {name}`")),
+            );
+        }
+    }
+
+    fn analyze_cast(&mut self, cast: &ast::CastExpression) -> Expression {
+        let target = self
+            .types
+            .resolve_type_name_in(&cast.target, &self.generic_environment, self.diagnostics)
+            .unwrap_or(Type::Unit);
+        let value = self.analyze_expression(&cast.value);
+        if value.ty != Type::Never && !is_valid_cast(value.ty, target) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3113",
+                    format!("cannot cast `{}` to `{target}`", value.ty),
+                    cast.span,
+                )
+                .with_help(
+                    "use `as` only for integer, floating-point, or character-to-integer conversions",
+                ),
+            );
+        }
+        Expression {
+            kind: ExpressionKind::Cast {
+                value: Box::new(value),
+                target,
+            },
+            ty: target,
+            span: cast.span,
+        }
+    }
+
+    fn unify_branch_types(&mut self, left: Type, right: Type, span: Span) -> Type {
+        if left == Type::Never {
+            return right;
+        }
+        if right == Type::Never || left == right {
+            return left;
+        }
+        self.type_mismatch(left, right, span, "`if` branches");
+        Type::Unit
+    }
+
+    fn require_type(&mut self, expected: Type, actual: Type, span: Span, role: &str) {
+        if !expected.accepts(actual) {
+            self.type_mismatch(expected, actual, span, role);
+        }
+    }
+
+    fn type_mismatch(&mut self, expected: Type, actual: Type, span: Span, role: &str) {
+        self.diagnostics.push(Diagnostic::error(
+            "E3103",
+            format!("{role} requires `{expected}`, found `{actual}`"),
+            span,
+        ));
+    }
+
+    fn invalid_operator(&mut self, role: &str, ty: Type, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error("E3112", format!("{role} is not defined for `{ty}`"), span)
+                .with_help("use an operator supported by this operand type"),
+        );
+    }
+
+    fn struct_fields(&self, ty: Type) -> Vec<hir::TypeField> {
+        let Some(definition) = self.types.definition(ty) else {
+            return Vec::new();
+        };
+        let hir::TypeDefinitionKind::Struct { fields } = &definition.kind else {
+            return Vec::new();
+        };
+        fields.clone()
+    }
+
+    fn reject_external_private_construction(
+        &mut self,
+        ty: Type,
+        fields: &[hir::TypeField],
+        span: Span,
+    ) {
+        if self.type_is_external(ty) && fields.iter().any(|field| !field.is_public) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E4005",
+                    "cannot construct an external aggregate with private fields",
+                    span,
+                )
+                .with_help("use a public constructor function from the defining module"),
+            );
+        }
+    }
+
+    fn type_is_external(&self, ty: Type) -> bool {
+        let module = self
+            .types
+            .definition(ty)
+            .and_then(|definition| definition.name.as_deref())
+            .and_then(symbol_module_identity);
+        module != self.module_identity.as_deref()
+    }
+
+    fn tuple_elements(&self, ty: Type) -> Option<Vec<Type>> {
+        let definition = self.types.definition(ty)?;
+        let hir::TypeDefinitionKind::Tuple { elements } = &definition.kind else {
+            return None;
+        };
+        Some(elements.clone())
+    }
+
+    fn array_shape(&self, ty: Type) -> Option<(Type, u64)> {
+        let definition = self.types.definition(ty)?;
+        let hir::TypeDefinitionKind::Array { element, length } = definition.kind else {
+            return None;
+        };
+        Some((element, length))
+    }
+
+    fn enum_variant(&self, ty: Type, name: &str) -> Option<(u32, hir::EnumVariantFields)> {
+        let definition = self.types.definition(ty)?;
+        let hir::TypeDefinitionKind::Enum { variants } = &definition.kind else {
+            return None;
+        };
+        variants
+            .iter()
+            .enumerate()
+            .find(|(_, variant)| variant.name == name)
+            .and_then(|(index, variant)| {
+                u32::try_from(index)
+                    .ok()
+                    .map(|index| (index, variant.fields.clone()))
+            })
+    }
+
+    fn lookup(&self, name: &str) -> Option<Binding> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+        self.borrow_scopes.push(Vec::new());
+        self.deferred_use_scopes.push(Vec::new());
+    }
+
+    fn pop_scope(&mut self) {
+        if let Some(locals) = self.deferred_use_scopes.pop() {
+            for local in locals {
+                self.deferred_uses.remove(&local);
+            }
+        }
+        if let Some(borrows) = self.borrow_scopes.pop() {
+            for (local, mutable) in borrows {
+                let Some(state) = self.borrow_states.get_mut(&local) else {
+                    continue;
+                };
+                if mutable {
+                    state.mutable = false;
+                } else {
+                    state.shared = state.shared.saturating_sub(1);
+                }
+                if state.shared == 0 && !state.mutable {
+                    self.borrow_states.remove(&local);
+                }
+            }
+        }
+        self.scopes.pop();
+    }
+
+    fn current_scope(&mut self) -> &mut HashMap<String, Binding> {
+        let index = self.scopes.len().saturating_sub(1);
+        &mut self.scopes[index]
+    }
+
+    fn new_local(&mut self, span: Span) -> LocalId {
+        let local = LocalId(self.next_local);
+        if let Some(next) = self.next_local.checked_add(1) {
+            self.next_local = next;
+        } else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3999",
+                "function contains too many local bindings",
+                span,
+            ));
+        }
+        local
+    }
+}
+
+fn primitive_type(name: &str) -> Option<Type> {
+    Some(match name {
+        "i8" => Type::I8,
+        "i16" => Type::I16,
+        "i32" => Type::I32,
+        "i64" => Type::I64,
+        "i128" => Type::I128,
+        "isize" => Type::Isize,
+        "u8" => Type::U8,
+        "u16" => Type::U16,
+        "u32" => Type::U32,
+        "u64" => Type::U64,
+        "u128" => Type::U128,
+        "usize" => Type::Usize,
+        "f32" => Type::F32,
+        "f64" => Type::F64,
+        "bool" => Type::Bool,
+        "char" => Type::Char,
+        "str" => Type::Str,
+        "cstr" => Type::CStr,
+        "never" => Type::Never,
+        _ => return None,
+    })
+}
+
+fn validate_generic_parameter_names(
+    parameters: &[ast::GenericParameter],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut names = HashMap::new();
+    let mut saw_default = false;
+    for parameter in parameters {
+        let name = parameter.name();
+        if names.insert(name.name.as_str(), name.span).is_some() {
+            diagnostics.push(Diagnostic::error(
+                "E6005",
+                format!(
+                    "generic parameter `{}` is declared more than once",
+                    name.name
+                ),
+                name.span,
+            ));
+        }
+        let has_default = match parameter {
+            ast::GenericParameter::Type { default, .. } => default.is_some(),
+            ast::GenericParameter::Const { default, .. } => default.is_some(),
+        };
+        if saw_default && !has_default {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E6005",
+                    "required generic parameters cannot follow a defaulted parameter",
+                    parameter.span(),
+                )
+                .with_help("move required parameters before parameters with defaults"),
+            );
+        }
+        saw_default |= has_default;
+    }
+}
+
+fn generic_type_parameter(parameters: &[ast::GenericParameter], name: &str) -> bool {
+    parameters.iter().any(|parameter| {
+        matches!(
+            parameter,
+            ast::GenericParameter::Type {
+                name: parameter_name,
+                ..
+            } if parameter_name.name == name
+        )
+    })
+}
+
+fn generic_const_parameter(parameters: &[ast::GenericParameter], name: &str) -> bool {
+    parameters.iter().any(|parameter| {
+        matches!(
+            parameter,
+            ast::GenericParameter::Const {
+                name: parameter_name,
+                ..
+            } if parameter_name.name == name
+        )
+    })
+}
+
+fn bind_type_argument(environment: &mut GenericEnvironment, name: &str, ty: Type) -> bool {
+    if let Some(existing) = environment.types.get(name) {
+        *existing == ty
+    } else {
+        environment.types.insert(name.to_owned(), ty);
+        true
+    }
+}
+
+fn bind_const_argument(environment: &mut GenericEnvironment, name: &str, value: u64) -> bool {
+    if let Some(existing) = environment.constants.get(name) {
+        *existing == value
+    } else {
+        environment.constants.insert(name.to_owned(), value);
+        true
+    }
+}
+
+fn infer_const_pattern(
+    pattern: &AstExpression,
+    actual: u64,
+    parameters: &[ast::GenericParameter],
+    environment: &mut GenericEnvironment,
+) -> bool {
+    if let AstExpression::Path(path) = pattern
+        && let Some(name) = single_path_name(path)
+        && generic_const_parameter(parameters, name)
+    {
+        return bind_const_argument(environment, name, actual);
+    }
+    let mut ignored_diagnostics = Vec::new();
+    evaluate_array_length_in(pattern, environment, &mut ignored_diagnostics)
+        .is_some_and(|expected| expected == actual)
+}
+
+fn type_pattern_is_bound(
+    pattern: &ast::TypeName,
+    parameters: &[ast::GenericParameter],
+    environment: &GenericEnvironment,
+) -> bool {
+    match &pattern.kind {
+        TypeNameKind::Function {
+            parameters: parameter_types,
+            return_type,
+        } => {
+            parameter_types
+                .iter()
+                .all(|parameter| type_pattern_is_bound(parameter, parameters, environment))
+                && type_pattern_is_bound(return_type, parameters, environment)
+        }
+        TypeNameKind::Path(path) => single_path_name(path).is_none_or(|name| {
+            !generic_type_parameter(parameters, name) || environment.types.contains_key(name)
+        }),
+        TypeNameKind::Generic { arguments, .. } => {
+            arguments.iter().all(|argument| match argument {
+                ast::GenericArgument::Type(ty) => {
+                    if let TypeNameKind::Path(path) = &ty.kind
+                        && let Some(name) = single_path_name(path)
+                        && generic_const_parameter(parameters, name)
+                    {
+                        environment.constants.contains_key(name)
+                    } else {
+                        type_pattern_is_bound(ty, parameters, environment)
+                    }
+                }
+                ast::GenericArgument::Const(value) => {
+                    const_pattern_is_bound(value, parameters, environment)
+                }
+            })
+        }
+        TypeNameKind::Tuple(elements) => elements
+            .iter()
+            .all(|element| type_pattern_is_bound(element, parameters, environment)),
+        TypeNameKind::Array { element, length } => {
+            type_pattern_is_bound(element, parameters, environment)
+                && const_pattern_is_bound(length, parameters, environment)
+        }
+        TypeNameKind::Slice(element) => type_pattern_is_bound(element, parameters, environment),
+        TypeNameKind::Reference { target, .. } | TypeNameKind::RawPointer { target, .. } => {
+            type_pattern_is_bound(target, parameters, environment)
+        }
+        TypeNameKind::Unit => true,
+    }
+}
+
+fn const_pattern_is_bound(
+    expression: &AstExpression,
+    parameters: &[ast::GenericParameter],
+    environment: &GenericEnvironment,
+) -> bool {
+    match expression {
+        AstExpression::Path(path) => single_path_name(path).is_none_or(|name| {
+            !generic_const_parameter(parameters, name) || environment.constants.contains_key(name)
+        }),
+        AstExpression::Binary(expression) => {
+            const_pattern_is_bound(&expression.left, parameters, environment)
+                && const_pattern_is_bound(&expression.right, parameters, environment)
+        }
+        AstExpression::Integer(_) => true,
+        _ => false,
+    }
+}
+
+fn evaluate_array_length_in(
+    expression: &AstExpression,
+    environment: &GenericEnvironment,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<u64> {
+    let value = match expression {
+        AstExpression::Integer(literal) => u64::try_from(literal.value).ok(),
+        AstExpression::Path(path) => {
+            single_path_name(path).and_then(|name| environment.constants.get(name).copied())
+        }
+        AstExpression::Binary(expression) => {
+            let left = evaluate_array_length_in(&expression.left, environment, diagnostics)?;
+            let right = evaluate_array_length_in(&expression.right, environment, diagnostics)?;
+            match expression.operator {
+                AstBinaryOperator::Add => left.checked_add(right),
+                AstBinaryOperator::Subtract => left.checked_sub(right),
+                AstBinaryOperator::Multiply => left.checked_mul(right),
+                AstBinaryOperator::Divide => left.checked_div(right),
+                AstBinaryOperator::Remainder => left.checked_rem(right),
+                AstBinaryOperator::BitAnd => Some(left & right),
+                AstBinaryOperator::BitXor => Some(left ^ right),
+                AstBinaryOperator::BitOr => Some(left | right),
+                AstBinaryOperator::ShiftLeft => u32::try_from(right)
+                    .ok()
+                    .and_then(|shift| left.checked_shl(shift)),
+                AstBinaryOperator::ShiftRight => u32::try_from(right)
+                    .ok()
+                    .and_then(|shift| left.checked_shr(shift)),
+                AstBinaryOperator::Equal
+                | AstBinaryOperator::NotEqual
+                | AstBinaryOperator::Less
+                | AstBinaryOperator::LessEqual
+                | AstBinaryOperator::Greater
+                | AstBinaryOperator::GreaterEqual
+                | AstBinaryOperator::And
+                | AstBinaryOperator::Or => None,
+            }
+        }
+        _ => None,
+    };
+    if value.is_none() {
+        diagnostics.push(
+            Diagnostic::error(
+                "E3011",
+                "array length must be a non-negative integer constant",
+                expression.span(),
+            )
+            .with_help("use an integer literal, const parameter, or checked const arithmetic"),
+        );
+    }
+    value
+}
+
+fn invalid_composite_expression(span: Span) -> Expression {
+    Expression {
+        kind: ExpressionKind::Unit,
+        ty: Type::Unit,
+        span,
+    }
+}
+
+fn scoped_storage_diagnostic(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E3013",
+        "a scoped view cannot be hidden inside raw owning storage",
+        span,
+    )
+    .with_help("store owned data or keep the scoped value in a directly borrowed aggregate")
+}
+
+fn pattern_is_irrefutable(pattern: &hir::Pattern) -> bool {
+    match &pattern.kind {
+        hir::PatternKind::Wildcard | hir::PatternKind::Binding { .. } => true,
+        hir::PatternKind::Tuple(elements) => elements.iter().all(pattern_is_irrefutable),
+        hir::PatternKind::Integer(_)
+        | hir::PatternKind::Float32(_)
+        | hir::PatternKind::Float64(_)
+        | hir::PatternKind::Character(_)
+        | hir::PatternKind::Boolean(_)
+        | hir::PatternKind::Enum { .. } => false,
+    }
+}
+
+fn match_is_exhaustive(types: &TypeRegistry, ty: Type, arms: &[hir::MatchArm]) -> bool {
+    let unguarded: Vec<_> = arms.iter().filter(|arm| arm.guard.is_none()).collect();
+    if unguarded
+        .iter()
+        .any(|arm| pattern_is_irrefutable(&arm.pattern))
+    {
+        return true;
+    }
+    match ty {
+        Type::Never => true,
+        Type::Bool => {
+            let mut seen_false = false;
+            let mut seen_true = false;
+            for arm in unguarded {
+                match arm.pattern.kind {
+                    hir::PatternKind::Boolean(false) => seen_false = true,
+                    hir::PatternKind::Boolean(true) => seen_true = true,
+                    _ => {}
+                }
+            }
+            seen_false && seen_true
+        }
+        Type::Enum(_) => enum_match_is_exhaustive(types, ty, &unguarded),
+        _ => false,
+    }
+}
+
+fn enum_match_is_exhaustive(types: &TypeRegistry, ty: Type, arms: &[&hir::MatchArm]) -> bool {
+    let Some(definition) = types.definition(ty) else {
+        return false;
+    };
+    let hir::TypeDefinitionKind::Enum { variants } = &definition.kind else {
+        return false;
+    };
+    let mut covered = vec![false; variants.len()];
+    for arm in arms {
+        let hir::PatternKind::Enum { variant, fields } = &arm.pattern.kind else {
+            continue;
+        };
+        if fields.iter().all(pattern_is_irrefutable)
+            && let Ok(index) = usize::try_from(*variant)
+            && let Some(entry) = covered.get_mut(index)
+        {
+            *entry = true;
+        }
+    }
+    covered.into_iter().all(|entry| entry)
+}
+
+fn integer_positive_maximum(ty: Type) -> u128 {
+    debug_assert!(ty.is_integer());
+    let Some(bits) = ty.integer_bits() else {
+        return 0;
+    };
+    if ty.is_signed_integer() {
+        if bits == 128 {
+            i128::MAX as u128
+        } else {
+            (1_u128 << (bits - 1)) - 1
+        }
+    } else if bits == 128 {
+        u128::MAX
+    } else {
+        (1_u128 << bits) - 1
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "contextual f32 literals deliberately round an already range-checked f64"
+)]
+fn narrow_f64_to_f32(value: f64) -> f32 {
+    value as f32
+}
+
+fn integer_minimum_magnitude(ty: Type) -> u128 {
+    debug_assert!(ty.is_signed_integer());
+    let Some(bits) = ty.integer_bits() else {
+        return 0;
+    };
+    1_u128 << (bits - 1)
+}
+
+fn is_equality_type(ty: Type) -> bool {
+    ty.is_numeric() || matches!(ty, Type::Bool | Type::Char)
+}
+
+fn is_ordered_type(ty: Type) -> bool {
+    ty.is_numeric() || ty == Type::Char
+}
+
+fn is_valid_cast(source: Type, target: Type) -> bool {
+    (source == target && source.has_runtime_value())
+        || (source.is_integer() && (target.is_integer() || target.is_float()))
+        || (source.is_float() && target.is_float())
+        || (source == Type::Char && target.is_integer())
+        || (source.is_thin_pointer() && target.is_thin_pointer())
+        || (source.is_thin_pointer() && target == Type::Usize)
+        || (source == Type::Usize && matches!(target, Type::RawPointer(_)))
+}
+
+fn is_builtin_trait(name: &str) -> bool {
+    matches!(
+        name,
+        "Copy" | "Clone" | "Eq" | "Ord" | "Ordered" | "Hash" | "Send" | "Sync"
+    )
+}
+
+fn receiver_shapes_match(required: Option<&TypeNameKind>, provided: Option<&TypeNameKind>) -> bool {
+    match (required, provided) {
+        (
+            Some(TypeNameKind::Reference {
+                mutable: required, ..
+            }),
+            Some(TypeNameKind::Reference {
+                mutable: provided, ..
+            }),
+        ) => required == provided,
+        (Some(TypeNameKind::Reference { .. }), _)
+        | (_, Some(TypeNameKind::Reference { .. }))
+        | (None, Some(_))
+        | (Some(_), None) => false,
+        (None, None) | (Some(_), Some(_)) => true,
+    }
+}
+
+fn type_pattern_key(type_name: &ast::TypeName) -> String {
+    match &type_name.kind {
+        TypeNameKind::Function {
+            parameters,
+            return_type,
+        } => format!(
+            "fn({})->{}",
+            parameters
+                .iter()
+                .map(type_pattern_key)
+                .collect::<Vec<_>>()
+                .join(","),
+            type_pattern_key(return_type)
+        ),
+        TypeNameKind::Path(path) => path.display(),
+        TypeNameKind::Generic { path, arguments } => {
+            let arguments = arguments
+                .iter()
+                .map(|argument| match argument {
+                    ast::GenericArgument::Type(ty) => type_pattern_key(ty),
+                    ast::GenericArgument::Const(value) => const_expression_key(value),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}<{arguments}>", path.display())
+        }
+        TypeNameKind::Unit => "()".to_owned(),
+        TypeNameKind::Tuple(elements) => format!(
+            "({})",
+            elements
+                .iter()
+                .map(type_pattern_key)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        TypeNameKind::Array { element, length } => {
+            format!(
+                "[{};{}]",
+                type_pattern_key(element),
+                const_expression_key(length)
+            )
+        }
+        TypeNameKind::Slice(element) => format!("[{}]", type_pattern_key(element)),
+        TypeNameKind::Reference { mutable, target } => format!(
+            "&{}{}",
+            if *mutable { "mut " } else { "" },
+            type_pattern_key(target)
+        ),
+        TypeNameKind::RawPointer { mutable, target } => format!(
+            "*{} {}",
+            if *mutable { "mut" } else { "const" },
+            type_pattern_key(target)
+        ),
+    }
+}
+
+fn const_expression_key(expression: &AstExpression) -> String {
+    match expression {
+        AstExpression::Integer(literal) => literal.value.to_string(),
+        AstExpression::Path(path) => path.display(),
+        AstExpression::Unary(expression) => format!(
+            "{:?}{}",
+            expression.operator,
+            const_expression_key(&expression.operand)
+        ),
+        AstExpression::Binary(expression) => format!(
+            "({} {:?} {})",
+            const_expression_key(&expression.left),
+            expression.operator,
+            const_expression_key(&expression.right)
+        ),
+        _ => "<expression>".to_owned(),
+    }
+}
+
+fn single_path_name(path: &ast::Path) -> Option<&str> {
+    let [name] = path.segments.as_slice() else {
+        return None;
+    };
+    Some(&name.name)
+}
+
+fn function_path_name(path: &ast::Path) -> Option<String> {
+    match path.segments.as_slice() {
+        [name] => Some(name.name.clone()),
+        [owner, method] => Some(format!("{}::{}", owner.name, method.name)),
+        _ => None,
+    }
+}
+
+fn type_constructor_name(type_name: &ast::TypeName) -> Option<&str> {
+    match &type_name.kind {
+        TypeNameKind::Path(path) | TypeNameKind::Generic { path, .. } => single_path_name(path),
+        TypeNameKind::Function { .. }
+        | TypeNameKind::Unit
+        | TypeNameKind::Tuple(_)
+        | TypeNameKind::Array { .. }
+        | TypeNameKind::Slice(_)
+        | TypeNameKind::Reference { .. }
+        | TypeNameKind::RawPointer { .. } => None,
+    }
+}
+
+fn symbol_module_identity(name: &str) -> Option<&str> {
+    let (module, _) = name.strip_prefix("__module_")?.split_once('$')?;
+    Some(module)
+}
+
+fn assignment_root_path(expression: &AstExpression) -> Option<&ast::Path> {
+    match expression {
+        AstExpression::Path(path) => Some(path),
+        AstExpression::Field(field) => assignment_root_path(&field.base),
+        AstExpression::Index(index) => assignment_root_path(&index.base),
+        _ => None,
+    }
+}
+
+fn scoped_return_root(expression: &AstExpression) -> Option<&ast::Path> {
+    match expression {
+        AstExpression::Unary(unary)
+            if matches!(
+                unary.operator,
+                AstUnaryOperator::Borrow | AstUnaryOperator::BorrowMut
+            ) =>
+        {
+            view_source_root_path(&unary.operand)
+        }
+        AstExpression::Path(path) => Some(path),
+        AstExpression::Call(call) => match &call.callee {
+            AstExpression::Field(field) => view_source_root_path(&field.base),
+            AstExpression::Path(_) => call.arguments.first().and_then(view_source_root_path),
+            _ => None,
+        },
+        AstExpression::Struct(structure) => structure
+            .fields
+            .iter()
+            .find_map(|field| scoped_return_root(&field.value)),
+        AstExpression::Tuple(tuple) => tuple.elements.iter().find_map(scoped_return_root),
+        AstExpression::Array(array) => array.elements.iter().find_map(scoped_return_root),
+        _ => None,
+    }
+}
+
+fn scoped_return_is_empty(expression: &AstExpression) -> bool {
+    matches!(
+        expression,
+        AstExpression::Path(path) if single_path_name(path) == Some("None")
+    )
+}
+
+fn initializer_stores_borrow(expression: &AstExpression) -> bool {
+    match expression {
+        AstExpression::Unary(unary) => matches!(
+            unary.operator,
+            AstUnaryOperator::Borrow | AstUnaryOperator::BorrowMut
+        ),
+        AstExpression::Struct(structure) => structure
+            .fields
+            .iter()
+            .any(|field| initializer_stores_borrow(&field.value)),
+        AstExpression::Tuple(tuple) => tuple.elements.iter().any(initializer_stores_borrow),
+        AstExpression::Array(array) => array.elements.iter().any(initializer_stores_borrow),
+        _ => false,
+    }
+}
+
+fn view_source_root_path(expression: &AstExpression) -> Option<&ast::Path> {
+    match expression {
+        AstExpression::Path(path) => Some(path),
+        AstExpression::Field(field) => view_source_root_path(&field.base),
+        AstExpression::Index(index) => view_source_root_path(&index.base),
+        AstExpression::Call(call) => match &call.callee {
+            AstExpression::Field(field) => view_source_root_path(&field.base),
+            _ => None,
+        },
+        AstExpression::Cast(cast) => view_source_root_path(&cast.value),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reimer_lexer::lex;
+    use reimer_parser::parse;
+    use reimer_types::Type;
+
+    use super::{resolve, resolve_library};
+
+    fn resolve_fixture(
+        source: &str,
+    ) -> Result<reimer_hir::Program, Vec<reimer_diagnostics::Diagnostic>> {
+        let tokens = lex(source).expect("fixture should lex");
+        let program = parse(&tokens).expect("fixture should parse");
+        resolve(&program)
+    }
+
+    #[test]
+    fn resolve_should_type_check_functions_bindings_and_control_flow() {
+        let source = "fn add(left: i32, right: i32) -> i32 { left + right }
+            fn main() -> i32 {
+                let mut value = add(1, 2);
+                while value < 5 { value += 1; }
+                if value == 5 { 42 } else { 0 }
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions[1].body.ty, Type::I32);
+    }
+
+    #[test]
+    fn resolve_library_should_not_require_main() {
+        let tokens = lex("pub fn answer() -> i32 { 42 }").expect("fixture should lex");
+        let syntax = parse(&tokens).expect("fixture should parse");
+
+        let program = resolve_library(&syntax).expect("library should resolve");
+
+        assert!(program.entry.is_none());
+    }
+
+    #[test]
+    fn resolve_should_reject_assignment_to_immutable_binding() {
+        let source = "fn main() -> i32 { let value = 1; value = 2; return value; }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3107")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_wrong_function_argument_type() {
+        let source = "fn identity(value: i32) -> i32 { value } fn main() -> i32 { identity(true) }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3103")
+        );
+    }
+
+    #[test]
+    fn resolve_should_accept_unit_function_without_return_annotation() {
+        let source = "fn visit() { let done = true; } fn main() -> i32 { visit(); 0 }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions[0].return_type, Type::Unit);
+    }
+
+    #[test]
+    fn resolve_should_reject_qualified_call_until_module_resolution() {
+        let source = "fn main() -> i32 { x::y::z(); 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3106")
+        );
+    }
+
+    #[test]
+    fn resolve_should_accept_minimum_i32_literal() {
+        let program =
+            resolve_fixture("fn main() -> i32 { -2147483648 }").expect("fixture should resolve");
+
+        let tail = program.functions[0]
+            .body
+            .tail
+            .as_ref()
+            .expect("fixture has a tail expression");
+
+        assert!(matches!(
+            tail.kind,
+            reimer_hir::ExpressionKind::Integer(value) if value == 1_u128 << 31
+        ));
+    }
+
+    #[test]
+    fn resolve_should_respect_local_shadowing_at_call_sites() {
+        let source = "fn answer() -> i32 { 42 }
+            fn main() -> i32 { let answer = 1; answer(); 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("not callable"))
+        );
+    }
+
+    #[test]
+    fn resolve_should_contextually_type_scalar_literals_and_casts() {
+        let source = "fn widen(value: u8) -> u64 { value as u64 }
+            fn main() -> i32 {
+                let byte: u8 = 21;
+                let signed: i128 = -170141183460469231731687303715884105728;
+                let ratio: f32 = 1.5;
+                let scalar: char = 'A';
+                if (widen(byte) << 1) == 42 && ratio > 1.0 && scalar as u32 == 65 {
+                    signed as i32
+                } else {
+                    0
+                }
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions[0].parameters[0].ty, Type::U8);
+        assert_eq!(program.functions[0].return_type, Type::U64);
+    }
+
+    #[test]
+    fn resolve_should_reject_out_of_range_contextual_integer() {
+        let diagnostics = resolve_fixture("fn main() -> i32 { let byte: u8 = 256; 0 }")
+            .expect_err("fixture should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E3104" && diagnostic.message.contains("`u8`")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_reject_implicit_numeric_conversion() {
+        let source = "fn main() -> i32 { let small: u8 = 1; let wide: u64 = small; 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3103")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_potentially_failing_float_to_integer_cast() {
+        let diagnostics =
+            resolve_fixture("fn main() -> i32 { 1.5 as i32 }").expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3113")
+        );
+    }
+
+    #[test]
+    fn resolve_should_type_structs_tuples_arrays_fields_and_indices() {
+        let source = "struct Pair { left: i32, right: i32 }
+            fn sum(pair: Pair) -> i32 { pair.left + pair.right }
+            fn main() -> i32 {
+                let pair = Pair { right: 22, left: 20 };
+                let values: [i32; 2] = [sum(pair), 0];
+                let result: (i32, bool) = (values[0], true);
+                result.0
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.types.len(), 3);
+    }
+
+    #[test]
+    fn resolve_should_monomorphize_generic_structs_and_const_lengths() {
+        let source = "
+            struct Buffer<T, const N: usize> { values: [T; N] }
+            fn main() -> i32 {
+                let buffer: Buffer<i32, 2> = Buffer { values: [20, 22] };
+                buffer.values[0] + buffer.values[1]
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert!(program.types.iter().any(|definition| {
+            definition
+                .name
+                .as_deref()
+                .is_some_and(|name| name == "Buffer<i32, 2>")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_monomorphize_generic_functions_by_inference() {
+        let source = "
+            fn identity<T>(value: T) -> T { value }
+            fn first<T, const N: usize>(values: [T; N]) -> T { values[0] }
+            fn main() -> i32 { identity(first([42, 7])) }
+        ";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions.len(), 3);
+        assert!(
+            program
+                .functions
+                .iter()
+                .filter(|function| function.name.contains("$instance$"))
+                .count()
+                == 2
+        );
+    }
+
+    #[test]
+    fn resolve_should_monomorphize_generic_inherent_methods() {
+        let source = "
+            struct Holder<T> { value: T }
+            impl<T> Holder<T> {
+                fn new(value: T) -> Holder<T> { Holder { value: value } }
+                fn get(&self) -> T { self.value }
+            }
+            fn main() -> i32 {
+                let holder: Holder<i32> = Holder::new(42);
+                holder.get()
+            }
+        ";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions.len(), 3);
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name.starts_with("Holder::get$instance$"))
+        );
+    }
+
+    #[test]
+    fn resolve_should_validate_trait_bounds_and_dispatch_statically() {
+        let source = "
+            trait Measure {
+                fn measure(&self) -> i32;
+            }
+            struct Counter { value: i32 }
+            impl Measure for Counter {
+                fn measure(&self) -> i32 { self.value }
+            }
+            fn read<T: Measure>(value: T) -> i32 { value.measure() }
+            fn main() -> i32 { read(Counter { value: 42 }) }
+        ";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions.len(), 3);
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name.starts_with("read$instance$"))
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_unsatisfied_trait_bound() {
+        let source = "
+            trait Measure { fn measure(&self) -> i32; }
+            fn read<T: Measure>(value: T) -> i32 { 42 }
+            fn main() -> i32 { read(true) }
+        ";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6014"
+                && diagnostic.message.contains("does not satisfy trait bound")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_apply_explicit_copy_marker_to_move_analysis() {
+        let source = "
+            struct Pair { left: i32, right: i32 }
+            impl Copy for Pair {}
+            fn duplicate<T: Copy>(value: T) -> T {
+                let other = value;
+                value
+            }
+            fn main() -> i32 {
+                let pair = duplicate(Pair { left: 42, right: 7 });
+                pair.left
+            }
+        ";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions.len(), 2);
+    }
+
+    #[test]
+    fn resolve_should_reject_trait_method_return_mismatch() {
+        let source = "
+            trait Measure { fn measure(&self) -> bool; }
+            struct Counter { value: i32 }
+            impl Measure for Counter {
+                fn measure(&self) -> i32 { self.value }
+            }
+            fn main() -> i32 { 42 }
+        ";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6013" && diagnostic.message.contains("return type")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_type_all_enum_variant_forms() {
+        let source = "enum Value {
+                Empty,
+                Number(i32),
+                Named { value: i32 },
+            }
+            fn make_number() -> Value { Value::Number(42) }
+            fn main() -> i32 {
+                let empty = Value::Empty;
+                let number = make_number();
+                let named = Value::Named { value: 42 };
+                42
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert!(matches!(program.functions[0].return_type, Type::Enum(_)));
+    }
+
+    #[test]
+    fn resolve_should_report_missing_and_unknown_struct_fields() {
+        let source = "struct Pair { left: i32, right: i32 } fn main() -> i32 {
+                let pair = Pair { left: 20, other: 22 };
+                0
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { matches!(diagnostic.code, "E3121" | "E3122") })
+        );
+    }
+
+    #[test]
+    fn resolve_should_accept_mutable_fields_and_array_elements() {
+        let source = "struct Pair { left: i32, right: i32 }
+            fn main() -> i32 {
+                let mut pair = Pair { left: 18, right: 0 };
+                let mut values: [i32; 2] = [11, 0];
+                pair.left += 2;
+                values[0] *= 2;
+                pair.right = values[0];
+                pair.left + pair.right
+            }";
+
+        resolve_fixture(source).expect("fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_reject_field_assignment_through_immutable_binding() {
+        let source = "struct Pair { left: i32, right: i32 }
+            fn main() -> i32 {
+                let pair = Pair { left: 20, right: 22 };
+                pair.left = 0;
+                pair.left + pair.right
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3107")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_recursive_types_stored_by_value() {
+        let source = "struct First { next: Second }
+            struct Second { next: First }
+            fn main() -> i32 { 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3012")
+        );
+    }
+
+    #[test]
+    fn resolve_should_type_match_loop_for_and_pattern_bindings() {
+        let source = "enum Value { Empty, Pair(i32, i32) }
+            fn main() -> i32 {
+                let values: [i32; 2] = [20, 22];
+                let mut sum = 0;
+                for value in values { sum += value; }
+                let selected = Value::Pair(sum, 0);
+                let result = match selected {
+                    Value::Empty => 0,
+                    Value::Pair(left, right) if right != 0 => left + right,
+                    Value::Pair(left, _) => left,
+                };
+                loop { break result; }
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions[0].body.ty, Type::I32);
+    }
+
+    #[test]
+    fn resolve_should_require_exhaustive_matches() {
+        let source = "enum Value { Empty, Number(i32) }
+            fn main() -> i32 {
+                match Value::Empty {
+                    Value::Empty => 42,
+                }
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3133")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_refutable_for_patterns() {
+        let source = "fn main() -> i32 {
+            for 1 in [1, 2] { }
+            42
+        }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3131")
+        );
+    }
+
+    #[test]
+    fn resolve_should_type_references_slices_str_and_raw_pointers() {
+        let source = "fn adjust(value: &mut i32) { *value += 2; }
+            fn sum(values: &[i32]) -> i32 {
+                let mut total = 0;
+                for value in values { total += value; }
+                total
+            }
+            fn title_code(title: str) -> i32 { 0 }
+            fn main() -> i32 {
+                let mut value = 18;
+                adjust(&mut value);
+                let values: [i32; 2] = [value, 22];
+                let view: &[i32] = &values;
+                let raw: *mut i32 = &mut value as *mut i32;
+                unsafe { *raw -= 2; }
+                sum(view) + title_code(\"Reimer\")
+            }";
+
+        resolve_fixture(source).expect("fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_reject_raw_dereference_outside_unsafe() {
+        let source = "fn main() -> i32 {
+            let mut value = 42;
+            let raw: *mut i32 = &mut value as *mut i32;
+            *raw
+        }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3136")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_escaping_local_references() {
+        let source = "fn invalid() -> &i32 {
+                let value = 42;
+                &value
+            }
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3137")
+        );
+    }
+
+    #[test]
+    fn resolve_should_track_scoped_aggregate_lifetimes() {
+        let source = "
+            struct View { data: &i32 }
+            fn view(value: &i32) -> View { View { data: value } }
+            fn main() -> i32 {
+                let value = 42;
+                let borrowed = view(&value);
+                *borrowed.data
+            }";
+
+        resolve_fixture(source).expect("a scoped aggregate rooted in a parameter should resolve");
+    }
+
+    #[test]
+    fn resolve_should_reject_scoped_aggregate_escape() {
+        let source = "
+            struct View { data: &i32 }
+            fn invalid() -> View {
+                let value = 42;
+                View { data: &value }
+            }
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3137")
+        );
+    }
+
+    #[test]
+    fn resolve_should_keep_owner_borrowed_by_scoped_aggregate() {
+        let source = "
+            struct View { data: &i32 }
+            fn main() -> i32 {
+                let mut value = 42;
+                let borrowed = View { data: &value };
+                value = 0;
+                *borrowed.data
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3107" || diagnostic.code == "E3138")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_scoped_values_hidden_by_raw_generic_storage() {
+        let source = "
+            struct View { data: &i32 }
+            struct RawOwner<T> { data: *mut T }
+            fn consume(value: RawOwner<View>) {}
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3013")
+        );
+    }
+
+    #[test]
+    fn resolve_should_keep_method_owner_live_for_returned_view() {
+        let source = "
+            struct Owner { value: i32 }
+            struct View { data: &i32 }
+            impl Owner {
+                fn view(&self) -> View { View { data: &self.value } }
+                fn deinit(self) {}
+            }
+            fn main() -> i32 {
+                let owner = Owner { value: 42 };
+                let borrowed = owner.view();
+                owner.deinit();
+                *borrowed.data
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3138")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_conflicting_scoped_borrows() {
+        let source = "fn main() -> i32 {
+            let mut value = 42;
+            let shared = &value;
+            let exclusive = &mut value;
+            *shared
+        }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3138")
+        );
+    }
+
+    #[test]
+    fn resolve_should_type_option_result_and_try() {
+        let source = "fn maybe(flag: bool) -> Option<i32> {
+                if flag { Some(42) } else { None }
+            }
+            fn forward(flag: bool) -> Option<i32> {
+                let value = maybe(flag)?;
+                Some(value)
+            }
+            fn fallible(flag: bool) -> Result<Option<i32>, i32> {
+                if flag { Ok(Some(42)) } else { Err(7) }
+            }
+            fn main() -> i32 {
+                match forward(true) {
+                    Some(value) => value,
+                    None => 0,
+                }
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions.len(), 4);
+        assert!(matches!(program.functions[0].return_type, Type::Enum(_)));
+    }
+
+    #[test]
+    fn resolve_should_reject_invalid_try_contexts() {
+        let source = "fn not_fallible() -> i32 { 42? }
+            fn mismatched(value: Option<i32>) -> Result<i32, i32> {
+                value?
+            }
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E3140")
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn resolve_should_type_defer_and_panic() {
+        let source = "fn record(value: &mut i32, digit: i32) {
+                *value = *value * 10 + digit;
+            }
+            fn cleanup(value: &mut i32, flag: bool) -> Option<i32> {
+                defer record(value, 1);
+                if flag { Some(42) } else { None?; Some(0) }
+            }
+            fn choose(flag: bool) -> i32 {
+                if flag { 42 } else { panic(\"unreachable\") }
+            }
+            fn main() -> i32 { choose(true) }";
+
+        resolve_fixture(source).expect("fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_allow_borrowing_a_resource_after_registering_its_cleanup() {
+        let source = "
+            struct Resource { value: i32 }
+            fn destroy(resource: Resource) {}
+            fn inspect(resource: &Resource) -> i32 { (*resource).value }
+            fn main() -> i32 {
+                let resource = Resource { value: 42 };
+                defer destroy(resource);
+                inspect(&resource)
+            }";
+
+        let result = resolve_fixture(source);
+
+        assert!(
+            result.is_ok(),
+            "deferred cleanup should reserve rather than move"
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_moving_a_resource_reserved_for_cleanup() {
+        let source = "
+            struct Resource { value: i32 }
+            fn destroy(resource: Resource) {}
+            fn main() -> i32 {
+                let resource = Resource { value: 42 };
+                defer destroy(resource);
+                let moved = resource;
+                moved.value
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3147")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_two_deferred_consumers_of_one_resource() {
+        let source = "
+            struct Resource { value: i32 }
+            fn destroy(resource: Resource) {}
+            fn main() -> i32 {
+                let resource = Resource { value: 42 };
+                defer destroy(resource);
+                defer destroy(resource);
+                42
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3147")
+        );
+    }
+
+    #[test]
+    fn resolve_should_keep_string_view_intrinsics_private_to_standard_io() {
+        let source = r#"
+            fn main() -> i32 {
+                __string_length("private") as i32
+            }"#;
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3148")
+        );
+    }
+
+    #[test]
+    fn resolve_should_register_c_abi_function_declarations() {
+        let source = "
+            extern \"C\" fn native_abs(value: i32) -> i32;
+            fn main() -> i32 { unsafe { native_abs(-42) } }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.extern_functions.len(), 1);
+    }
+
+    #[test]
+    fn resolve_should_type_c_string_literals_for_ffi_calls() {
+        let source = r#"
+            extern "C" fn string_length(value: cstr) -> usize;
+            fn main() -> i32 {
+                unsafe { string_length(c"Reimer") as i32 }
+            }"#;
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions[0].body.ty, Type::I32);
+    }
+
+    #[test]
+    fn resolve_should_reject_escaping_c_string_literals() {
+        let source = r#"fn title() -> cstr { c"temporary" } fn main() -> i32 { 42 }"#;
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3137")
+        );
+    }
+
+    #[test]
+    fn resolve_should_require_unsafe_for_native_calls() {
+        let source = "
+            extern \"C\" fn native_abs(value: i32) -> i32;
+            fn main() -> i32 { native_abs(-42) }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E5002")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_non_abi_safe_external_parameters() {
+        let source = "
+            extern \"C\" fn native_log(value: str);
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E5001")
+        );
+    }
+
+    #[test]
+    fn resolve_should_preserve_ffi_layout_and_link_metadata() {
+        let source = "
+            @repr(C)
+            pub struct Vector2 { pub x: f32, pub y: f32 }
+            @link(\"raylib\")
+            extern \"C\" {
+                fn draw(value: *const Vector2, title: cstr) -> bool;
+            }
+            fn main() -> i32 { 42 }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(
+            program.types[0].representation,
+            reimer_hir::TypeRepresentation::C
+        );
+        assert_eq!(program.extern_functions[0].link.as_deref(), Some("raylib"));
+    }
+
+    #[test]
+    fn resolve_should_reject_pointers_to_native_layout_structs_at_ffi_boundary() {
+        let source = "
+            struct Vector2 { x: f32, y: f32 }
+            extern \"C\" fn draw(value: *const Vector2);
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E5001")
+        );
+    }
+
+    #[test]
+    fn resolve_should_type_inherent_associated_and_receiver_calls() {
+        let source = include_str!("../../../examples/m6_methods.reim");
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.functions.len(), 4);
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name == "Counter::add")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_control_transfer_from_defer() {
+        let source = "fn invalid() -> Option<i32> {
+                defer { return Some(0); }
+                defer None?;
+                Some(42)
+            }
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E3142")
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_use_after_implicit_move() {
+        let source = "struct Resource { id: i32 }
+            fn consume(resource: Resource) -> i32 { resource.id }
+            fn main() -> i32 {
+                let first = Resource { id: 20 };
+                let second = first;
+                let invalid = consume(first);
+                consume(second)
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3143")
+        );
+    }
+
+    #[test]
+    fn resolve_should_allow_copy_reuse_reinitialization_and_mutable_reborrows() {
+        let source = "struct Resource { id: i32 }
+            fn consume(resource: Resource) -> i32 { resource.id }
+            fn increment(value: &mut i32) { *value += 1; }
+            fn main() -> i32 {
+                let mut resource = Resource { id: 19 };
+                let moved = resource;
+                resource = Resource { id: 21 };
+                let tuple = (20, 22);
+                let tuple_copy = tuple;
+                let mut scalar = 18;
+                let view = &mut scalar;
+                increment(view);
+                increment(view);
+                consume(moved) + consume(resource) + tuple.0 + tuple_copy.1
+            }";
+
+        resolve_fixture(source).expect("fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_keep_raw_string_construction_private() {
+        let source = "fn invalid() -> str {
+                __str_from_parts(0 as *const u8, 0)
+            }
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3149")
+        );
+    }
+
+    #[test]
+    fn resolve_should_keep_native_element_stride_private() {
+        let source = "fn invalid() -> usize {
+                __pointee_stride(0 as usize as *const i32)
+            }
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3150")
+        );
+    }
+
+    #[test]
+    fn resolve_should_keep_raw_slice_construction_private() {
+        let source = "fn invalid(data: *const i32) -> &[i32] {
+                __slice_from_parts(data, 1)
+            }
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3150")
+        );
+    }
+
+    #[test]
+    fn resolve_should_type_function_values_and_indirect_calls() {
+        let source = "
+            fn add(left: i32, right: i32) -> i32 { left + right }
+            fn apply(callback: fn(i32, i32) -> i32) -> i32 {
+                callback(20, 22)
+            }
+            fn main() -> i32 { apply(add) }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert!(matches!(
+            program.functions[1].parameters[0].ty,
+            Type::Function(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_should_derive_send_for_safe_aggregate_fields() {
+        let source = "
+            struct Work { value: i32 }
+            fn transfer<T: Send>(value: T) -> T { value }
+            fn main() -> i32 { transfer(Work { value: 42 }).value }";
+
+        resolve_fixture(source).expect("fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_never_derive_send_for_raw_pointers() {
+        let source = "
+            fn transfer<T: Send>(value: T) -> T { value }
+            fn main() -> i32 {
+                let pointer = 0 as usize as *const i32;
+                let moved = transfer(pointer);
+                42
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Send"))
+        );
+    }
+}

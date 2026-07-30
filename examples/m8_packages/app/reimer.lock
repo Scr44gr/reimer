@@ -1,0 +1,33 @@
+format = 1
+
+[[package]]
+id = "259a6f42fda5f1b72d718143"
+name = "vectors"
+version = "0.1.0"
+source = "path+../vectors"
+checksum = "9e81570b058d87e47d70403cb414389a3477f9985ce3f17a958d7913982e858c"
+dependencies = []
+
+[[package]]
+id = "4558e8026e779ba60a19121c"
+name = "motion-app"
+version = "0.1.0"
+source = "path+."
+checksum = "15475e41befc82a4c8bae89b2a092714f6800c3dd5d67e4aaa33b194b5d72d62"
+
+[[package.dependencies]]
+alias = "physics"
+request = "path+../physics"
+package = "cbaceabcb35da33b1049692c"
+
+[[package]]
+id = "cbaceabcb35da33b1049692c"
+name = "physics"
+version = "0.1.0"
+source = "path+../physics"
+checksum = "1476d93fad48c67908d0ff52374e5730bcad00abb2f84d6d1b509303bfe82ed9"
+
+[[package.dependencies]]
+alias = "vectors"
+request = "path+../vectors"
+package = "259a6f42fda5f1b72d718143"

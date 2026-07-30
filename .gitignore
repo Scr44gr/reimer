@@ -1,0 +1,12 @@
+/target/
+**/target/
+/.tmp/
+/.reimer-build/
+*.reimer.c
+/.agents/
+/output/
+/tmp/
+/skills-lock.json
+*.o
+*.obj
+*.vsix

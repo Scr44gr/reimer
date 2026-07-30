@@ -1,0 +1,21 @@
+fn factorial(value: i32) -> i32 {
+    let mut current = value;
+    let mut result = 1;
+
+    while current > 1 {
+        result *= current;
+        current -= 1;
+    }
+
+    result
+}
+
+fn main() -> i32 {
+    let result = factorial(5);
+
+    if result == 120 && true {
+        42
+    } else {
+        0
+    }
+}

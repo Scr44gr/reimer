@@ -1,0 +1,25 @@
+from std::alloc import general_allocator;
+from std::io import println;
+from std::string import String;
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let mut owned = match String::from(&allocator, "allocator") {
+        Ok(value) => value,
+        Err(_) => {
+            return 1;
+        },
+    };
+    defer owned.deinit();
+    match owned.push_str("-aware") {
+        Ok(_) => (),
+        Err(_) => {
+            return 2;
+        },
+    }
+
+    match println(owned.as_str()) {
+        Ok(_) => 42,
+        Err(_) => 3,
+    }
+}

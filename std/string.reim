@@ -1,0 +1,159 @@
+from std::alloc import AllocError, Allocator, OwnedBytes, allocate_bytes;
+
+pub enum StringError {
+    InvalidUtf8,
+    LengthExceedsCapacity,
+}
+
+pub struct String {
+    bytes: OwnedBytes,
+    len: usize,
+}
+
+@link("runtime")
+extern "C" {
+    fn copy_bytes(
+        destination: *mut u8,
+        source: *const u8,
+        len: usize,
+    ) -> i32;
+    fn utf8_is_valid(data: *const u8, len: usize) -> bool;
+    fn buffer_equals(
+        left: *const u8,
+        left_len: usize,
+        right: *const u8,
+        right_len: usize,
+    ) -> bool;
+}
+
+impl String {
+    pub fn from(
+        allocator: &Allocator,
+        value: str,
+    ) -> Result<String, AllocError> {
+        let len = __string_length(value);
+        let mut bytes = allocate_bytes(allocator, len)?;
+        let status = unsafe {
+            copy_bytes(bytes.as_mut_ptr(), __string_data(value), len)
+        };
+        if status == 0 {
+            Ok(String {
+                bytes: bytes,
+                len: len,
+            })
+        } else {
+            bytes.deinit();
+            panic("std::string received invalid bounded byte regions")
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_str(&self) -> str {
+        __str_from_parts(self.bytes.as_ptr(), self.len)
+    }
+
+    pub fn matches(&self, value: str) -> bool {
+        unsafe {
+            buffer_equals(
+                self.bytes.as_ptr(),
+                self.len,
+                __string_data(value),
+                __string_length(value),
+            )
+        }
+    }
+
+    pub fn clone_in(
+        &self,
+        allocator: &Allocator,
+    ) -> Result<String, AllocError> {
+        String::from(allocator, self.as_str())
+    }
+
+    pub fn reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), AllocError> {
+        let required = self.len + additional;
+        if required <= self.bytes.len() {
+            Ok(())
+        } else {
+            let doubled = self.bytes.len() * 2;
+            let next = if doubled > required {
+                doubled
+            } else {
+                required
+            };
+            self.bytes.grow(next)
+        }
+    }
+
+    pub fn push_str(
+        &mut self,
+        value: str,
+    ) -> Result<(), AllocError> {
+        let appended = __string_length(value);
+        let start = self.len;
+        let required = start + appended;
+        if required > self.bytes.len() {
+            let doubled = self.bytes.len() * 2;
+            let next = if doubled > required {
+                doubled
+            } else {
+                required
+            };
+            self.bytes.grow(next)?;
+        }
+        let pointer = self.bytes.as_mut_ptr();
+        let destination = (pointer as usize + start) as *mut u8;
+        let status = unsafe {
+            copy_bytes(destination, __string_data(value), appended)
+        };
+        if status == 0 {
+            self.len = required;
+            Ok(())
+        } else {
+            panic("std::string received invalid bounded byte regions")
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn deinit(self) {
+        self.bytes.deinit();
+    }
+}
+
+pub fn from_initialized_bytes(
+    bytes: OwnedBytes,
+    len: usize,
+) -> Result<String, StringError> {
+    if len > bytes.len() {
+        bytes.deinit();
+        Err(StringError::LengthExceedsCapacity)
+    } else {
+        let valid = unsafe { utf8_is_valid(bytes.as_ptr(), len) };
+        if valid {
+            Ok(String {
+                bytes: bytes,
+                len: len,
+            })
+        } else {
+            bytes.deinit();
+            Err(StringError::InvalidUtf8)
+        }
+    }
+}

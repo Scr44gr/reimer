@@ -1,0 +1,39 @@
+from std::alloc import AllocError, general_allocator;
+from std::collections import Vec;
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let created: Result<Vec<i32>, AllocError> =
+        Vec::with_capacity(&allocator, 1);
+    let mut values = match created {
+        Ok(value) => value,
+        Err(_) => {
+            return 1;
+        },
+    };
+    defer values.deinit();
+
+    match values.push(20) {
+        Ok(_) => (),
+        Err(_) => {
+            return 2;
+        },
+    }
+    match values.push(1) {
+        Ok(_) => (),
+        Err(_) => {
+            return 3;
+        },
+    }
+    if !values.set(1, 22) {
+        return 4;
+    }
+
+    match values.pop() {
+        Some(right) => match values.get(0) {
+            Some(left) => left + right,
+            None => 5,
+        },
+        None => 6,
+    }
+}

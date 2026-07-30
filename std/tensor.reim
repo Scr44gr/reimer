@@ -1,0 +1,454 @@
+from std::alloc import AllocError, Allocator;
+from std::collections import Vec;
+from std::job import JobError, JobPool, parallel_for_mut;
+
+pub enum TensorError {
+    ShapeOverflow,
+    ShapeMismatch,
+    AllocationFailed,
+}
+
+pub struct tensor<T, const Rank: usize> {
+    values: Vec<T>,
+    shape: [usize; Rank],
+    strides: [usize; Rank],
+    len: usize,
+}
+
+pub struct TensorView<T, const Rank: usize> {
+    data: &[T],
+    shape: [usize; Rank],
+    strides: [usize; Rank],
+    len: usize,
+}
+
+pub struct TensorViewMut<T, const Rank: usize> {
+    data: &mut [T],
+    shape: [usize; Rank],
+    strides: [usize; Rank],
+    len: usize,
+}
+
+impl<T: Copy, const Rank: usize> Copy for TensorView<T, Rank> {}
+
+fn row_major_layout<const Rank: usize>(
+    shape: [usize; Rank],
+) -> Result<([usize; Rank], usize), TensorError> {
+    let maximum: usize = !0;
+    let mut strides = shape;
+    let mut element_count: usize = 1;
+    let mut cursor: usize = Rank;
+    while cursor > 0 {
+        cursor -= 1;
+        strides[cursor] = element_count;
+        let dimension = shape[cursor];
+        if dimension != 0 && element_count > maximum / dimension {
+            return Err(TensorError::ShapeOverflow);
+        }
+        element_count *= dimension;
+    }
+    Ok((strides, element_count))
+}
+
+fn flat_offset<const Rank: usize>(
+    shape: [usize; Rank],
+    strides: [usize; Rank],
+    indices: [usize; Rank],
+) -> Option<usize> {
+    let mut offset: usize = 0;
+    let mut axis: usize = 0;
+    while axis < Rank {
+        if indices[axis] >= shape[axis] {
+            return None;
+        }
+        offset += indices[axis] * strides[axis];
+        axis += 1;
+    }
+    Some(offset)
+}
+
+fn shapes_equal<const Rank: usize>(
+    left: [usize; Rank],
+    right: [usize; Rank],
+) -> bool {
+    let mut axis: usize = 0;
+    while axis < Rank {
+        if left[axis] != right[axis] {
+            return false;
+        }
+        axis += 1;
+    }
+    true
+}
+
+impl<T: Copy, const Rank: usize> tensor<T, Rank> {
+    pub fn filled(
+        allocator: &Allocator,
+        shape: [usize; Rank],
+        value: T,
+    ) -> Result<tensor<T, Rank>, TensorError> {
+        let layout = row_major_layout(shape);
+        let layout_values = match layout {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(error);
+            },
+        };
+        let strides = layout_values.0;
+        let len = layout_values.1;
+        let allocation: Result<Vec<T>, AllocError> =
+            Vec::with_capacity(allocator, len);
+        let mut values = match allocation {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(TensorError::AllocationFailed);
+            },
+        };
+        let mut index: usize = 0;
+        while index < len {
+            if !values.push_within_capacity(value) {
+                panic("std::tensor capacity invariant failed");
+            }
+            index += 1;
+        }
+        Ok(tensor {
+            values: values,
+            shape: shape,
+            strides: strides,
+            len: len,
+        })
+    }
+
+    pub fn from_values(
+        shape: [usize; Rank],
+        values: Vec<T>,
+    ) -> Result<tensor<T, Rank>, TensorError> {
+        let layout = row_major_layout(shape);
+        let layout_values = match layout {
+            Ok(value) => value,
+            Err(error) => {
+                values.deinit();
+                return Err(error);
+            },
+        };
+        let strides = layout_values.0;
+        let len = layout_values.1;
+        if values.len() != len {
+            values.deinit();
+            Err(TensorError::ShapeMismatch)
+        } else {
+            Ok(tensor {
+                values: values,
+                shape: shape,
+                strides: strides,
+                len: len,
+            })
+        }
+    }
+
+    pub fn shape(&self) -> [usize; Rank] {
+        self.shape
+    }
+
+    pub fn strides(&self) -> [usize; Rank] {
+        self.strides
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, indices: [usize; Rank]) -> Option<&T> {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => Some(&self.values.as_slice()[offset]),
+            None => None,
+        }
+    }
+
+    pub fn set(&mut self, indices: [usize; Rank], value: T) -> bool {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => self.values.set(offset, value),
+            None => false,
+        }
+    }
+
+    pub fn index(&self, indices: [usize; Rank]) -> T {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => match self.values.get(offset) {
+                Some(value) => value,
+                None => panic("tensor storage invariant failed"),
+            },
+            None => panic("tensor index is out of bounds"),
+        }
+    }
+
+    pub fn set_index(&mut self, indices: [usize; Rank], value: T) {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => {
+                if !self.values.set(offset, value) {
+                    panic("tensor storage invariant failed");
+                }
+            },
+            None => {
+                panic("tensor index is out of bounds");
+            },
+        }
+    }
+
+    pub fn get_flat(&self, index: usize) -> Option<T> {
+        self.values.get(index)
+    }
+
+    pub fn set_flat(&mut self, index: usize, value: T) -> bool {
+        self.values.set(index, value)
+    }
+
+    pub fn view(&self) -> TensorView<T, Rank> {
+        TensorView {
+            data: self.values.as_slice(),
+            shape: self.shape,
+            strides: self.strides,
+            len: self.len,
+        }
+    }
+
+    pub fn view_mut(&mut self) -> TensorViewMut<T, Rank> {
+        let shape = self.shape;
+        let strides = self.strides;
+        let len = self.len;
+        TensorViewMut {
+            data: self.values.as_mut_slice(),
+            shape: shape,
+            strides: strides,
+            len: len,
+        }
+    }
+
+    pub fn fill(&mut self, value: T) {
+        let mut index: usize = 0;
+        while index < self.len {
+            self.values.set(index, value);
+            index += 1;
+        }
+    }
+
+    pub fn parallel_for_mut(
+        &mut self,
+        pool: &JobPool,
+        callback: fn(&mut [T]) -> (),
+        minimum_chunk: usize,
+    ) -> Result<(), JobError> {
+        parallel_for_mut(
+            pool,
+            self.values.as_mut_slice(),
+            callback,
+            minimum_chunk,
+        )
+    }
+
+    pub fn deinit(self) {
+        self.values.deinit();
+    }
+}
+
+impl<T: Copy, const Rank: usize> TensorView<T, Rank> {
+    pub fn shape(&self) -> [usize; Rank] {
+        self.shape
+    }
+
+    pub fn strides(&self) -> [usize; Rank] {
+        self.strides
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn get(&self, indices: [usize; Rank]) -> Option<&T> {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => Some(&self.data[offset]),
+            None => None,
+        }
+    }
+
+    pub fn index(&self, indices: [usize; Rank]) -> T {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => self.data[offset],
+            None => panic("tensor view index is out of bounds"),
+        }
+    }
+}
+
+impl<T: Copy, const Rank: usize> TensorViewMut<T, Rank> {
+    pub fn shape(&self) -> [usize; Rank] {
+        self.shape
+    }
+
+    pub fn strides(&self) -> [usize; Rank] {
+        self.strides
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn get(&self, indices: [usize; Rank]) -> Option<&T> {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => Some(&self.data[offset]),
+            None => None,
+        }
+    }
+
+    pub fn get_mut(&mut self, indices: [usize; Rank]) -> Option<&mut T> {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => Some(&mut self.data[offset]),
+            None => None,
+        }
+    }
+
+    pub fn set(&mut self, indices: [usize; Rank], value: T) -> bool {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => {
+                self.data[offset] = value;
+                true
+            },
+            None => false,
+        }
+    }
+
+    pub fn index(&self, indices: [usize; Rank]) -> T {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => self.data[offset],
+            None => panic("mutable tensor view index is out of bounds"),
+        }
+    }
+
+    pub fn set_index(&mut self, indices: [usize; Rank], value: T) {
+        match flat_offset(self.shape, self.strides, indices) {
+            Some(offset) => {
+                self.data[offset] = value;
+            },
+            None => {
+                panic("mutable tensor view index is out of bounds");
+            },
+        }
+    }
+
+    pub fn fill(&mut self, value: T) {
+        let mut index: usize = 0;
+        while index < self.len {
+            self.data[index] = value;
+            index += 1;
+        }
+    }
+}
+
+impl<const Rank: usize> tensor<f32, Rank> {
+    pub fn zeros(
+        allocator: &Allocator,
+        shape: [usize; Rank],
+    ) -> Result<tensor<f32, Rank>, TensorError> {
+        tensor::filled(allocator, shape, 0.0)
+    }
+
+    pub fn multiply_scalar(&mut self, scalar: f32) {
+        let mut index: usize = 0;
+        while index < self.len {
+            match self.values.get(index) {
+                Some(value) => {
+                    self.values.set(index, value * scalar);
+                },
+                None => (),
+            }
+            index += 1;
+        }
+    }
+
+    pub fn add_into(
+        left: &tensor<f32, Rank>,
+        right: &tensor<f32, Rank>,
+        output: &mut tensor<f32, Rank>,
+    ) -> Result<(), TensorError> {
+        if !shapes_equal(left.shape, right.shape)
+            || !shapes_equal(left.shape, output.shape)
+        {
+            return Err(TensorError::ShapeMismatch);
+        }
+        let mut index: usize = 0;
+        while index < left.len {
+            let left_value = match left.values.get(index) {
+                Some(value) => value,
+                None => {
+                    return Err(TensorError::ShapeMismatch);
+                },
+            };
+            let right_value = match right.values.get(index) {
+                Some(value) => value,
+                None => {
+                    return Err(TensorError::ShapeMismatch);
+                },
+            };
+            output.values.set(index, left_value + right_value);
+            index += 1;
+        }
+        Ok(())
+    }
+}
+
+impl<const Rank: usize> tensor<f32, Rank> {
+    pub fn matmul_into(
+        left: &tensor<f32, Rank>,
+        right: &tensor<f32, Rank>,
+        output: &mut tensor<f32, Rank>,
+    ) -> Result<(), TensorError> {
+        if Rank != 2 {
+            return Err(TensorError::ShapeMismatch);
+        }
+        let rows = left.shape[0];
+        let shared = left.shape[1];
+        let columns = right.shape[1];
+        if shared != right.shape[0]
+            || output.shape[0] != rows
+            || output.shape[1] != columns
+        {
+            return Err(TensorError::ShapeMismatch);
+        }
+        let mut row: usize = 0;
+        while row < rows {
+            let mut column: usize = 0;
+            while column < columns {
+                let mut total: f32 = 0.0;
+                let mut inner: usize = 0;
+                while inner < shared {
+                    let left_offset = row * shared + inner;
+                    let right_offset = inner * columns + column;
+                    let left_value = match left.values.get(left_offset) {
+                        Some(value) => value,
+                        None => {
+                            return Err(TensorError::ShapeMismatch);
+                        },
+                    };
+                    let right_value = match right.values.get(right_offset) {
+                        Some(value) => value,
+                        None => {
+                            return Err(TensorError::ShapeMismatch);
+                        },
+                    };
+                    total += left_value * right_value;
+                    inner += 1;
+                }
+                let output_offset = row * columns + column;
+                if !output.values.set(output_offset, total) {
+                    return Err(TensorError::ShapeMismatch);
+                }
+                column += 1;
+            }
+            row += 1;
+        }
+        Ok(())
+    }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "motion-app"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+physics = { path = "../physics", version = "^0.1" }
+
+[profile.debug]
+optimization = 0
+
+[profile.release]
+optimization = 3

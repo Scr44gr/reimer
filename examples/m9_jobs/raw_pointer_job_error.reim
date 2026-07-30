@@ -1,0 +1,23 @@
+from std::alloc import general_allocator;
+from std::job import Job, JobError, JobPool, JobPoolConfig;
+
+fn read(pointer: *const i32) -> i32 {
+    unsafe { *pointer }
+}
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let created: Result<JobPool, JobError> =
+        JobPool::init(&allocator, JobPoolConfig::fixed(2));
+    let pool = match created {
+        Ok(value) => value,
+        Err(_) => {
+            return 1;
+        },
+    };
+    let value = 42;
+    let pointer = &value as *const i32;
+    let submitted: Result<Job<i32>, JobError> =
+        pool.submit(read, pointer);
+    0
+}
