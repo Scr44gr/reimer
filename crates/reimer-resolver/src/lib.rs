@@ -12,7 +12,7 @@ use reimer_ast::{
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_hir::{
     self as hir, AssignmentOperator, BinaryOperator, Expression, ExpressionKind, FunctionId,
-    LocalId, Place, PlaceKind, UnaryOperator,
+    IntegerAdditionMode, LocalId, Place, PlaceKind, UnaryOperator,
 };
 use reimer_layout::Layouts;
 use reimer_types::{Type, TypeId};
@@ -5536,6 +5536,11 @@ impl<'context> FunctionAnalyzer<'context> {
         let ast::FieldName::Named(method) = &field.field else {
             return invalid_composite_expression(call.span);
         };
+        if let Some(expression) =
+            self.analyze_integer_addition_method(call, field, method, expected_return)
+        {
+            return expression;
+        }
         let Some(receiver_type) = self.place_expression_type(&field.base) else {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -5608,6 +5613,93 @@ impl<'context> FunctionAnalyzer<'context> {
             return invalid_composite_expression(call.span);
         };
         self.analyze_resolved_method_call(call, field, receiver_type, &resolved_name, &signature)
+    }
+
+    fn analyze_integer_addition_method(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        let mode = match method.name.as_str() {
+            "wrapping_add" => IntegerAdditionMode::Wrapping,
+            "checked_add" => IntegerAdditionMode::Checked,
+            "saturating_add" => IntegerAdditionMode::Saturating,
+            _ => return None,
+        };
+        if !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    format!("integer method `{}` is not generic", method.name),
+                    call.span,
+                )
+                .with_help("remove the arguments between `<` and `>`"),
+            );
+        }
+        if call.arguments.len() != 1 {
+            self.diagnostics.push(Diagnostic::error(
+                "E3105",
+                format!(
+                    "integer method `{}` expects 1 argument(s), but {} were provided",
+                    method.name,
+                    call.arguments.len()
+                ),
+                call.span,
+            ));
+        }
+
+        let expected_receiver = match mode {
+            IntegerAdditionMode::Checked => expected_return.and_then(|expected| {
+                let IntrinsicType::Option { value } = self.types.intrinsic(expected)? else {
+                    return None;
+                };
+                value.is_integer().then_some(value)
+            }),
+            IntegerAdditionMode::Wrapping | IntegerAdditionMode::Saturating => {
+                expected_return.filter(|expected| expected.is_integer())
+            }
+        };
+        let left = self.analyze_expression_expected(&field.base, expected_receiver);
+        let right = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(left.ty)),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        if !left.ty.is_integer() {
+            self.diagnostics.push(Diagnostic::error(
+                "E6002",
+                format!(
+                    "method `{}` does not exist on non-integer type `{}`",
+                    method.name, left.ty
+                ),
+                method.span,
+            ));
+            return Some(invalid_composite_expression(call.span));
+        }
+        self.require_type(left.ty, right.ty, right.span, "integer method argument");
+        let result_type = match mode {
+            IntegerAdditionMode::Checked => self
+                .types
+                .intern_option(left.ty, call.span, self.diagnostics)
+                .unwrap_or(Type::Unit),
+            IntegerAdditionMode::Wrapping | IntegerAdditionMode::Saturating => left.ty,
+        };
+        if let Some(expected) = expected_return {
+            self.require_type(expected, result_type, call.span, "integer method result");
+        }
+        Some(Expression {
+            kind: ExpressionKind::IntegerAddition {
+                mode,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            ty: result_type,
+            span: call.span,
+        })
     }
 
     fn analyze_resolved_method_call(
@@ -10284,6 +10376,8 @@ fn view_source_root_path(expression: &AstExpression) -> Option<&ast::Path> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use reimer_lexer::lex;
     use reimer_parser::parse;
     use reimer_types::Type;
@@ -10420,6 +10514,50 @@ mod tests {
 
         assert_eq!(program.functions[0].parameters[0].ty, Type::U8);
         assert_eq!(program.functions[0].return_type, Type::U64);
+    }
+
+    #[test]
+    fn resolve_should_type_integer_addition_modes_for_every_integer_type() {
+        let mut source = String::new();
+        for ty in [
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+        ] {
+            write!(
+                source,
+                "fn exercise_{ty}(value: {ty}) {{
+                    value.wrapping_add(1);
+                    value.checked_add(1);
+                    value.saturating_add(1);
+                }}"
+            )
+            .expect("writing a String should not fail");
+        }
+        source.push_str("fn main() -> i32 { 0 }");
+
+        let program = resolve_fixture(&source).expect("integer methods should resolve");
+
+        assert_eq!(program.functions.len(), 13);
+    }
+
+    #[test]
+    fn resolve_should_reject_integer_addition_methods_on_other_types() {
+        let diagnostics = resolve_fixture("fn main() -> i32 { true.checked_add(1); 0 }")
+            .expect_err("boolean receiver should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6002" && diagnostic.message.contains("non-integer")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_reject_wrong_integer_addition_method_arity() {
+        let diagnostics =
+            resolve_fixture("fn main() -> i32 { let value: u8 = 1; value.wrapping_add(); 0 }")
+                .expect_err("missing argument should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E3105" && diagnostic.message.contains("wrapping_add")
+        }));
     }
 
     #[test]

@@ -15,7 +15,7 @@
 6. `reimer-project` validates `reimer.toml`, resolves path/Git dependencies,
    synchronizes `reimer.lock`, and builds a portable graph.
 7. `reimer-cli` exposes the complete
-   `new/init/check/build/run/test/fmt/clean/add/remove` cycle and retains
+   `new/init/check/build/run/test/doc/fmt/clean/add/remove` cycle and retains
    `emit-object` for standalone files.
 8. `reimer-diagnostics` renders errors with a code, location, source excerpt,
    and optional help.
@@ -44,6 +44,25 @@
   be added with the startup runtime for each platform.
 - The runtime encapsulates FFI, allocator, and I/O boundaries; programs use
   safe standard-library wrappers.
+
+## Integer overflow
+
+Ordinary integer `+`, `-`, and `*` operations are checked in every profile and
+call the runtime panic boundary on overflow. Programs can select a different
+addition policy explicitly:
+
+```reimer
+let value: u8 = 255;
+let wrapped: u8 = value.wrapping_add(1);
+let checked: Option<u8> = value.checked_add(1);
+let saturated: u8 = value.saturating_add(1);
+```
+
+The resolver accepts these methods on every signed and unsigned integer type.
+Cranelift lowering evaluates each operand once and uses native overflow flags:
+`wrapping_add` keeps the low bits, `checked_add` constructs `Some(sum)` or
+`None`, and `saturating_add` selects the correct minimum or maximum for the
+integer width. No operation relies on host-language overflow behavior.
 
 Frozen syntax and semantic decisions are recorded in
 [`language-decisions-v0.1.md`](language-decisions-v0.1.md).

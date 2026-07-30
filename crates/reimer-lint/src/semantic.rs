@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use reimer_ast::{self as ast, Expression as AstExpression, Item, TypeNameKind};
 use reimer_diagnostics::Span;
-use reimer_hir::{self as hir, ExpressionKind, FunctionId, LocalId, PlaceKind, TypeDefinitionKind};
+use reimer_hir::{
+    self as hir, ExpressionKind, FunctionId, IntegerAdditionMode, LocalId, PlaceKind,
+    TypeDefinitionKind,
+};
 use reimer_types::{Type, TypeId};
 
 use crate::walk::{self, Visitor};
@@ -681,6 +684,9 @@ impl HirIndexer<'_> {
                 self.expression(left);
                 self.expression(right);
             }
+            ExpressionKind::IntegerAddition { mode, left, right } => {
+                self.integer_addition(*mode, left, right, expression.span);
+            }
             ExpressionKind::If(_)
             | ExpressionKind::Match(_)
             | ExpressionKind::Loop(_)
@@ -874,6 +880,47 @@ impl HirIndexer<'_> {
         });
     }
 
+    fn integer_addition(
+        &mut self,
+        mode: IntegerAdditionMode,
+        left: &hir::Expression,
+        right: &hir::Expression,
+        span: Span,
+    ) {
+        if let Some(use_span) = self.syntax_index.call_callees.get(&span_key(span)).copied() {
+            let integer = type_label(left.ty, self.typed);
+            let (name, result, documentation) = match mode {
+                IntegerAdditionMode::Wrapping => (
+                    "wrapping_add",
+                    integer.clone(),
+                    format!("Adds two `{integer}` values modulo 2^N. This operation never panics."),
+                ),
+                IntegerAdditionMode::Checked => (
+                    "checked_add",
+                    format!("Option<{integer}>"),
+                    format!(
+                        "Returns `Some(sum)` when two `{integer}` values can be added without overflow; otherwise returns `None`."
+                    ),
+                ),
+                IntegerAdditionMode::Saturating => (
+                    "saturating_add",
+                    integer.clone(),
+                    format!(
+                        "Adds two `{integer}` values and clamps overflow to the nearest `{integer}` bound."
+                    ),
+                ),
+            };
+            self.type_hints.push(TypeHint {
+                span: use_span,
+                label: format!("fn {name}(self: {integer}, right: {integer}) -> {result}"),
+                documentation,
+                kind: TypeHintKind::Callable,
+            });
+        }
+        self.expression(left);
+        self.expression(right);
+    }
+
     fn direct_call(&mut self, function: FunctionId, arguments: &[hir::Expression], span: Span) {
         if let Some(use_span) = self.syntax_index.call_callees.get(&span_key(span)).copied() {
             self.add_callable_hint(function, use_span);
@@ -955,12 +1002,17 @@ fn type_label_at_depth(ty: Type, program: &hir::Program, depth: usize) -> String
         return ty.to_string();
     };
     match &definition.kind {
-        TypeDefinitionKind::Struct { .. } | TypeDefinitionKind::Enum { .. } => {
-            definition.name.as_ref().map_or_else(
-                || ty.to_string(),
-                |name| reimer_package::display_symbol_name(name),
-            )
-        }
+        TypeDefinitionKind::Struct { .. } => definition.name.as_ref().map_or_else(
+            || ty.to_string(),
+            |name| reimer_package::display_symbol_name(name),
+        ),
+        TypeDefinitionKind::Enum { variants } => definition.name.as_ref().map_or_else(
+            || ty.to_string(),
+            |name| {
+                intrinsic_enum_label(name, variants, program, depth)
+                    .unwrap_or_else(|| reimer_package::display_symbol_name(name))
+            },
+        ),
         TypeDefinitionKind::Tuple { elements } => format!(
             "({})",
             elements
@@ -1006,6 +1058,50 @@ fn type_label_at_depth(ty: Type, program: &hir::Program, depth: usize) -> String
                 .join(", "),
             type_label_at_depth(*return_type, program, depth + 1)
         ),
+    }
+}
+
+fn intrinsic_enum_label(
+    name: &str,
+    variants: &[hir::EnumVariant],
+    program: &hir::Program,
+    depth: usize,
+) -> Option<String> {
+    match (name, variants) {
+        (
+            "Option",
+            [
+                hir::EnumVariant {
+                    fields: hir::EnumVariantFields::Tuple(value),
+                    ..
+                },
+                hir::EnumVariant {
+                    fields: hir::EnumVariantFields::Unit,
+                    ..
+                },
+            ],
+        ) if value.len() == 1 => Some(format!(
+            "Option<{}>",
+            type_label_at_depth(value[0], program, depth + 1)
+        )),
+        (
+            "Result",
+            [
+                hir::EnumVariant {
+                    fields: hir::EnumVariantFields::Tuple(success),
+                    ..
+                },
+                hir::EnumVariant {
+                    fields: hir::EnumVariantFields::Tuple(error),
+                    ..
+                },
+            ],
+        ) if success.len() == 1 && error.len() == 1 => Some(format!(
+            "Result<{}, {}>",
+            type_label_at_depth(success[0], program, depth + 1),
+            type_label_at_depth(error[0], program, depth + 1)
+        )),
+        _ => None,
     }
 }
 

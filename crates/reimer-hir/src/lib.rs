@@ -348,6 +348,17 @@ pub enum SynchronizationKind {
     ThreadLocal,
 }
 
+/// Overflow behavior selected by an explicit integer addition method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerAdditionMode {
+    /// Discards the carry and returns the low bits.
+    Wrapping,
+    /// Returns `None` when the mathematical result is out of range.
+    Checked,
+    /// Clamps an out-of-range result to the nearest integer bound.
+    Saturating,
+}
+
 /// A resolved expression form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpressionKind {
@@ -396,6 +407,15 @@ pub enum ExpressionKind {
         /// Left operand.
         left: Box<Expression>,
         /// Right operand.
+        right: Box<Expression>,
+    },
+    /// Integer addition with source-selected overflow behavior.
+    IntegerAddition {
+        /// Whether the result wraps, becomes optional, or saturates.
+        mode: IntegerAdditionMode,
+        /// Left integer operand.
+        left: Box<Expression>,
+        /// Right integer operand.
         right: Box<Expression>,
     },
     /// Direct call to a resolved function.

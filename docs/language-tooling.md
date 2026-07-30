@@ -33,6 +33,11 @@ Typo detection compares symbols, bindings, fields, imports, primitive types,
 and core names visible in the document. A replacement is offered only for a
 small edit distance; final validation still belongs to the resolver.
 
+Built-in integer methods are completed and carry semantic hover information.
+For example, hovering `checked_add` shows its exact integer signature, explains
+the overflow behavior, and the result binding is displayed as
+`Option<integer>` rather than an internal enum name.
+
 Language-specific lints include:
 
 - `L1001`: noncanonical imports;

@@ -374,6 +374,19 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_should_complete_explicit_integer_overflow_modes() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_integer_overflow.reim");
+
+        let result = execute_file(&path).expect("integer overflow program should execute");
+        let object =
+            compile_file_to_object(&path).expect("integer overflow program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
     fn execute_file_should_complete_safe_standard_output_vertical_slice() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_io.reim");
 

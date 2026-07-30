@@ -46,6 +46,7 @@ cargo run -p reimer-cli -- run examples/m3_io.reim
 cargo run -p reimer-cli -- run examples/m3_string.reim
 cargo run -p reimer-cli -- run examples/m3_vec.reim
 cargo run -p reimer-cli -- run examples/m3_collections.reim
+cargo run -p reimer-cli -- run examples/m3_integer_overflow.reim
 cargo run -p reimer-cli -- run examples/m5_ffi.reim
 cargo run -p reimer-cli -- run examples/m6_generics.reim
 cargo run -p reimer-cli -- run examples/m7_tensor.reim

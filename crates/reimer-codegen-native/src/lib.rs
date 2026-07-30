@@ -20,8 +20,8 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_hir::{
     AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, Function, FunctionId,
-    LocalId, MatchExpression, Pattern, PatternKind, Place, PlaceKind, Program, Statement,
-    SynchronizationKind, TypeDefinitionKind, UnaryOperator,
+    IntegerAdditionMode, LocalId, MatchExpression, Pattern, PatternKind, Place, PlaceKind, Program,
+    Statement, SynchronizationKind, TypeDefinitionKind, UnaryOperator,
 };
 use reimer_layout::{AggregateLayoutKind, Layouts};
 use reimer_runtime::Failure;
@@ -1919,6 +1919,9 @@ fn emit_expression<M: Module>(
             left,
             right,
         } => emit_binary(builder, module, functions, state, *operator, left, right),
+        ExpressionKind::IntegerAddition { .. } => {
+            emit_integer_addition(builder, module, functions, state, expression)
+        }
         ExpressionKind::Call { .. }
         | ExpressionKind::Function(_)
         | ExpressionKind::IndirectCall { .. } => {
@@ -4728,6 +4731,77 @@ fn emit_binary<M: Module>(
         }
     };
     Ok(Emitted::value(value))
+}
+
+fn emit_integer_addition<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    expression: &Expression,
+) -> Result<Emitted, String> {
+    let ExpressionKind::IntegerAddition { mode, left, right } = &expression.kind else {
+        return Err("integer addition lowering received an incompatible expression".to_owned());
+    };
+    let emitted_left = emit_expression(builder, module, functions, state, left)?;
+    if emitted_left.terminated {
+        return Ok(emitted_left);
+    }
+    let emitted_right = emit_expression(builder, module, functions, state, right)?;
+    if emitted_right.terminated {
+        return Ok(emitted_right);
+    }
+    let left_value = require_value(emitted_left, "left integer addition operand")?;
+    let right_value = require_value(emitted_right, "right integer addition operand")?;
+    let value = match mode {
+        IntegerAdditionMode::Wrapping => builder.ins().iadd(left_value, right_value),
+        IntegerAdditionMode::Checked => {
+            let (sum, overflow) = emit_overflowing_add(builder, left.ty, left_value, right_value);
+            let some = build_enum_from_values(builder, state, expression.ty, 0, &[(left.ty, sum)])?;
+            let none = build_enum_from_values(builder, state, expression.ty, 1, &[])?;
+            builder.ins().select(overflow, none, some)
+        }
+        IntegerAdditionMode::Saturating => {
+            emit_saturating_add(builder, left.ty, left_value, right_value)?
+        }
+    };
+    Ok(Emitted::value(value))
+}
+
+fn emit_overflowing_add(
+    builder: &mut FunctionBuilder<'_>,
+    ty: Type,
+    left: Value,
+    right: Value,
+) -> (Value, Value) {
+    if ty.is_signed_integer() {
+        builder.ins().sadd_overflow(left, right)
+    } else {
+        builder.ins().uadd_overflow(left, right)
+    }
+}
+
+fn emit_saturating_add(
+    builder: &mut FunctionBuilder<'_>,
+    ty: Type,
+    left: Value,
+    right: Value,
+) -> Result<Value, String> {
+    let (sum, overflow) = emit_overflowing_add(builder, ty, left, right);
+    let bits = ty
+        .integer_bits()
+        .ok_or_else(|| format!("`{ty}` has no integer width"))?;
+    if !ty.is_signed_integer() {
+        let maximum = emit_integer_constant(builder, ty, integer_bit_mask(bits))?;
+        return Ok(builder.ins().select(overflow, maximum, sum));
+    }
+
+    let sign_bit = 1_u128 << (bits - 1);
+    let minimum = emit_integer_constant(builder, ty, sign_bit)?;
+    let maximum = emit_integer_constant(builder, ty, sign_bit - 1)?;
+    let left_is_negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, left, 0);
+    let bound = builder.ins().select(left_is_negative, minimum, maximum);
+    Ok(builder.ins().select(overflow, bound, sum))
 }
 
 fn emit_value_equality<M: Module>(

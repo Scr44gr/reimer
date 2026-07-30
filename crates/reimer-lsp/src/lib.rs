@@ -839,6 +839,21 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("from", CompletionItemKind::METHOD, "String::from"),
     ("as_str", CompletionItemKind::METHOD, "String::as_str"),
     ("clone_in", CompletionItemKind::METHOD, "String::clone_in"),
+    (
+        "wrapping_add",
+        CompletionItemKind::METHOD,
+        "integer overflow",
+    ),
+    (
+        "checked_add",
+        CompletionItemKind::METHOD,
+        "integer overflow",
+    ),
+    (
+        "saturating_add",
+        CompletionItemKind::METHOD,
+        "integer overflow",
+    ),
     ("Thread", CompletionItemKind::STRUCT, "std::thread"),
     ("scope", CompletionItemKind::FUNCTION, "std::thread"),
     ("Mutex", CompletionItemKind::STRUCT, "std::thread"),
@@ -1080,6 +1095,9 @@ mod tests {
             "AtomicBool",
             "JobPool",
             "parallel_for_mut",
+            "wrapping_add",
+            "checked_add",
+            "saturating_add",
             "comptime",
             "size_of",
             "fields",
@@ -1128,6 +1146,59 @@ mod tests {
                 .contains("`-2,147,483,648` to `2,147,483,647`")
         );
         assert!(!contents.value.to_lowercase().contains("inferred"));
+    }
+
+    #[test]
+    fn document_should_describe_explicit_integer_overflow_methods() {
+        let source = "fn calculate() -> u8 {
+                          let maximum: u8 = 255;
+                          let checked = maximum.checked_add(1);
+                          let saturated = maximum.saturating_add(1);
+                          match checked {
+                              Some(value) => value,
+                              None => saturated,
+                          }
+                      }
+                      fn main() -> i32 { calculate() as i32 }"
+            .to_owned();
+        let method_offset = source
+            .find("saturating_add")
+            .expect("method call should exist");
+        let position = LineIndex::new(Arc::from(source.as_str())).position(method_offset);
+        let checked_offset = source
+            .rfind("checked {")
+            .expect("checked local use should exist");
+        let checked_position = LineIndex::new(Arc::from(source.as_str())).position(checked_offset);
+        let document = Document::new(
+            Url::parse("untitled:overflow.reim").expect("URL should parse"),
+            source,
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("integer method should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents
+                .value
+                .contains("fn saturating_add(self: u8, right: u8) -> u8")
+        );
+        assert!(contents.value.contains("clamps overflow"));
+        assert!(contents.value.contains("`u8` bound"));
+
+        let checked_hover = document
+            .hover(checked_position)
+            .expect("checked result should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(checked_contents) = checked_hover.contents
+        else {
+            panic!("hover should use markdown");
+        };
+        assert!(checked_contents.value.contains("Option<u8>"));
+        assert!(checked_contents.value.contains("`Some`"));
+        assert!(checked_contents.value.contains("`None`"));
     }
 
     #[test]

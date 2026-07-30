@@ -1,0 +1,45 @@
+fn main() -> i32 {
+    let unsigned_maximum: u8 = 255;
+    let wrapped = unsigned_maximum.wrapping_add(1);
+    let saturated = unsigned_maximum.saturating_add(1);
+    let overflow = unsigned_maximum.checked_add(1);
+
+    let signed_maximum: i8 = 127;
+    let signed_wrapped = signed_maximum.wrapping_add(1);
+    let signed_saturated = signed_maximum.saturating_add(1);
+    let signed_minimum: i8 = -128;
+    let signed_underflow = signed_minimum.saturating_add(-1);
+
+    let wide_maximum: u128 = 340282366920938463463374607431768211455;
+    let wide_wrapped = wide_maximum.wrapping_add(1);
+    let wide_saturated = wide_maximum.saturating_add(1);
+    let wide_overflowed = match wide_maximum.checked_add(1) {
+        Some(_) => false,
+        None => true,
+    };
+
+    let base: u8 = 40;
+    let recovered = match base.checked_add(2) {
+        Some(value) => value as i32,
+        None => 0,
+    };
+    let overflowed = match overflow {
+        Some(_) => false,
+        None => true,
+    };
+
+    if wrapped == 0
+        && saturated == 255
+        && signed_wrapped == -128
+        && signed_saturated == 127
+        && signed_underflow == -128
+        && wide_wrapped == 0
+        && wide_saturated == wide_maximum
+        && wide_overflowed
+        && overflowed
+    {
+        recovered
+    } else {
+        0
+    }
+}

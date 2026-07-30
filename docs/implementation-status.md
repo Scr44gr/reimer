@@ -40,7 +40,7 @@ reported as implemented:
 | LDD area | Implemented | Remaining |
 |---|---|---|
 | Constants and stable storage | Typed compile-time `const` values | Stable-address `static` values and `unsafe` access to `static mut` |
-| Integer overflow APIs | Checked operators panic in every profile; constant overflow is rejected | `wrapping_add`, `checked_add`, and `saturating_add` source methods |
+| Integer overflow APIs | Checked operators panic in every profile; constant overflow is rejected; every integer type provides `wrapping_add`, `checked_add`, and `saturating_add` | - |
 | Slices and UTF-8 views | Checked `[]`, slice iteration, and validated `str` representation | Recoverable slice `get`/`get_mut` and `str.bytes()`/`str.chars()` |
 | Standard library plan | `alloc`, `collections`, `io`, `string`, `thread`, `job`, and `tensor` | Planned `fs`, `c`, and `math` modules plus broader formatting/Unicode APIs |
 | Tooling | Formatter, checker, tests, generated `///` Markdown, hover, completion, definitions, CodeLens, and diagnostics | Rename and dependency-aware incremental analysis |
