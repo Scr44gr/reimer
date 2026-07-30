@@ -23,6 +23,11 @@ const grammarPath = path.join(
   "syntaxes",
   "reimer.tmLanguage.json",
 );
+const languageConfigurationPath = path.join(
+  extensionDirectory,
+  "language-configuration.json",
+);
+const manifestPath = path.join(extensionDirectory, "package.json");
 const wasm = await readFile(wasmPath);
 await loadWASM(wasm.buffer);
 
@@ -103,6 +108,21 @@ for (const tokenText of ["*", "->"]) {
     "keyword.operator.reimer",
   );
 }
+
+const languageConfiguration = JSON.parse(
+  await readFile(languageConfigurationPath, "utf8"),
+);
+assert.deepEqual(languageConfiguration.brackets, [
+  ["{", "}"],
+  ["[", "]"],
+  ["(", ")"],
+]);
+
+const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+const editorDefaults = manifest.contributes.configurationDefaults["[reimer]"];
+assert.equal(editorDefaults["editor.matchBrackets"], "always");
+assert.equal(editorDefaults["editor.inlayHints.enabled"], "on");
+assert.equal(editorDefaults["editor.guides.bracketPairs"], "active");
 
 function assertScope(grammar, line, tokenText, expectedScope) {
   const scopes = scopesFor(grammar, line, tokenText);

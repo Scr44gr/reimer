@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import {
   commands,
   ExtensionContext,
+  LogOutputChannel,
   window,
   workspace,
 } from "vscode";
@@ -14,8 +15,11 @@ import {
 } from "vscode-languageclient/node";
 
 let client: LanguageClient | undefined;
+let output: LogOutputChannel | undefined;
 
 export async function activate(context: ExtensionContext): Promise<void> {
+  output = window.createOutputChannel("Reimer Language Server", { log: true });
+  context.subscriptions.push(output);
   context.subscriptions.push(
     commands.registerCommand("reimer.organizeImports", async () => {
       await commands.executeCommand("editor.action.organizeImports");
@@ -32,21 +36,50 @@ export async function activate(context: ExtensionContext): Promise<void> {
     ),
     commands.registerCommand("reimer.restartServer", async () => {
       await stopClient();
-      client = createClient(context);
-      await client.start();
+      await startClient(context);
       window.setStatusBarMessage("Reimer language server restarted", 2500);
     }),
   );
 
-  client = createClient(context);
-  await client.start();
+  await startClient(context);
 }
 
 export async function deactivate(): Promise<void> {
   await stopClient();
 }
 
-function createClient(context: ExtensionContext): LanguageClient {
+async function startClient(context: ExtensionContext): Promise<void> {
+  const channel = output;
+  if (!channel) {
+    throw new Error("Reimer output channel was not initialized");
+  }
+  const nextClient = createClient(context, channel);
+  client = nextClient;
+  channel.appendLine("Starting Reimer Language Server...");
+  try {
+    await nextClient.start();
+    channel.appendLine("Reimer Language Server is ready.");
+  } catch (error) {
+    if (client === nextClient) {
+      client = undefined;
+    }
+    const details = error instanceof Error ? error.stack ?? error.message : String(error);
+    channel.appendLine(`Failed to start Reimer Language Server:\n${details}`);
+    const action = await window.showErrorMessage(
+      "Reimer Language Server could not start. See the output channel for details.",
+      "Show Output",
+    );
+    if (action === "Show Output") {
+      channel.show(true);
+    }
+    throw error;
+  }
+}
+
+function createClient(
+  context: ExtensionContext,
+  channel: LogOutputChannel,
+): LanguageClient {
   const configuration = workspace.getConfiguration("reimer");
   const configuredPath = configuration.get<string>(
     "server.path",
@@ -82,7 +115,7 @@ function createClient(context: ExtensionContext): LanguageClient {
       ],
       configurationSection: "reimer",
     },
-    outputChannelName: "Reimer Language Server",
+    outputChannel: channel,
   };
   return new LanguageClient(
     "reimerLanguageServer",

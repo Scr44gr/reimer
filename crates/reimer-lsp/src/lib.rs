@@ -2,7 +2,6 @@
 //! server binary.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::sync::Arc;
 
 use reimer_ast::Item;
@@ -45,7 +44,7 @@ impl Document {
             lines,
             analysis,
         };
-        document.refresh_saved_package();
+        document.refresh_package();
         document
     }
 
@@ -356,19 +355,19 @@ impl Document {
         lenses
     }
 
-    fn refresh_saved_package(&mut self) {
+    fn refresh_package(&mut self) {
         let Ok(path) = self.uri.to_file_path() else {
             return;
         };
-        let Ok(saved) = fs::read_to_string(&path) else {
-            return;
-        };
-        if saved != self.text.as_ref() {
-            return;
-        }
         let package = match Project::open(&path, LockMode::Use) {
-            Ok(project) => reimer_package::load_graph(&project.source_graph(&path)),
-            Err(ProjectError::ManifestNotFound { .. }) => reimer_package::load(&path),
+            Ok(project) => reimer_package::load_graph_with_overlay(
+                &project.source_graph(&path),
+                &path,
+                &self.text,
+            ),
+            Err(ProjectError::ManifestNotFound { .. }) => {
+                reimer_package::load_with_overlay(&path, &self.text)
+            }
             Err(error) => {
                 self.analysis
                     .findings
@@ -1042,6 +1041,45 @@ mod tests {
     }
 
     #[test]
+    fn document_should_hover_an_inferred_local_type() {
+        let source = "fn main() -> i32 { let answer = 42; answer }".to_owned();
+        let document = Document::new(
+            Url::parse("untitled:main.reim").expect("URL should parse"),
+            source,
+        );
+
+        let hover = document
+            .hover(Position::new(0, 42))
+            .expect("local use should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(contents.value.contains("i32"));
+    }
+
+    #[test]
+    fn document_should_show_an_inlay_hint_for_an_inferred_binding() {
+        let source = "fn main() -> i32 { let answer = 42; answer }".to_owned();
+        let document = Document::new(
+            Url::parse("untitled:main.reim").expect("URL should parse"),
+            source,
+        );
+
+        let hints = document.inlay_hints(tower_lsp::lsp_types::Range::new(
+            Position::new(0, 0),
+            Position::new(0, 48),
+        ));
+
+        assert!(hints.iter().any(|hint| {
+            matches!(
+                &hint.label,
+                tower_lsp::lsp_types::InlayHintLabel::String(label) if label == ": i32"
+            )
+        }));
+    }
+
+    #[test]
     fn document_should_resolve_imports_from_a_manifest_dependency() {
         let fixture = Fixture::new();
         fixture.write(
@@ -1060,6 +1098,35 @@ mod tests {
 
         let document = Document::new(uri, source.to_owned());
 
+        assert!(
+            document
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR))
+        );
+    }
+
+    #[test]
+    fn document_should_infer_types_in_an_unsaved_file_with_imports() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+        );
+        let saved = "from std::io import print;\nfn main() -> i32 { 0 }\n";
+        let main = fixture.write("app/src/main.reim", saved);
+        let overlay = "from std::io import print;\nfn main() -> i32 { let answer = 42; answer }\n";
+        let uri = Url::from_file_path(main).expect("file URL should be created");
+
+        let document = Document::new(uri, overlay.to_owned());
+        let hover = document
+            .hover(Position::new(1, 42))
+            .expect("unsaved local use should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(contents.value.contains("i32"));
         assert!(
             document
                 .diagnostics()

@@ -170,6 +170,21 @@ pub fn load(entry: &Path) -> Result<Package, Vec<FileDiagnostic>> {
     Loader::single(entry).load()
 }
 
+/// Loads an entry file while replacing that file with an in-memory source
+/// snapshot.
+///
+/// Imported modules are still loaded from disk. This is intended for editor
+/// integrations that need package-aware analysis before the active document is
+/// saved.
+///
+/// # Errors
+///
+/// Returns the same file-aware diagnostics as [`load`], including diagnostics
+/// produced from the in-memory source.
+pub fn load_with_overlay(entry: &Path, source: &str) -> Result<Package, Vec<FileDiagnostic>> {
+    Loader::single(entry).with_overlay(entry, source).load()
+}
+
 /// Loads a resolved package graph and enforces dependency visibility per edge.
 ///
 /// # Errors
@@ -180,9 +195,25 @@ pub fn load_graph(graph: &SourceGraph) -> Result<Package, Vec<FileDiagnostic>> {
     Loader::from_graph(graph)?.load()
 }
 
+/// Loads a resolved package graph while replacing one file with an in-memory
+/// source snapshot.
+///
+/// # Errors
+///
+/// Returns the same file-aware diagnostics as [`load_graph`], including
+/// diagnostics produced from the in-memory source.
+pub fn load_graph_with_overlay(
+    graph: &SourceGraph,
+    path: &Path,
+    source: &str,
+) -> Result<Package, Vec<FileDiagnostic>> {
+    Loader::from_graph(graph)?.with_overlay(path, source).load()
+}
+
 struct Loader {
     root_package: String,
     packages: HashMap<String, SourcePackage>,
+    overlays: HashMap<PathBuf, String>,
     modules: Vec<Module>,
     module_indices: HashMap<ModuleName, usize>,
     sources: Vec<SourceFile>,
@@ -207,6 +238,7 @@ impl Loader {
         Self {
             root_package: root_package.clone(),
             packages: HashMap::from([(root_package, package)]),
+            overlays: HashMap::new(),
             modules: Vec::new(),
             module_indices: HashMap::new(),
             sources: Vec::new(),
@@ -260,6 +292,7 @@ impl Loader {
         Ok(Self {
             root_package: graph.root.clone(),
             packages,
+            overlays: HashMap::new(),
             modules: Vec::new(),
             module_indices: HashMap::new(),
             sources: Vec::new(),
@@ -273,6 +306,11 @@ impl Loader {
         if let Some(root) = self.packages.get_mut(&self.root_package) {
             root.entry = entry;
         }
+        self
+    }
+
+    fn with_overlay(mut self, path: &Path, source: &str) -> Self {
+        self.overlays.insert(path.to_path_buf(), source.to_owned());
         self
     }
 
@@ -334,7 +372,12 @@ impl Loader {
         if self.module_indices.contains_key(name) {
             return;
         }
-        let text = match fs::read_to_string(&path) {
+        let text = match self
+            .overlays
+            .get(&path)
+            .cloned()
+            .map_or_else(|| fs::read_to_string(&path), Ok)
+        {
             Ok(text) => text,
             Err(error) => {
                 let diagnostic = Diagnostic::error(
@@ -2074,7 +2117,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{SourceDependency, SourceGraph, SourcePackage, load, load_graph};
+    use super::{
+        SourceDependency, SourceGraph, SourcePackage, load, load_graph, load_with_overlay,
+    };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -2108,6 +2153,18 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn load_with_overlay_should_analyze_the_in_memory_entry() {
+        let fixture = Fixture::new();
+        fixture.write("main.reim", "fn main() -> i32 { 1 }");
+        let path = fixture.path("main.reim");
+        let overlay = "fn main() -> i32 { 42 }";
+
+        let package = load_with_overlay(&path, overlay).expect("in-memory source should load");
+
+        assert_eq!(package.sources[0].text, overlay);
     }
 
     #[test]

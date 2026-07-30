@@ -23,9 +23,11 @@
   ],
   "main": "./out/extension.js",
   "scripts": {
-    "compile": "tsc -p ./",
+    "bundle": "node scripts/build-extension.mjs",
+    "compile": "npm run check && npm run bundle",
     "check": "tsc -p ./ --noEmit",
-    "test": "npm run check && npm run test:grammar",
+    "test": "npm run check && npm run bundle && npm run test:bundle && npm run test:grammar",
+    "test:bundle": "node scripts/test-bundle.mjs",
     "test:grammar": "node scripts/test-grammar.mjs",
     "package": "cargo build --release --manifest-path ../../Cargo.toml -p reimer-lsp && node scripts/prepare-server.mjs && npm run compile && vsce package --target win32-x64 --no-dependencies --allow-missing-repository",
     "vscode:prepublish": "npm run compile"
@@ -37,6 +39,7 @@
     "@types/node": "^22.10.1",
     "@types/vscode": "^1.95.0",
     "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.25.0",
     "typescript": "^5.7.2",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.2.1"
@@ -90,6 +93,15 @@
           "group": "1_modification"
         }
       ]
+    },
+    "configurationDefaults": {
+      "[reimer]": {
+        "editor.bracketPairColorization.enabled": true,
+        "editor.guides.bracketPairs": "active",
+        "editor.guides.bracketPairsHorizontal": "active",
+        "editor.inlayHints.enabled": "on",
+        "editor.matchBrackets": "always"
+      }
     },
     "configuration": {
       "title": "Reimer",
