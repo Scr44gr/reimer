@@ -120,6 +120,12 @@ assertScope(
 );
 assertScope(
   grammar,
+  "let length = square_root(vector.length_squared());",
+  "square_root",
+  "support.function.builtin.reimer",
+);
+assertScope(
+  grammar,
   "static mut COUNTER: i32 = 0;",
   "COUNTER",
   "variable.other.constant.reimer",

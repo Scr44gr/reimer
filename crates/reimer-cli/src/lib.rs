@@ -409,6 +409,17 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_should_complete_scalar_and_vector_math_vertical_slice() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_math.reim");
+
+        let result = execute_file(&path).expect("math program should execute");
+        let object = compile_file_to_object(&path).expect("math program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
     fn execute_file_should_complete_explicit_integer_overflow_modes() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_integer_overflow.reim");

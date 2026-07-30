@@ -24,6 +24,11 @@ mod filesystem;
     reason = "the job ABI exposes stable symbols and invokes compiler-generated callback thunks"
 )]
 mod job;
+#[expect(
+    unsafe_code,
+    reason = "scalar math helpers expose stable symbols to generated native code"
+)]
+mod mathematics;
 
 pub use concurrency::{
     ATOMIC_CLONE_SYMBOL, ATOMIC_COMPARE_EXCHANGE_SYMBOL, ATOMIC_CREATE_SYMBOL,
@@ -60,6 +65,18 @@ pub use job::{
     JOB_POOL_DESTROY_SYMBOL, JOB_SUBMIT_SYMBOL, JOB_WAIT_SYMBOL, ParallelForRequest,
     job_parallel_for, job_pool_clone, job_pool_create, job_pool_destroy, job_submit, job_wait,
     shutdown_all_job_pools, shutdown_job_pools,
+};
+pub use mathematics::{
+    MATH_ABSOLUTE_F32_SYMBOL, MATH_ABSOLUTE_F64_SYMBOL, MATH_CEIL_F32_SYMBOL, MATH_CEIL_F64_SYMBOL,
+    MATH_COS_F32_SYMBOL, MATH_COS_F64_SYMBOL, MATH_EXP_F32_SYMBOL, MATH_EXP_F64_SYMBOL,
+    MATH_FLOOR_F32_SYMBOL, MATH_FLOOR_F64_SYMBOL, MATH_LN_F32_SYMBOL, MATH_LN_F64_SYMBOL,
+    MATH_POW_F32_SYMBOL, MATH_POW_F64_SYMBOL, MATH_ROUND_F32_SYMBOL, MATH_ROUND_F64_SYMBOL,
+    MATH_SIN_F32_SYMBOL, MATH_SIN_F64_SYMBOL, MATH_SQRT_F32_SYMBOL, MATH_SQRT_F64_SYMBOL,
+    MATH_TAN_F32_SYMBOL, MATH_TAN_F64_SYMBOL, math_absolute_f32, math_absolute_f64, math_ceil_f32,
+    math_ceil_f64, math_cos_f32, math_cos_f64, math_exp_f32, math_exp_f64, math_floor_f32,
+    math_floor_f64, math_ln_f32, math_ln_f64, math_pow_f32, math_pow_f64, math_round_f32,
+    math_round_f64, math_sin_f32, math_sin_f64, math_sqrt_f32, math_sqrt_f64, math_tan_f32,
+    math_tan_f64,
 };
 
 /// Runtime failure categories emitted by checked native operations.

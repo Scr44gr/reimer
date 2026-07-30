@@ -865,6 +865,30 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("remove_file", CompletionItemKind::FUNCTION, "std::fs"),
     ("rename", CompletionItemKind::FUNCTION, "std::fs"),
     ("write_string", CompletionItemKind::FUNCTION, "std::fs"),
+    ("Vec2", CompletionItemKind::STRUCT, "std::math"),
+    ("Vec3", CompletionItemKind::STRUCT, "std::math"),
+    ("Vec4", CompletionItemKind::STRUCT, "std::math"),
+    ("PI", CompletionItemKind::CONSTANT, "std::math"),
+    ("TAU", CompletionItemKind::CONSTANT, "std::math"),
+    ("E", CompletionItemKind::CONSTANT, "std::math"),
+    ("absolute", CompletionItemKind::FUNCTION, "std::math"),
+    ("square_root", CompletionItemKind::FUNCTION, "std::math"),
+    ("floor", CompletionItemKind::FUNCTION, "std::math"),
+    ("ceil", CompletionItemKind::FUNCTION, "std::math"),
+    ("round", CompletionItemKind::FUNCTION, "std::math"),
+    ("sine", CompletionItemKind::FUNCTION, "std::math"),
+    ("cosine", CompletionItemKind::FUNCTION, "std::math"),
+    ("tangent", CompletionItemKind::FUNCTION, "std::math"),
+    ("exponential", CompletionItemKind::FUNCTION, "std::math"),
+    (
+        "natural_logarithm",
+        CompletionItemKind::FUNCTION,
+        "std::math",
+    ),
+    ("power", CompletionItemKind::FUNCTION, "std::math"),
+    ("minimum", CompletionItemKind::FUNCTION, "std::math"),
+    ("maximum", CompletionItemKind::FUNCTION, "std::math"),
+    ("clamp", CompletionItemKind::FUNCTION, "std::math"),
     (
         "size_of",
         CompletionItemKind::FUNCTION,
@@ -1892,6 +1916,62 @@ fn main() -> i32 { 0 }
                 .contains("Opens an existing UTF-8 path for reading.")
         );
         assert!(binding_contents.value.contains("File"));
+        assert!(!binding_contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_scalar_and_vector_math_documentation() {
+        let source = "from std::math import Vec3, square_root;
+fn main() -> i32 {
+    let direction = Vec3::new(3.0, 4.0, 0.0);
+    let length = square_root(81.0);
+    if direction.length() + length == 14.0 { 42 } else { 0 }
+}
+";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let lines = LineIndex::new(Arc::from(source));
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+        let call_position = lines.position(
+            source
+                .find("square_root(81")
+                .expect("math call should exist"),
+        );
+        let binding_position = lines.position(
+            source
+                .find("direction =")
+                .expect("vector binding should exist"),
+        );
+
+        let call_hover = document
+            .hover(call_position)
+            .expect("math call should have hover information");
+        let binding_hover = document
+            .hover(binding_position)
+            .expect("vector binding should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(call_contents) = call_hover.contents else {
+            panic!("math call hover should use markdown");
+        };
+        let tower_lsp::lsp_types::HoverContents::Markup(binding_contents) = binding_hover.contents
+        else {
+            panic!("vector binding hover should use markdown");
+        };
+
+        assert!(call_contents.value.contains("fn std::math::square_root"));
+        assert!(
+            call_contents
+                .value
+                .contains("Returns the principal square root")
+        );
+        assert!(binding_contents.value.contains("Vec3"));
+        assert!(
+            binding_contents
+                .value
+                .contains("Three-dimensional single-precision vector.")
+        );
         assert!(!binding_contents.value.contains("__module_"));
     }
 

@@ -291,6 +291,7 @@ pub fn execute_test_with_options(
 fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_core_symbols(builder);
     register_target_symbols(builder);
+    register_mathematics_symbols(builder);
     register_filesystem_symbols(builder);
     register_storage_symbols(builder);
     register_coordination_symbols(builder);
@@ -417,6 +418,100 @@ fn register_target_symbols(builder: &mut JITBuilder) {
             reimer_runtime::target_os_code as *const u8,
         )],
     );
+}
+
+fn register_mathematics_symbols(builder: &mut JITBuilder) {
+    let symbols = [
+        (
+            reimer_runtime::MATH_ABSOLUTE_F32_SYMBOL,
+            reimer_runtime::math_absolute_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_ABSOLUTE_F64_SYMBOL,
+            reimer_runtime::math_absolute_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_SQRT_F32_SYMBOL,
+            reimer_runtime::math_sqrt_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_SQRT_F64_SYMBOL,
+            reimer_runtime::math_sqrt_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_FLOOR_F32_SYMBOL,
+            reimer_runtime::math_floor_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_FLOOR_F64_SYMBOL,
+            reimer_runtime::math_floor_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_CEIL_F32_SYMBOL,
+            reimer_runtime::math_ceil_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_CEIL_F64_SYMBOL,
+            reimer_runtime::math_ceil_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_ROUND_F32_SYMBOL,
+            reimer_runtime::math_round_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_ROUND_F64_SYMBOL,
+            reimer_runtime::math_round_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_SIN_F32_SYMBOL,
+            reimer_runtime::math_sin_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_SIN_F64_SYMBOL,
+            reimer_runtime::math_sin_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_COS_F32_SYMBOL,
+            reimer_runtime::math_cos_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_COS_F64_SYMBOL,
+            reimer_runtime::math_cos_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_TAN_F32_SYMBOL,
+            reimer_runtime::math_tan_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_TAN_F64_SYMBOL,
+            reimer_runtime::math_tan_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_EXP_F32_SYMBOL,
+            reimer_runtime::math_exp_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_EXP_F64_SYMBOL,
+            reimer_runtime::math_exp_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_LN_F32_SYMBOL,
+            reimer_runtime::math_ln_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_LN_F64_SYMBOL,
+            reimer_runtime::math_ln_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_POW_F32_SYMBOL,
+            reimer_runtime::math_pow_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::MATH_POW_F64_SYMBOL,
+            reimer_runtime::math_pow_f64 as *const u8,
+        ),
+    ];
+    register_symbol_group(builder, symbols);
 }
 
 fn register_filesystem_symbols(builder: &mut JITBuilder) {

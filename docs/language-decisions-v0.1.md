@@ -316,3 +316,14 @@ capacity, and UTF-8 validation is required before a file buffer becomes
 Paths use bounded UTF-8 `str` views in v0.1. The standard library encapsulates
 the native ABI, so application code performs ordinary file and path operations
 without `unsafe`.
+
+## D-014: explicit scalar precision and nominal vectors
+
+`std::math` uses unsuffixed `f32` functions and explicit `_f64` variants.
+Rendering, simulation, and tensor code therefore remain concise without
+silently changing precision. Constants follow the same convention.
+
+`Vec2`, `Vec3`, and `Vec4` are nominal, `Copy`, single-precision structures.
+They expose named arithmetic methods instead of operator overloads. Normalizing
+an exactly zero vector returns `Option` rather than producing a hidden
+division-by-zero result. Vector operations allocate no memory.

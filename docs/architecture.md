@@ -51,6 +51,11 @@ Files remain move-only source values, reads receive an explicit allocator, and
 all public operations return recoverable errors. The detailed ownership and
 buffer contracts are documented in [`filesystem.md`](filesystem.md).
 
+`std::math` uses a smaller private ABI for scalar floating-point operations
+that are not source-language operators. The ABI receives and returns only
+`f32` or `f64`; safe wrappers provide explicit precision and the vector layer
+is implemented entirely in source. See [`mathematics.md`](mathematics.md).
+
 ## Integer overflow
 
 Ordinary integer `+`, `-`, and `*` operations are checked in every profile and

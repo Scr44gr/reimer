@@ -14,9 +14,9 @@ by `unsafe`. Runtime `assert` and debug-only `debug_assert` preserve explicit
 failure messages, and `std::target::os()` exposes the host as a typed enum. The
 standard library includes explicit allocators, safe I/O, owned files with
 explicit allocator-backed reads, recoverable slice access, allocation-free
-UTF-8 byte and character iteration, `String`, `Vec`, `HashMap`, `HashSet`,
-`RingBuffer`, contiguous tensors with safe views, threads, synchronization,
-atomics, and a work-stealing job pool:
+UTF-8 byte and character iteration, scalar and vector math, `String`, `Vec`,
+`HashMap`, `HashSet`, `RingBuffer`, contiguous tensors with safe views, threads,
+synchronization, atomics, and a work-stealing job pool:
 
 ```reimer
 fn factorial(value: i32) -> i32 {
@@ -55,6 +55,7 @@ cargo run -p reimer-cli -- run examples/m3_slice_access.reim
 cargo run -p reimer-cli -- run examples/m3_utf8.reim
 cargo run -p reimer-cli -- run examples/m3_assertions.reim
 cargo run -p reimer-cli -- run examples/m3_filesystem.reim
+cargo run -p reimer-cli -- run examples/m3_math.reim
 cargo run -p reimer-cli -- run examples/m5_ffi.reim
 cargo run -p reimer-cli -- run examples/m6_generics.reim
 cargo run -p reimer-cli -- run examples/m7_tensor.reim
@@ -89,6 +90,8 @@ attributes, and reflection are specified in
 [`docs/metaprogramming.md`](docs/metaprogramming.md).
 Safe owned file handles, UTF-8 paths, and explicit reads are documented in
 [`docs/filesystem.md`](docs/filesystem.md).
+Scalar functions and `Vec2`/`Vec3`/`Vec4` are documented in
+[`docs/mathematics.md`](docs/mathematics.md).
 `reimer doc` validates the complete package and writes its public `///`
 documentation to `target/reimer/doc/<package>.md`.
 

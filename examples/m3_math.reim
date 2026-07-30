@@ -1,0 +1,25 @@
+from std::math import Vec3, absolute, clamp, cosine, square_root, square_root_f64;
+
+fn main() -> i32 {
+    let direction = Vec3::new(3.0, 4.0, 0.0);
+    let length = direction.length();
+    let normalized = direction.normalized();
+    let scalar = square_root(81.0);
+    let precise: f64 = square_root_f64(144.0);
+    let cross = direction.cross(Vec3::new(0.0, 0.0, 1.0));
+
+    match normalized {
+        Some(value) if length == 5.0
+            && value.length() > 0.999
+            && value.length() < 1.001
+            && absolute(-7.0) == 7.0
+            && clamp(50.0, 0.0, 42.0) == 42.0
+            && cosine(0.0) == 1.0
+            && scalar == 9.0
+            && precise == 12.0
+            && cross.x == 4.0
+            && cross.y == -3.0
+            && cross.z == 0.0 => 42,
+        _ => 1,
+    }
+}

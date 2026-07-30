@@ -1,0 +1,451 @@
+@link("runtime")
+extern "C" {
+    fn math_absolute_f32(value: f32) -> f32;
+    fn math_absolute_f64(value: f64) -> f64;
+    fn math_sqrt_f32(value: f32) -> f32;
+    fn math_sqrt_f64(value: f64) -> f64;
+    fn math_floor_f32(value: f32) -> f32;
+    fn math_floor_f64(value: f64) -> f64;
+    fn math_ceil_f32(value: f32) -> f32;
+    fn math_ceil_f64(value: f64) -> f64;
+    fn math_round_f32(value: f32) -> f32;
+    fn math_round_f64(value: f64) -> f64;
+    fn math_sin_f32(value: f32) -> f32;
+    fn math_sin_f64(value: f64) -> f64;
+    fn math_cos_f32(value: f32) -> f32;
+    fn math_cos_f64(value: f64) -> f64;
+    fn math_tan_f32(value: f32) -> f32;
+    fn math_tan_f64(value: f64) -> f64;
+    fn math_exp_f32(value: f32) -> f32;
+    fn math_exp_f64(value: f64) -> f64;
+    fn math_ln_f32(value: f32) -> f32;
+    fn math_ln_f64(value: f64) -> f64;
+    fn math_pow_f32(value: f32, exponent: f32) -> f32;
+    fn math_pow_f64(value: f64, exponent: f64) -> f64;
+}
+
+/// Single-precision ratio of a circle's circumference to its diameter.
+pub const PI: f32 = 3.1415927;
+/// Single-precision full-turn angle in radians.
+pub const TAU: f32 = 6.2831855;
+/// Single-precision base of the natural logarithm.
+pub const E: f32 = 2.7182817;
+/// Double-precision ratio of a circle's circumference to its diameter.
+pub const PI_F64: f64 = 3.141592653589793;
+/// Double-precision full-turn angle in radians.
+pub const TAU_F64: f64 = 6.283185307179586;
+/// Double-precision base of the natural logarithm.
+pub const E_F64: f64 = 2.718281828459045;
+
+/// Returns the absolute value of a single-precision scalar.
+pub fn absolute(value: f32) -> f32 {
+    unsafe { math_absolute_f32(value) }
+}
+
+/// Returns the absolute value of a double-precision scalar.
+pub fn absolute_f64(value: f64) -> f64 {
+    unsafe { math_absolute_f64(value) }
+}
+
+/// Returns the principal square root of a single-precision scalar.
+pub fn square_root(value: f32) -> f32 {
+    unsafe { math_sqrt_f32(value) }
+}
+
+/// Returns the principal square root of a double-precision scalar.
+pub fn square_root_f64(value: f64) -> f64 {
+    unsafe { math_sqrt_f64(value) }
+}
+
+/// Returns the greatest integer not greater than a single-precision scalar.
+pub fn floor(value: f32) -> f32 {
+    unsafe { math_floor_f32(value) }
+}
+
+/// Returns the greatest integer not greater than a double-precision scalar.
+pub fn floor_f64(value: f64) -> f64 {
+    unsafe { math_floor_f64(value) }
+}
+
+/// Returns the smallest integer not less than a single-precision scalar.
+pub fn ceil(value: f32) -> f32 {
+    unsafe { math_ceil_f32(value) }
+}
+
+/// Returns the smallest integer not less than a double-precision scalar.
+pub fn ceil_f64(value: f64) -> f64 {
+    unsafe { math_ceil_f64(value) }
+}
+
+/// Rounds a single-precision scalar, with halfway cases away from zero.
+pub fn round(value: f32) -> f32 {
+    unsafe { math_round_f32(value) }
+}
+
+/// Rounds a double-precision scalar, with halfway cases away from zero.
+pub fn round_f64(value: f64) -> f64 {
+    unsafe { math_round_f64(value) }
+}
+
+/// Returns the sine of a single-precision radian angle.
+pub fn sine(value: f32) -> f32 {
+    unsafe { math_sin_f32(value) }
+}
+
+/// Returns the sine of a double-precision radian angle.
+pub fn sine_f64(value: f64) -> f64 {
+    unsafe { math_sin_f64(value) }
+}
+
+/// Returns the cosine of a single-precision radian angle.
+pub fn cosine(value: f32) -> f32 {
+    unsafe { math_cos_f32(value) }
+}
+
+/// Returns the cosine of a double-precision radian angle.
+pub fn cosine_f64(value: f64) -> f64 {
+    unsafe { math_cos_f64(value) }
+}
+
+/// Returns the tangent of a single-precision radian angle.
+pub fn tangent(value: f32) -> f32 {
+    unsafe { math_tan_f32(value) }
+}
+
+/// Returns the tangent of a double-precision radian angle.
+pub fn tangent_f64(value: f64) -> f64 {
+    unsafe { math_tan_f64(value) }
+}
+
+/// Returns e raised to a single-precision scalar.
+pub fn exponential(value: f32) -> f32 {
+    unsafe { math_exp_f32(value) }
+}
+
+/// Returns e raised to a double-precision scalar.
+pub fn exponential_f64(value: f64) -> f64 {
+    unsafe { math_exp_f64(value) }
+}
+
+/// Returns the natural logarithm of a single-precision scalar.
+pub fn natural_logarithm(value: f32) -> f32 {
+    unsafe { math_ln_f32(value) }
+}
+
+/// Returns the natural logarithm of a double-precision scalar.
+pub fn natural_logarithm_f64(value: f64) -> f64 {
+    unsafe { math_ln_f64(value) }
+}
+
+/// Raises a single-precision scalar to a floating-point exponent.
+pub fn power(value: f32, exponent: f32) -> f32 {
+    unsafe { math_pow_f32(value, exponent) }
+}
+
+/// Raises a double-precision scalar to a floating-point exponent.
+pub fn power_f64(value: f64, exponent: f64) -> f64 {
+    unsafe { math_pow_f64(value, exponent) }
+}
+
+/// Returns the smaller single-precision scalar.
+pub fn minimum(left: f32, right: f32) -> f32 {
+    if left < right { left } else { right }
+}
+
+/// Returns the smaller double-precision scalar.
+pub fn minimum_f64(left: f64, right: f64) -> f64 {
+    if left < right { left } else { right }
+}
+
+/// Returns the larger single-precision scalar.
+pub fn maximum(left: f32, right: f32) -> f32 {
+    if left > right { left } else { right }
+}
+
+/// Returns the larger double-precision scalar.
+pub fn maximum_f64(left: f64, right: f64) -> f64 {
+    if left > right { left } else { right }
+}
+
+/// Restricts a single-precision scalar to an inclusive interval.
+pub fn clamp(value: f32, lower: f32, upper: f32) -> f32 {
+    if value < lower {
+        lower
+    } else if value > upper {
+        upper
+    } else {
+        value
+    }
+}
+
+/// Restricts a double-precision scalar to an inclusive interval.
+pub fn clamp_f64(value: f64, lower: f64, upper: f64) -> f64 {
+    if value < lower {
+        lower
+    } else if value > upper {
+        upper
+    } else {
+        value
+    }
+}
+
+/// Two-dimensional single-precision vector.
+@derive(Copy, Clone, Debug, Default)
+pub struct Vec2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Three-dimensional single-precision vector.
+@derive(Copy, Clone, Debug, Default)
+pub struct Vec3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// Four-dimensional single-precision vector.
+@derive(Copy, Clone, Debug, Default)
+pub struct Vec4 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub w: f32,
+}
+
+impl Vec2 {
+    /// Creates a vector from its components.
+    pub fn new(x: f32, y: f32) -> Vec2 {
+        Vec2 { x: x, y: y }
+    }
+
+    /// Returns the zero vector.
+    pub fn zero() -> Vec2 {
+        Vec2::new(0.0, 0.0)
+    }
+
+    /// Returns a vector with both components set to `value`.
+    pub fn splat(value: f32) -> Vec2 {
+        Vec2::new(value, value)
+    }
+
+    /// Adds corresponding components.
+    pub fn add(&self, other: Vec2) -> Vec2 {
+        Vec2::new(self.x + other.x, self.y + other.y)
+    }
+
+    /// Subtracts corresponding components.
+    pub fn subtract(&self, other: Vec2) -> Vec2 {
+        Vec2::new(self.x - other.x, self.y - other.y)
+    }
+
+    /// Multiplies every component by `factor`.
+    pub fn scale(&self, factor: f32) -> Vec2 {
+        Vec2::new(self.x * factor, self.y * factor)
+    }
+
+    /// Returns the dot product.
+    pub fn dot(&self, other: Vec2) -> f32 {
+        self.x * other.x + self.y * other.y
+    }
+
+    /// Returns the squared Euclidean length.
+    pub fn length_squared(&self) -> f32 {
+        self.dot(*self)
+    }
+
+    /// Returns the Euclidean length.
+    pub fn length(&self) -> f32 {
+        square_root(self.length_squared())
+    }
+
+    /// Returns a unit vector, or `None` for the zero vector.
+    pub fn normalized(&self) -> Option<Vec2> {
+        let length = self.length();
+        if length == 0.0 {
+            None
+        } else {
+            Some(self.scale(1.0 / length))
+        }
+    }
+
+    /// Returns the Euclidean distance to `other`.
+    pub fn distance(&self, other: Vec2) -> f32 {
+        let delta = other.subtract(*self);
+        delta.length()
+    }
+
+    /// Interpolates linearly toward `other` without clamping `amount`.
+    pub fn lerp(&self, other: Vec2, amount: f32) -> Vec2 {
+        let delta = other.subtract(*self);
+        let scaled = delta.scale(amount);
+        self.add(scaled)
+    }
+}
+
+impl Vec3 {
+    /// Creates a vector from its components.
+    pub fn new(x: f32, y: f32, z: f32) -> Vec3 {
+        Vec3 { x: x, y: y, z: z }
+    }
+
+    /// Returns the zero vector.
+    pub fn zero() -> Vec3 {
+        Vec3::new(0.0, 0.0, 0.0)
+    }
+
+    /// Returns a vector with every component set to `value`.
+    pub fn splat(value: f32) -> Vec3 {
+        Vec3::new(value, value, value)
+    }
+
+    /// Adds corresponding components.
+    pub fn add(&self, other: Vec3) -> Vec3 {
+        Vec3::new(self.x + other.x, self.y + other.y, self.z + other.z)
+    }
+
+    /// Subtracts corresponding components.
+    pub fn subtract(&self, other: Vec3) -> Vec3 {
+        Vec3::new(self.x - other.x, self.y - other.y, self.z - other.z)
+    }
+
+    /// Multiplies every component by `factor`.
+    pub fn scale(&self, factor: f32) -> Vec3 {
+        Vec3::new(self.x * factor, self.y * factor, self.z * factor)
+    }
+
+    /// Returns the dot product.
+    pub fn dot(&self, other: Vec3) -> f32 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    /// Returns the right-handed cross product.
+    pub fn cross(&self, other: Vec3) -> Vec3 {
+        Vec3::new(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        )
+    }
+
+    /// Returns the squared Euclidean length.
+    pub fn length_squared(&self) -> f32 {
+        self.dot(*self)
+    }
+
+    /// Returns the Euclidean length.
+    pub fn length(&self) -> f32 {
+        square_root(self.length_squared())
+    }
+
+    /// Returns a unit vector, or `None` for the zero vector.
+    pub fn normalized(&self) -> Option<Vec3> {
+        let length = self.length();
+        if length == 0.0 {
+            None
+        } else {
+            Some(self.scale(1.0 / length))
+        }
+    }
+
+    /// Returns the Euclidean distance to `other`.
+    pub fn distance(&self, other: Vec3) -> f32 {
+        let delta = other.subtract(*self);
+        delta.length()
+    }
+
+    /// Interpolates linearly toward `other` without clamping `amount`.
+    pub fn lerp(&self, other: Vec3, amount: f32) -> Vec3 {
+        let delta = other.subtract(*self);
+        let scaled = delta.scale(amount);
+        self.add(scaled)
+    }
+}
+
+impl Vec4 {
+    /// Creates a vector from its components.
+    pub fn new(x: f32, y: f32, z: f32, w: f32) -> Vec4 {
+        Vec4 { x: x, y: y, z: z, w: w }
+    }
+
+    /// Returns the zero vector.
+    pub fn zero() -> Vec4 {
+        Vec4::new(0.0, 0.0, 0.0, 0.0)
+    }
+
+    /// Returns a vector with every component set to `value`.
+    pub fn splat(value: f32) -> Vec4 {
+        Vec4::new(value, value, value, value)
+    }
+
+    /// Adds corresponding components.
+    pub fn add(&self, other: Vec4) -> Vec4 {
+        Vec4::new(
+            self.x + other.x,
+            self.y + other.y,
+            self.z + other.z,
+            self.w + other.w,
+        )
+    }
+
+    /// Subtracts corresponding components.
+    pub fn subtract(&self, other: Vec4) -> Vec4 {
+        Vec4::new(
+            self.x - other.x,
+            self.y - other.y,
+            self.z - other.z,
+            self.w - other.w,
+        )
+    }
+
+    /// Multiplies every component by `factor`.
+    pub fn scale(&self, factor: f32) -> Vec4 {
+        Vec4::new(
+            self.x * factor,
+            self.y * factor,
+            self.z * factor,
+            self.w * factor,
+        )
+    }
+
+    /// Returns the dot product.
+    pub fn dot(&self, other: Vec4) -> f32 {
+        self.x * other.x
+            + self.y * other.y
+            + self.z * other.z
+            + self.w * other.w
+    }
+
+    /// Returns the squared Euclidean length.
+    pub fn length_squared(&self) -> f32 {
+        self.dot(*self)
+    }
+
+    /// Returns the Euclidean length.
+    pub fn length(&self) -> f32 {
+        square_root(self.length_squared())
+    }
+
+    /// Returns a unit vector, or `None` for the zero vector.
+    pub fn normalized(&self) -> Option<Vec4> {
+        let length = self.length();
+        if length == 0.0 {
+            None
+        } else {
+            Some(self.scale(1.0 / length))
+        }
+    }
+
+    /// Returns the Euclidean distance to `other`.
+    pub fn distance(&self, other: Vec4) -> f32 {
+        let delta = other.subtract(*self);
+        delta.length()
+    }
+
+    /// Interpolates linearly toward `other` without clamping `amount`.
+    pub fn lerp(&self, other: Vec4, amount: f32) -> Vec4 {
+        let delta = other.subtract(*self);
+        let scaled = delta.scale(amount);
+        self.add(scaled)
+    }
+}
