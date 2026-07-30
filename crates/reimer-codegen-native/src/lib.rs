@@ -291,6 +291,7 @@ pub fn execute_test_with_options(
 fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_core_symbols(builder);
     register_target_symbols(builder);
+    register_filesystem_symbols(builder);
     register_storage_symbols(builder);
     register_coordination_symbols(builder);
 }
@@ -416,6 +417,64 @@ fn register_target_symbols(builder: &mut JITBuilder) {
             reimer_runtime::target_os_code as *const u8,
         )],
     );
+}
+
+fn register_filesystem_symbols(builder: &mut JITBuilder) {
+    let symbols = [
+        (
+            reimer_runtime::FILE_OPEN_SYMBOL,
+            reimer_runtime::file_open as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_CREATE_SYMBOL,
+            reimer_runtime::file_create as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_APPEND_SYMBOL,
+            reimer_runtime::file_append as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_CLOSE_SYMBOL,
+            reimer_runtime::file_close as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_READ_SYMBOL,
+            reimer_runtime::file_read as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_READ_EXACT_SYMBOL,
+            reimer_runtime::file_read_exact as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_WRITE_SYMBOL,
+            reimer_runtime::file_write as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_WRITE_ALL_SYMBOL,
+            reimer_runtime::file_write_all as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_FLUSH_SYMBOL,
+            reimer_runtime::file_flush as *const u8,
+        ),
+        (
+            reimer_runtime::FILE_REMAINING_LEN_SYMBOL,
+            reimer_runtime::file_remaining_len as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_EXISTS_SYMBOL,
+            reimer_runtime::path_exists as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_REMOVE_FILE_SYMBOL,
+            reimer_runtime::path_remove_file as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_RENAME_SYMBOL,
+            reimer_runtime::path_rename as *const u8,
+        ),
+    ];
+    register_symbol_group(builder, symbols);
 }
 
 fn register_storage_symbols(builder: &mut JITBuilder) {

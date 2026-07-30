@@ -7870,17 +7870,17 @@ impl<'context> FunctionAnalyzer<'context> {
     fn require_standard_io_intrinsic(&mut self, span: Span) {
         if matches!(
             self.module_identity.as_deref(),
-            Some("3_std_2_io" | "3_std_6_string")
+            Some("3_std_2_fs" | "3_std_2_io" | "3_std_6_string")
         ) {
             return;
         }
         self.diagnostics.push(
             Diagnostic::error(
                 "E3148",
-                "string-view runtime intrinsics are private to `std::io`",
+                "string-view runtime intrinsics are private to standard library wrappers",
                 span,
             )
-            .with_help("import and call the public standard I/O wrapper instead"),
+            .with_help("import and call the public string, file-system, or I/O wrapper instead"),
         );
     }
 
@@ -12019,7 +12019,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_should_keep_string_view_intrinsics_private_to_standard_io() {
+    fn resolve_should_keep_string_view_intrinsics_private_to_standard_wrappers() {
         let source = r#"
             fn main() -> i32 {
                 __string_length("private") as i32

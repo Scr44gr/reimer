@@ -327,7 +327,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.reimer",
-          "match": "\\b(?:assert|debug_assert|panic|print|println|eprint|eprintln|stdin|stdout|stderr|allocate_bytes|general_allocator|page_allocator|size_of|align_of|name|fields|variants|traits|os)\\b(?=\\s*(?:<[^;{}()]+>\\s*)?\\()"
+          "match": "\\b(?:assert|debug_assert|panic|print|println|eprint|eprintln|stdin|stdout|stderr|open|create|append|exists|remove_file|rename|read_to_string|write_string|allocate_bytes|general_allocator|page_allocator|size_of|align_of|name|fields|variants|traits|os)\\b(?=\\s*(?:<[^;{}()]+>\\s*)?\\()"
         },
         {
           "name": "entity.name.function.call.reimer",

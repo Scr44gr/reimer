@@ -1,0 +1,311 @@
+from std::alloc import Allocator, OwnedBytes, allocate_bytes;
+from std::string import String, from_initialized_bytes;
+
+/// Recoverable file-system failures.
+pub enum FileError {
+    Failed,
+    UnexpectedEndOfFile,
+    OutOfMemory,
+    InvalidData,
+}
+
+/// One owned native file handle.
+///
+/// Call `deinit` explicitly, normally through `defer`.
+pub struct File {
+    raw: usize,
+}
+
+/// Allocator-owned bytes initialized by a file read.
+pub struct FileBuffer {
+    bytes: OwnedBytes,
+    len: usize,
+}
+
+@link("runtime")
+extern "C" {
+    fn file_open(data: *const u8, len: usize) -> usize;
+    fn file_create(data: *const u8, len: usize) -> usize;
+    fn file_append(data: *const u8, len: usize) -> usize;
+    fn file_close(handle: usize) -> i32;
+    fn file_read(handle: usize, data: *mut u8, len: usize) -> isize;
+    fn file_read_exact(handle: usize, data: *mut u8, len: usize) -> isize;
+    fn file_write(handle: usize, data: *const u8, len: usize) -> isize;
+    fn file_write_all(handle: usize, data: *const u8, len: usize) -> i32;
+    fn file_flush(handle: usize) -> i32;
+    fn file_remaining_len(handle: usize) -> isize;
+    fn path_exists(data: *const u8, len: usize) -> bool;
+    fn path_remove_file(data: *const u8, len: usize) -> i32;
+    fn path_rename(
+        source_data: *const u8,
+        source_len: usize,
+        destination_data: *const u8,
+        destination_len: usize,
+    ) -> i32;
+}
+
+fn path_data(path: str) -> *const u8 {
+    __string_data(path)
+}
+
+fn path_len(path: str) -> usize {
+    __string_length(path)
+}
+
+fn file_from_handle(handle: usize) -> Result<File, FileError> {
+    if handle == 0 {
+        Err(FileError::Failed)
+    } else {
+        Ok(File { raw: handle })
+    }
+}
+
+/// Opens an existing UTF-8 path for reading.
+pub fn open(path: str) -> Result<File, FileError> {
+    let handle = unsafe { file_open(path_data(path), path_len(path)) };
+    file_from_handle(handle)
+}
+
+/// Creates or truncates a UTF-8 path for writing.
+pub fn create(path: str) -> Result<File, FileError> {
+    let handle = unsafe { file_create(path_data(path), path_len(path)) };
+    file_from_handle(handle)
+}
+
+/// Creates or opens a UTF-8 path for appending.
+pub fn append(path: str) -> Result<File, FileError> {
+    let handle = unsafe { file_append(path_data(path), path_len(path)) };
+    file_from_handle(handle)
+}
+
+/// Returns whether a UTF-8 path currently exists.
+pub fn exists(path: str) -> bool {
+    unsafe { path_exists(path_data(path), path_len(path)) }
+}
+
+/// Removes one file at a UTF-8 path.
+pub fn remove_file(path: str) -> Result<(), FileError> {
+    let status = unsafe { path_remove_file(path_data(path), path_len(path)) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(FileError::Failed)
+    }
+}
+
+/// Renames one UTF-8 file-system path.
+pub fn rename(source: str, destination: str) -> Result<(), FileError> {
+    let status = unsafe {
+        path_rename(
+            path_data(source),
+            path_len(source),
+            path_data(destination),
+            path_len(destination),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(FileError::Failed)
+    }
+}
+
+fn allocate_file_buffer(
+    allocator: &Allocator,
+    capacity: usize,
+) -> Result<OwnedBytes, FileError> {
+    match allocate_bytes(allocator, capacity) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => Err(FileError::OutOfMemory),
+    }
+}
+
+fn finish_file_read(
+    bytes: OwnedBytes,
+    initialized: isize,
+) -> Result<FileBuffer, FileError> {
+    if initialized < 0 {
+        bytes.deinit();
+        if initialized == -2 {
+            Err(FileError::UnexpectedEndOfFile)
+        } else {
+            Err(FileError::Failed)
+        }
+    } else {
+        Ok(FileBuffer {
+            bytes: bytes,
+            len: initialized as usize,
+        })
+    }
+}
+
+fn remaining_file_len(handle: usize) -> Result<usize, FileError> {
+    let length = unsafe { file_remaining_len(handle) };
+    if length < 0 {
+        Err(FileError::Failed)
+    } else {
+        Ok(length as usize)
+    }
+}
+
+impl File {
+    /// Returns the unread byte length from the current cursor to the end.
+    pub fn remaining_len(&mut self) -> Result<usize, FileError> {
+        remaining_file_len(self.raw)
+    }
+
+    /// Reads at most `capacity` bytes into allocator-owned storage.
+    pub fn read(
+        &mut self,
+        allocator: &Allocator,
+        capacity: usize,
+    ) -> Result<FileBuffer, FileError> {
+        let mut bytes = allocate_file_buffer(allocator, capacity)?;
+        let initialized = unsafe {
+            file_read(self.raw, bytes.as_mut_ptr(), capacity)
+        };
+        finish_file_read(bytes, initialized)
+    }
+
+    /// Reads exactly `len` bytes or reports `UnexpectedEndOfFile`.
+    pub fn read_exact(
+        &mut self,
+        allocator: &Allocator,
+        len: usize,
+    ) -> Result<FileBuffer, FileError> {
+        let mut bytes = allocate_file_buffer(allocator, len)?;
+        let initialized = unsafe {
+            file_read_exact(self.raw, bytes.as_mut_ptr(), len)
+        };
+        finish_file_read(bytes, initialized)
+    }
+
+    /// Reads all remaining bytes through the supplied allocator.
+    pub fn read_to_end(
+        &mut self,
+        allocator: &Allocator,
+    ) -> Result<FileBuffer, FileError> {
+        let len = remaining_file_len(self.raw)?;
+        self.read_exact(allocator, len)
+    }
+
+    /// Reads and validates all remaining bytes as an owned UTF-8 string.
+    pub fn read_to_string(
+        &mut self,
+        allocator: &Allocator,
+    ) -> Result<String, FileError> {
+        let buffer = self.read_to_end(allocator)?;
+        buffer.into_string()
+    }
+
+    /// Writes at most one portion of a UTF-8 string and returns its byte count.
+    pub fn write(&mut self, value: str) -> Result<usize, FileError> {
+        let written = unsafe {
+            file_write(
+                self.raw,
+                __string_data(value),
+                __string_length(value),
+            )
+        };
+        if written < 0 {
+            Err(FileError::Failed)
+        } else {
+            Ok(written as usize)
+        }
+    }
+
+    /// Writes every UTF-8 byte or returns a recoverable error.
+    pub fn write_all(&mut self, value: str) -> Result<(), FileError> {
+        let status = unsafe {
+            file_write_all(
+                self.raw,
+                __string_data(value),
+                __string_length(value),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FileError::Failed)
+        }
+    }
+
+    /// Writes every initialized byte from a file buffer.
+    pub fn write_buffer(&mut self, buffer: &FileBuffer) -> Result<(), FileError> {
+        let status = unsafe {
+            file_write_all(self.raw, buffer.bytes.as_ptr(), buffer.len)
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FileError::Failed)
+        }
+    }
+
+    /// Flushes buffered data to the operating system.
+    pub fn flush(&mut self) -> Result<(), FileError> {
+        let status = unsafe { file_flush(self.raw) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FileError::Failed)
+        }
+    }
+
+    /// Closes this owned native file handle.
+    pub fn deinit(self) {
+        unsafe {
+            file_close(self.raw);
+        }
+    }
+}
+
+impl FileBuffer {
+    /// Returns the initialized byte length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns the allocated byte capacity.
+    pub fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Returns whether the read initialized no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Validates UTF-8 and transfers the allocation into an owned `String`.
+    pub fn into_string(self) -> Result<String, FileError> {
+        let len = self.len;
+        let bytes = self.bytes;
+        match from_initialized_bytes(bytes, len) {
+            Ok(value) => Ok(value),
+            Err(_) => Err(FileError::InvalidData),
+        }
+    }
+
+    /// Releases the buffer through its original allocator.
+    pub fn deinit(self) {
+        self.bytes.deinit();
+    }
+}
+
+/// Reads one complete UTF-8 file through an explicit allocator.
+pub fn read_to_string(
+    path: str,
+    allocator: &Allocator,
+) -> Result<String, FileError> {
+    let mut file = open(path)?;
+    defer file.deinit();
+    file.read_to_string(allocator)
+}
+
+/// Creates a file, writes a complete UTF-8 string, and closes it.
+pub fn write_string(path: str, value: str) -> Result<(), FileError> {
+    let mut file = create(path)?;
+    defer file.deinit();
+    file.write_all(value)?;
+    file.flush()
+}

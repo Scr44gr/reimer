@@ -855,6 +855,16 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("read_to_end", CompletionItemKind::METHOD, "Stdin"),
     ("read_line_string", CompletionItemKind::METHOD, "Stdin"),
     ("read_to_string", CompletionItemKind::METHOD, "Stdin"),
+    ("File", CompletionItemKind::STRUCT, "std::fs"),
+    ("FileBuffer", CompletionItemKind::STRUCT, "std::fs"),
+    ("FileError", CompletionItemKind::ENUM, "std::fs"),
+    ("open", CompletionItemKind::FUNCTION, "std::fs"),
+    ("create", CompletionItemKind::FUNCTION, "std::fs"),
+    ("append", CompletionItemKind::FUNCTION, "std::fs"),
+    ("exists", CompletionItemKind::FUNCTION, "std::fs"),
+    ("remove_file", CompletionItemKind::FUNCTION, "std::fs"),
+    ("rename", CompletionItemKind::FUNCTION, "std::fs"),
+    ("write_string", CompletionItemKind::FUNCTION, "std::fs"),
     (
         "size_of",
         CompletionItemKind::FUNCTION,
@@ -1836,6 +1846,52 @@ fn main() -> i32 {
                 .contains("Returns the operating system targeted by the current native build.")
         );
         assert!(binding_contents.value.contains("OperatingSystem"));
+        assert!(!binding_contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_safe_filesystem_documentation() {
+        let source = "from std::fs import FileError, open;
+fn inspect() -> Result<(), FileError> {
+    let file = open(\"missing.txt\")?;
+    file.deinit();
+    Ok(())
+}
+fn main() -> i32 { 0 }
+";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let lines = LineIndex::new(Arc::from(source));
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+        let call_position =
+            lines.position(source.find("open(\"").expect("file open call should exist"));
+        let binding_position =
+            lines.position(source.find("file =").expect("file binding should exist"));
+
+        let call_hover = document
+            .hover(call_position)
+            .expect("file open call should have hover information");
+        let binding_hover = document
+            .hover(binding_position)
+            .expect("file binding should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(call_contents) = call_hover.contents else {
+            panic!("file call hover should use markdown");
+        };
+        let tower_lsp::lsp_types::HoverContents::Markup(binding_contents) = binding_hover.contents
+        else {
+            panic!("file binding hover should use markdown");
+        };
+
+        assert!(call_contents.value.contains("fn std::fs::open"));
+        assert!(
+            call_contents
+                .value
+                .contains("Opens an existing UTF-8 path for reading.")
+        );
+        assert!(binding_contents.value.contains("File"));
         assert!(!binding_contents.value.contains("__module_"));
     }
 

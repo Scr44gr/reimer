@@ -114,6 +114,12 @@ assertScope(
 );
 assertScope(
   grammar,
+  'let file = open("assets/data.txt")?;',
+  "open",
+  "support.function.builtin.reimer",
+);
+assertScope(
+  grammar,
   "static mut COUNTER: i32 = 0;",
   "COUNTER",
   "variable.other.constant.reimer",

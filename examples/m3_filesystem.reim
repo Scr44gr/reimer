@@ -1,0 +1,47 @@
+from std::alloc import Allocator, general_allocator;
+from std::fs import FileError, create, exists, open, remove_file, rename;
+from std::string import String;
+
+fn write_fixture(path: str) -> Result<(), FileError> {
+    let mut file = create(path)?;
+    defer file.deinit();
+    file.write_all("answer")?;
+    file.flush()
+}
+
+fn read_fixture(
+    path: str,
+    allocator: &Allocator,
+) -> Result<String, FileError> {
+    let mut file = open(path)?;
+    defer file.deinit();
+    file.read_to_string(allocator)
+}
+
+fn exercise_filesystem(allocator: &Allocator) -> Result<i32, FileError> {
+    let source = ".reimer-filesystem-smoke.tmp";
+    let destination = ".reimer-filesystem-renamed.tmp";
+    write_fixture(source)?;
+    if !exists(source) {
+        return Err(FileError::Failed);
+    }
+    let text = read_fixture(source, allocator)?;
+    defer text.deinit();
+    if !text.matches("answer") {
+        return Err(FileError::InvalidData);
+    }
+    rename(source, destination)?;
+    if exists(source) || !exists(destination) {
+        return Err(FileError::Failed);
+    }
+    remove_file(destination)?;
+    Ok(42)
+}
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    match exercise_filesystem(&allocator) {
+        Ok(value) => value,
+        Err(_) => 1,
+    }
+}

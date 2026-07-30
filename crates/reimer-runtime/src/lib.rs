@@ -16,6 +16,11 @@ use std::thread::JoinHandle;
 mod concurrency;
 #[expect(
     unsafe_code,
+    reason = "the file-system ABI validates raw buffers at the generated-code boundary"
+)]
+mod filesystem;
+#[expect(
+    unsafe_code,
     reason = "the job ABI exposes stable symbols and invokes compiler-generated callback thunks"
 )]
 mod job;
@@ -40,6 +45,14 @@ pub use concurrency::{
     rwlock_load, rwlock_replace, semaphore_acquire, semaphore_clone, semaphore_create,
     semaphore_destroy, semaphore_release, semaphore_try_acquire, thread_local_clone,
     thread_local_create, thread_local_destroy, thread_local_get, thread_local_set,
+};
+pub use filesystem::{
+    FILE_APPEND_SYMBOL, FILE_CLOSE_SYMBOL, FILE_CREATE_SYMBOL, FILE_FLUSH_SYMBOL, FILE_OPEN_SYMBOL,
+    FILE_READ_EXACT_SYMBOL, FILE_READ_SYMBOL, FILE_REMAINING_LEN_SYMBOL, FILE_UNEXPECTED_EOF,
+    FILE_WRITE_ALL_SYMBOL, FILE_WRITE_SYMBOL, PATH_EXISTS_SYMBOL, PATH_REMOVE_FILE_SYMBOL,
+    PATH_RENAME_SYMBOL, file_append, file_close, file_create, file_flush, file_open, file_read,
+    file_read_exact, file_remaining_len, file_write, file_write_all, path_exists, path_remove_file,
+    path_rename,
 };
 pub use job::{
     JOB_JOIN_INVALID_HANDLE, JOB_JOIN_OK, JOB_JOIN_RESULT_MISMATCH, JOB_JOIN_WORKER_PANICKED,

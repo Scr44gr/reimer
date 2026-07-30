@@ -45,6 +45,12 @@
 - The runtime encapsulates FFI, allocator, and I/O boundaries; programs use
   safe standard-library wrappers.
 
+`std::fs` follows the same boundary. Generated code passes bounded UTF-8 paths
+and byte regions to a small runtime registry of opaque native file handles.
+Files remain move-only source values, reads receive an explicit allocator, and
+all public operations return recoverable errors. The detailed ownership and
+buffer contracts are documented in [`filesystem.md`](filesystem.md).
+
 ## Integer overflow
 
 Ordinary integer `+`, `-`, and `*` operations are checked in every profile and

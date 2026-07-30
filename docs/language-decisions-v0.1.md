@@ -299,3 +299,20 @@ The host-native backend exposes target identity through the safe standard
 library API `std::target::os() -> OperatingSystem`. The enum distinguishes
 Windows, Linux, macOS, FreeBSD, and other hosts. Its private ABI boundary is
 implemented by the standard library; user code does not need `unsafe`.
+
+## D-013: owned files and UTF-8 paths
+
+`std::fs::File` owns an opaque native handle and is move-only. Programs close
+it explicitly with `deinit`, normally registered through `defer`. Opening,
+creating, appending, reading, writing, flushing, renaming, and removing return
+recoverable errors.
+
+File reads receive an allocator. `read` and `read_exact` use caller-selected
+bounds; `read_to_end` allocates the exact unread regular-file length through
+that allocator. Initialized byte length remains distinct from allocation
+capacity, and UTF-8 validation is required before a file buffer becomes
+`String`.
+
+Paths use bounded UTF-8 `str` views in v0.1. The standard library encapsulates
+the native ABI, so application code performs ordinary file and path operations
+without `unsafe`.
