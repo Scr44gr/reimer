@@ -1,10 +1,10 @@
-# Sistema de paquetes y build
+# Package and build system
 
-M8 introduce proyectos declarativos sin scripts de build arbitrarios. El
-compilador resuelve el grafo completo antes de cargar módulos, pero cada paquete
-solo puede importar sus dependencias directas.
+M8 introduces declarative projects without arbitrary build scripts. The
+compiler resolves the complete graph before loading modules, but each package
+may only import its direct dependencies.
 
-## Estructura
+## Layout
 
 ```text
 game/
@@ -19,9 +19,9 @@ game/
 └── assets/
 ```
 
-`src/main.reim` define un ejecutable. Un paquete biblioteca usa
-`src/package.reim` como fachada pública y no necesita `main`. Las dependencias
-siempre deben ofrecer esa fachada.
+`src/main.reim` defines an executable. A library package uses
+`src/package.reim` as its public facade and does not need `main`. Dependencies
+must always provide that facade.
 
 ## Manifest
 
@@ -42,34 +42,33 @@ optimization = 0
 optimization = 3
 ```
 
-Los nombres de versión y requisitos siguen SemVer. Una dependencia puede
-renombrar el paquete con `package = "nombre-real"`. Las fuentes admitidas son:
+Versions and requirements follow SemVer. A dependency may rename a package
+with `package = "real-name"`. Supported sources are:
 
-- `path`, relativo al manifest que declara la dependencia;
-- `git`, fijado por commit y opcionalmente seleccionado mediante `rev`,
-  `branch` o `tag`.
+- `path`, relative to the manifest declaring the dependency;
+- `git`, pinned to a commit and optionally selected with `rev`, `branch`, or
+  `tag`.
 
-Solo puede aparecer un selector Git. Las dependencias de registry se reconocen
-para producir un error preciso, pero el registry y la publicación quedan para
-un hito posterior.
+Only one Git selector may appear. Registry dependencies are recognized so the
+compiler can produce a precise error, but registry support and publishing are
+reserved for a later milestone.
 
-## Resolución y lockfile
+## Resolution and lockfile
 
-`reimer.lock` contiene identidades, versiones, fuentes, checksums y aristas
-exactas. Los paths se guardan relativos a la raíz, por lo que mover el árbol
-completo produce el mismo lockfile. Los commits Git quedan fijados hasta
-solicitar una actualización.
+`reimer.lock` contains exact identities, versions, sources, checksums, and
+edges. Paths are stored relative to the root, so moving the complete tree
+produces the same lockfile. Git commits remain pinned until an update is
+requested.
 
-- modo normal: reutiliza commits fijados y actualiza checksums obsoletos;
-- `--locked`: rechaza un lockfile ausente o cualquier deriva;
-- `--refresh`: vuelve a resolver referencias Git y reemplaza el lockfile.
+- normal mode reuses pinned commits and updates stale checksums;
+- `--locked` rejects a missing lockfile or any drift;
+- `--refresh` resolves Git references again and replaces the lockfile.
 
-Las versiones se unifican cuando nombre, versión y fuente identifican el mismo
-paquete. Los ciclos se rechazan mostrando la cadena completa. Una dependencia
-transitiva no es visible desde el paquete raíz salvo que también se declare
-directamente.
+Versions are unified when name, version, and source identify the same package.
+Cycles are rejected with the complete chain. A transitive dependency is not
+visible from the root package unless it is also declared directly.
 
-## Comandos
+## Commands
 
 ```text
 reimer new <path>
@@ -84,22 +83,21 @@ reimer add <alias> (--path <path>|--git <url>)
 reimer remove <alias>
 ```
 
-`build` emite un objeto en `target/reimer/debug` o
-`target/reimer/release`. Los niveles de manifest se traducen a las estrategias
-de Cranelift: `0` desactiva optimización, `1–2` optimizan velocidad y `3`
-equilibra velocidad y tamaño. `run` ejecuta el mismo grafo por JIT.
+`build` emits an object under `target/reimer/debug` or
+`target/reimer/release`. Manifest levels map to Cranelift strategies: `0`
+disables optimization, `1-2` optimize for speed, and `3` balances speed and
+size. `run` executes the same graph through JIT.
 
-Cada archivo `.reim` bajo `tests/` es una prueba de integración independiente.
-Debe definir `fn main() -> i32`; retornar `0` significa éxito. La selección y
-ejecución se ordenan por path para que el resultado sea determinista.
+Each `.reim` file under `tests/` is an independent integration test. It must
+define `fn main() -> i32`; returning `0` means success. Selection and execution
+are sorted by path for deterministic results.
 
-`fmt` normaliza espacios finales, salto final y orden de imports; con `--check`
-solo verifica. `clean` elimina exclusivamente `target/reimer` después de
-resolver y comprobar la raíz del proyecto.
+`fmt` normalizes trailing spaces, the final newline, and import order;
+`--check` only verifies. `clean` removes only `target/reimer` after resolving
+and validating the project root.
 
-## Restricción deliberada
+## Deliberate restriction
 
-El manifest no ejecuta código, plugins ni scripts Turing-completos. Cualquier
-generación futura deberá expresarse mediante entradas y salidas declarativas,
-de modo que el grafo continúe siendo reproducible, inspeccionable por el LSP y
-seguro para herramientas.
+The manifest does not execute code, plugins, or Turing-complete scripts. Future
+generation must be expressed through declarative inputs and outputs so the
+graph remains reproducible, inspectable by the LSP, and safe for tooling.

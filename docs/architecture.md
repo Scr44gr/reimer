@@ -1,101 +1,99 @@
-# Arquitectura inicial de Reimer
+# Initial Reimer architecture
 
-## Pipeline implementado
+## Implemented pipeline
 
-1. `reimer-lexer` transforma UTF-8 en tokens y conserva spans de bytes.
-2. `reimer-parser` construye un AST fiel a la sintaxis y recupera errores en
-   límites de statements y declaraciones.
-3. `reimer-resolver` resuelve funciones, bindings y nombres de tipos; comprueba
-   tipos, mutabilidad, aridad, ciclos de almacenamiento y control de flujo.
-4. `reimer-hir` representa el programa tipado mediante IDs de funciones,
-   locales y tipos compuestos; el backend no depende del AST.
-5. `reimer-layout` calcula una única representación nativa compartida por
-   reflexión y codegen; `reimer-codegen-native` baja la HIR a Cranelift, con
-   overflow y división comprobados.
-6. `reimer-project` valida `reimer.toml`, resuelve dependencias path/git,
-   sincroniza `reimer.lock` y construye un grafo portable.
-7. `reimer-cli` expone el ciclo completo
-   `new/init/check/build/run/test/fmt/clean/add/remove` y conserva
-   `emit-object` para archivos sueltos.
-8. `reimer-diagnostics` renderiza errores con código, ubicación, fragmento de
-   fuente y ayuda opcional.
-9. `reimer-package` descubre módulos, resuelve imports `::`, limita la
-   visibilidad a dependencias directas y reescribe nombres
-   canónicos antes del type checker.
-10. `reimer-lint` deriva diagnósticos editoriales, inferencia visible,
-   antipatrones y estimaciones de allocator desde el frontend real.
-11. `reimer-lsp` sirve esas capacidades a VS Code mediante LSP y vuelve a
-    analizar al cambiar manifest o lockfile; la gramática
-    TextMate queda limitada al resaltado lexical.
-12. `std::tensor` construye tensors propietarios sobre `Vec<T>` y expone vistas
-    scoped; el resolver propaga el préstamo de agregados que contienen
-    referencias y el backend copia agregados con semántica de valor real.
+1. `reimer-lexer` transforms UTF-8 into tokens and preserves byte spans.
+2. `reimer-parser` builds an AST faithful to the syntax and recovers from
+   errors at statement and declaration boundaries.
+3. `reimer-resolver` resolves functions, bindings, and type names; it checks
+   types, mutability, arity, storage cycles, and control flow.
+4. `reimer-hir` represents the typed program through function, local, and
+   composite-type IDs; the backend does not depend on the AST.
+5. `reimer-layout` computes one native representation shared by reflection and
+   codegen; `reimer-codegen-native` lowers HIR to Cranelift with checked
+   overflow and division.
+6. `reimer-project` validates `reimer.toml`, resolves path/Git dependencies,
+   synchronizes `reimer.lock`, and builds a portable graph.
+7. `reimer-cli` exposes the complete
+   `new/init/check/build/run/test/fmt/clean/add/remove` cycle and retains
+   `emit-object` for standalone files.
+8. `reimer-diagnostics` renders errors with a code, location, source excerpt,
+   and optional help.
+9. `reimer-package` discovers modules, resolves `::` imports, limits visibility
+   to direct dependencies, and rewrites canonical names before type checking.
+10. `reimer-lint` derives editor diagnostics, visible inference, antipatterns,
+    and allocator estimates from the real frontend.
+11. `reimer-lsp` serves those capabilities to VS Code through LSP and
+    reanalyzes changes to a manifest or lockfile; the TextMate grammar is
+    limited to lexical highlighting.
+12. `std::tensor` builds owned tensors over `Vec<T>` and exposes scoped views;
+    the resolver propagates borrows from aggregates containing references, and
+    the backend copies aggregates with real value semantics.
 
-## Decisiones de alcance
+## Scope decisions
 
-- M1 reconoce funciones con parámetros `i32`/`bool`/`()`, retorno explícito u
-  omitido, bloques con valor, `let`, `let mut`, shadowing, asignación simple y
-  compuesta, operadores aritméticos/comparativos/lógicos, llamadas directas,
-  `if`, `while`, `break`, `continue` y `return`.
-- Los imports, reexports, paths absolutos, `self::` y `super::` se resuelven
-  estáticamente en paquetes multarchivo.
-- El único programa enlazable por ahora es `fn main() -> i32`.
-- Cranelift es un backend reemplazable. El AST no contiene detalles del backend.
-- `run` usa JIT y `build` produce un objeto nativo. El enlazado autónomo se
-  añadirá junto al runtime de arranque de cada plataforma.
-- El runtime encapsula los límites de FFI, allocator y E/S; los programas usan
-  wrappers seguros de la biblioteca estándar.
+- M1 recognizes functions with `i32`/`bool`/`()` parameters, explicit or
+  omitted returns, value blocks, `let`, `let mut`, shadowing, simple and
+  compound assignment, arithmetic/comparison/logical operators, direct calls,
+  `if`, `while`, `break`, `continue`, and `return`.
+- Imports, reexports, absolute paths, `self::`, and `super::` are resolved
+  statically in multi-file packages.
+- The only currently linkable entry point is `fn main() -> i32`.
+- Cranelift is a replaceable backend. The AST contains no backend details.
+- `run` uses JIT and `build` produces a native object. Standalone linking will
+  be added with the startup runtime for each platform.
+- The runtime encapsulates FFI, allocator, and I/O boundaries; programs use
+  safe standard-library wrappers.
 
-Las decisiones sintácticas y semánticas congeladas se encuentran en
+Frozen syntax and semantic decisions are recorded in
 [`language-decisions-v0.1.md`](language-decisions-v0.1.md).
 
 ## M7 Tensor
 
-`tensor<T, Rank>` usa almacenamiento contiguo row-major, conserva
-`shape: [usize; Rank]` y `strides: [usize; Rank]`, y no oculta allocations.
-`TensorView` y `TensorViewMut` almacenan slices scoped: el type checker impide
-que sobrevivan al tensor propietario o queden ocultos dentro de storage raw.
-La sintaxis `value[i, j]` se baja al protocolo comprobado de indexación del
-tipo, por lo que los fallos terminan en `panic` y nunca en acceso fuera de
-bounds. Los kernels que escriben resultados reciben un output explícito.
+`tensor<T, Rank>` uses contiguous row-major storage and preserves
+`shape: [usize; Rank]` and `strides: [usize; Rank]`; allocations are never
+hidden. `TensorView` and `TensorViewMut` store scoped slices: the type checker
+prevents them from outliving the owned tensor or being hidden inside raw
+storage. The `value[i, j]` syntax lowers to the type's checked indexing
+protocol, so failures end in `panic`, never an out-of-bounds access. Kernels
+that write results receive an explicit output.
 
-## M8 Paquetes
+## M8 Packages
 
-El sistema declarativo está descrito en
-[`package-system.md`](package-system.md). Las identidades de path son relativas
-a la raíz para que el lockfile sobreviva a una reubicación. Git queda fijado a
-un commit; `--locked` impide cualquier deriva. Un root con `src/package.reim`
-se resuelve como biblioteca sin inventar un `main`.
+The declarative system is described in
+[`package-system.md`](package-system.md). Path identities are relative to the
+root so the lockfile survives relocation. Git is pinned to a commit;
+`--locked` prevents drift. A root with `src/package.reim` resolves as a library
+without inventing a `main`.
 
-## M9 Concurrencia
+## M9 Concurrency
 
-El runtime mantiene threads nativos, workers persistentes, colas locales y
-work stealing. `Send` y `Sync` se derivan estructuralmente; los punteros raw no
-implementan ninguno. `std::thread` encapsula locks, atomics, channels,
-barriers, semaphores y estado local por thread. `std::job` ofrece un pool fijo,
-jobs tipados y `parallel_for_mut` para slices, arrays y tensors.
+The runtime maintains native threads, persistent workers, local queues, and
+work stealing. `Send` and `Sync` are derived structurally; raw pointers
+implement neither. `std::thread` encapsulates locks, atomics, channels,
+barriers, semaphores, and thread-local state. `std::job` provides a fixed pool,
+typed jobs, and `parallel_for_mut` for slices, arrays, and tensors.
 
-Cada ejecución JIT posee una sesión de recursos. La limpieza espera únicamente
-los threads y pools de esa sesión antes de liberar el código generado, por lo
-que dos compilaciones ejecutadas en paralelo no interfieren. Las fronteras ABI
-privadas conservan bloques `unsafe` documentados; el programa usuario solo ve
-wrappers seguros.
+Each JIT execution owns a resource session. Cleanup waits only for that
+session's threads and pools before releasing generated code, so two concurrent
+compilations do not interfere. Private ABI boundaries keep documented `unsafe`
+blocks; user code sees only safe wrappers.
 
-La API y sus invariantes se describen en
+The API and its invariants are described in
 [`concurrency.md`](concurrency.md).
 
 ## M10 Comptime
 
-El resolver evalúa constantes, funciones y bloques `comptime` sin delegar
-operaciones al host. Impone presupuestos de pasos, profundidad y memoria, y
-rechaza E/S, FFI, threads, punteros, préstamos y llamadas runtime. El mismo
-layout validado que consume Cranelift alimenta `size_of<T>()` y `align_of<T>()`,
-evitando dos calculadores con resultados distintos.
+The resolver evaluates constants, functions, and `comptime` blocks without
+delegating operations to the host. It enforces step, depth, and memory budgets
+and rejects I/O, FFI, threads, pointers, borrows, and runtime calls. The same
+validated layout consumed by Cranelift powers `size_of<T>()` and
+`align_of<T>()`, avoiding divergent layout calculators.
 
-Los atributos se conservan en AST/HIR y se validan por destino. Los derives son
-una lista cerrada y estructural; `Clone` no puede ocultar un allocator. `@test`
-registra funciones unitarias y la CLI ejecuta cada una en un proceso JIT
-aislado. `@must_use` se publica como diagnóstico del linter/LSP.
+Attributes are preserved in AST/HIR and validated for their targets. Derives
+form a closed, structural list; `Clone` cannot hide an allocator. `@test`
+registers unit functions, and the CLI executes each one in an isolated JIT
+process. `@must_use` is published as a linter/LSP diagnostic.
 
-La sintaxis, los límites y las garantías se describen en
+Syntax, limits, and guarantees are described in
 [`metaprogramming.md`](metaprogramming.md).

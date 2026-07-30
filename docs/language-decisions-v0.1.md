@@ -1,13 +1,13 @@
-# Decisiones congeladas para Reimer v0.1
+# Frozen decisions for Reimer v0.1
 
-Este documento registra las decisiones de diseño aceptadas antes de continuar
-el frontend y el backend nativo. Tienen prioridad sobre las propuestas
-contradictorias del LDD v0.1-draft.
+This document records design decisions accepted before continuing the frontend
+and native backend. They take precedence over contradictory proposals in the
+v0.1 draft LDD.
 
-## D-001: paths con `::`
+## D-001: `::` paths
 
-`::` separa módulos, tipos y símbolos asociados. `.` se reserva para acceder a
-campos y llamar métodos sobre un valor.
+`::` separates modules, types, and associated symbols. `.` is reserved for
+field access and method calls on a value.
 
 ```reimer
 from game::math import Vec3;
@@ -21,10 +21,10 @@ player.position = origin;
 player.update(delta);
 ```
 
-Un path absoluto empieza por un paquete visible. Los paths relativos empiezan
-por `self::` o por uno o más segmentos `super::`. No se admite `import *`.
+An absolute path starts with a visible package. Relative paths begin with
+`self::` or one or more `super::` segments. `import *` is not supported.
 
-Formas de importación:
+Import forms:
 
 ```text
 import_item =
@@ -36,14 +36,15 @@ import_name = identifier , [ "as" , identifier ] ;
 path = identifier , { "::" , identifier } ;
 ```
 
-`from x::y import z;` introduce `z` en el módulo actual. `import x::y;`
-introduce el último segmento (`y`), salvo que exista un alias. Un path completo,
-como `x::y::z()`, puede usarse sin import si `x` es un paquete visible.
+`from x::y import z;` introduces `z` into the current module.
+`import x::y;` introduces the final segment (`y`) unless an alias is present.
+A complete path such as `x::y::z()` can be used without an import when `x` is
+a visible package.
 
-## D-002: tipo unidad
+## D-002: unit type
 
-El único tipo unidad es `()`. Una función sin retorno escrito devuelve `()`.
-`void` no es una palabra reservada.
+The only unit type is `()`. A function without a written return type returns
+`()`. `void` is not a reserved word.
 
 ```reimer
 fn update() {
@@ -55,30 +56,29 @@ fn save() -> Result<(), SaveError> {
 }
 ```
 
-En FFI, una función C sin valor de retorno se representa como una función Reimer
-que devuelve `()`. No se introduce un segundo tipo para este caso.
+In FFI, a C function with no return value is represented as a Reimer function
+returning `()`. No second unit-like type is introduced.
 
-## D-003: movimiento implícito al consumir
+## D-003: implicit moves on consumption
 
-Los valores no `Copy` se mueven automáticamente al asignarlos, pasarlos por
-valor, retornarlos o enviarlos por un channel. La expresión prefija `move` se
-elimina de v0.1.
+Non-`Copy` values move automatically when assigned, passed by value, returned,
+or sent through a channel. The `move` prefix expression is removed from v0.1.
 
 ```reimer
 let texture = Texture::load(allocator, path)?;
 let second = texture;
-render(texture); // error: `texture` ya fue movido
-render(second);  // válido; consume `second`
+render(texture); // error: `texture` was already moved
+render(second);  // valid; consumes `second`
 ```
 
-Los préstamos `&T` y `&mut T` no consumen el valor. Solo los tipos que
-implementan `Copy` se duplican implícitamente.
+`&T` and `&mut T` borrows do not consume a value. Only types implementing
+`Copy` are duplicated implicitly.
 
-## D-004: representación de `str`
+## D-004: `str` representation
 
-`str` es una vista UTF-8 inmutable, no propietaria y `Copy`, representada
-conceptualmente por `(pointer, length)`. Se pasa por valor y nunca asigna
-memoria. No se escribe `&str` en v0.1.
+`str` is an immutable, non-owning, `Copy` UTF-8 view represented conceptually
+as `(pointer, length)`. It is passed by value and never allocates. v0.1 does not
+spell it `&str`.
 
 ```reimer
 fn load(path: str) -> Result<Asset, AssetError>;
@@ -88,22 +88,21 @@ let owned = String::from(allocator, name)?;
 let view: str = owned.as_str();
 ```
 
-`String` es el buffer propietario, move-only, con longitud, capacidad y
-allocator. Una vista `str` no puede sobrevivir al almacenamiento que contiene
-sus bytes. El type checker aplicará las mismas reglas scoped conservadoras que
-para otras vistas no propietarias.
+`String` is the move-only owned buffer with a length, capacity, and allocator.
+A `str` view cannot outlive the storage containing its bytes. The type checker
+applies the same conservative scoped rules used for other non-owning views.
 
-## D-005: copia explícita de valores propietarios
+## D-005: explicit copies of owned values
 
-v0.1 admite `Clone` únicamente como derive cerrado para valores cuya copia sea
-infalible, no asigne y no necesite un allocator. Esto evita que una llamada
-uniforme oculte asignaciones, fallos o semántica específica de recursos.
+v0.1 supports `Clone` only as a closed derive for values whose copy is
+infallible, allocation-free, and allocator-independent. A uniform call cannot
+hide allocations, failures, or resource-specific semantics.
 
-- `Copy` significa duplicación implícita, bit a bit, infalible y sin allocator.
-- `Clone` derivado significa duplicación explícita con esas mismas restricciones.
-- Los contenedores propietarios ofrecen `clone_in(allocator)`.
-- Los recursos ofrecen operaciones con nombre semántico, como
-  `duplicate_handle()` o `retain()`.
+- `Copy` means implicit, bitwise, infallible duplication without an allocator.
+- Derived `Clone` means explicit duplication with the same restrictions.
+- Owned containers provide `clone_in(allocator)`.
+- Resources provide semantic operations such as `duplicate_handle()` or
+  `retain()`.
 
 ```reimer
 @derive(Copy, Clone)
@@ -117,80 +116,78 @@ let copy = bytes.clone_in(allocator)?;
 let handle = texture.duplicate_handle()?;
 ```
 
-Un tipo propietario, un campo no `Copy` o cualquier clon que pueda fallar
-impide derivar `Clone`. Cuando existan suficientes implementaciones reales se
-podrá añadir un trait `CloneIn`, manteniendo el allocator y el posible error
-visibles en la firma.
+An owned type, a non-`Copy` field, or any copy that can fail prevents deriving
+`Clone`. Once enough real implementations exist, a `CloneIn` trait may be
+added while keeping the allocator and possible failure visible in the
+signature.
 
-## D-006: backend nativo
+## D-006: native backend
 
-El backend C se elimina. El backend inicial usa Cranelift para generar código
-máquina y objetos nativos.
+The C backend is removed. The initial backend uses Cranelift to generate
+machine code and native objects.
 
 ```text
-Fuente .reim
-  -> lexer y parser
-  -> resolución y type checking
-  -> HIR tipado
-  -> IR de Cranelift
-  -> JIT para `reimer run`
-  -> objeto nativo para `reimer build`
-  -> runtime + LLD para el ejecutable final
+.reim source
+  -> lexer and parser
+  -> resolution and type checking
+  -> typed HIR
+  -> Cranelift IR
+  -> JIT for `reimer run`
+  -> native object for `reimer build`
+  -> runtime + LLD for the final executable
 ```
 
-La generación de objeto no equivale al enlazado. Cada plataforma necesita un
-runtime de arranque, ABI, librerías del sistema y configuración de LLD. M0
-entrega JIT ejecutable y objeto nativo; el ejecutable autónomo se añade como el
-siguiente incremento del backend.
+Object generation is not linking. Each platform needs a startup runtime, ABI,
+system libraries, and LLD configuration. M0 provides executable JIT and native
+objects; standalone executables are a later backend increment.
 
-Las operaciones con semántica Reimer no se delegan ciegamente al host:
+Operations with Reimer semantics are not delegated blindly to the host:
 
-- overflow entero comprobado;
-- división y resto por cero comprobados;
-- shifts validados;
-- bounds checks activos;
-- traps convertidos en `panic` del runtime.
+- checked integer overflow;
+- checked division and remainder by zero;
+- validated shifts;
+- active bounds checks;
+- traps converted to runtime `panic`.
 
-El lowering debe usar instrucciones checked de Cranelift o bloques explícitos
-que llamen al runtime. Nunca dependerá del comportamiento indefinido de otro
-lenguaje.
+Lowering must use checked Cranelift instructions or explicit blocks that call
+the runtime. It must never depend on undefined behavior from another language.
 
-## D-007: E/S estándar segura
+## D-007: safe standard I/O
 
-`std::io` ofrece `stdin()`, `stdout()` y `stderr()` como handles seguros. Las
-operaciones públicas devuelven `Result`; un programa usuario no necesita
-`unsafe` para leer, escribir o hacer flush.
+`std::io` exposes `stdin()`, `stdout()`, and `stderr()` as safe handles. Public
+operations return `Result`; user code does not need `unsafe` to read, write, or
+flush.
 
 ```reimer
 from std::alloc import general_allocator;
 from std::io import println, stdin;
 
 let allocator = general_allocator();
-println("Escribe una línea:")?;
+println("Enter a line:")?;
 let input = stdin();
 let line = input.read_line(&allocator, 4096)?;
 defer line.deinit();
 ```
 
-Las lecturas siempre reciben una capacidad explícita y devuelven un
-`InputBuffer` propietario con longitud inicializada separada de la capacidad de
-la asignación. `read_line` conserva el salto de línea, `read_exact` distingue
-el EOF anticipado y `read_to_end` termina al alcanzar EOF o la capacidad.
+Reads always receive an explicit capacity and return an owned `InputBuffer`
+whose initialized length is separate from allocated capacity. `read_line`
+retains the newline, `read_exact` distinguishes early EOF, and `read_to_end`
+stops at EOF or capacity.
 
-La frontera privada entre `std::io` y el runtime usa punteros acotados por
-`(pointer, length)`. Todo `unsafe` queda concentrado en estos adaptadores,
-documentado con sus precondiciones y cubierto por pruebas; no forma parte de la
-API segura del programa. Los locks, iteradores de líneas, `read_to_string`,
-vectored I/O y los adapters genéricos se completan junto con traits, `String` y
-los contenedores propietarios de M6.
+The private boundary between `std::io` and the runtime uses pointers bounded by
+`(pointer, length)`. All `unsafe` is concentrated in these adapters,
+documented with preconditions, and covered by tests; it is not part of the
+program's safe public API. Locks, line iterators, `read_to_string`, vectored
+I/O, and generic adapters are completed alongside traits, `String`, and owned
+containers.
 
-## D-008: tensors y vistas scoped
+## D-008: tensors and scoped views
 
-`tensor<T, Rank>` es propietario y move-only. Su `Rank` es un const generic,
-su forma es runtime y su almacenamiento inicial es contiguo row-major.
-`TensorView` y `TensorViewMut` son agregados scoped: pueden contener slices,
-pero el resolver propaga su préstamo y prohíbe ocultarlos dentro de storage
-propietario basado en punteros raw.
+`tensor<T, Rank>` is owned and move-only. `Rank` is a const generic, shape is a
+runtime value, and initial storage is contiguous row-major. `TensorView` and
+`TensorViewMut` are scoped aggregates: they may contain slices, but the
+resolver propagates their borrow and prevents them from being hidden in
+raw-pointer-backed owned storage.
 
 ```reimer
 let shape: [usize; 2] = [1000, 3];
@@ -203,15 +200,15 @@ let position = positions.get([10, 2]); // Option<&f32>
 let view = positions.view();
 ```
 
-Una operación que crea almacenamiento recibe allocator. Los kernels que no
-asignan, como `add_into` y `matmul_into`, reciben un output mutable explícito.
-Los accesos `[]` conservan bounds checks en todos los perfiles.
+An operation that creates storage receives an allocator. Nonallocating kernels
+such as `add_into` and `matmul_into` receive an explicit mutable output.
+`[]` access retains bounds checks in every profile.
 
-## D-009: paquetes declarativos y lockfile portable
+## D-009: declarative packages and portable lockfile
 
-`reimer.toml` describe identidad SemVer, edición, dependencias y perfiles. No
-admite scripts de build ni plugins ejecutables. Un paquete solo puede importar
-dependencias directas y los ciclos se rechazan antes del frontend.
+`reimer.toml` describes SemVer identity, edition, dependencies, and profiles.
+It permits neither build scripts nor executable plugins. A package may only
+import direct dependencies, and cycles are rejected before the frontend.
 
 ```toml
 [package]
@@ -224,36 +221,33 @@ physics = { path = "../physics", version = "^0.1" }
 assets = { git = "https://example.com/assets.git", tag = "0.4.0" }
 ```
 
-`reimer.lock` fija el grafo exacto, checksums de fuentes path y commits Git.
-Los paths se serializan relativos a la raíz: reubicar el árbol completo no
-cambia el lockfile. `--locked` falla si falta o deriva; `--refresh` vuelve a
-resolver referencias Git.
+`reimer.lock` pins the exact graph, path-source checksums, and Git commits.
+Paths are serialized relative to the root: relocating the complete tree does
+not change the lockfile. `--locked` fails when the lockfile is missing or has
+drifted; `--refresh` resolves Git references again.
 
-`src/main.reim` define un ejecutable y `src/package.reim` una biblioteca. Las
-pruebas de integración bajo `tests/` son programas independientes cuyo `main`
-retorna `0` al pasar. Los perfiles `debug` y `release` controlan realmente la
-estrategia de optimización de Cranelift.
+`src/main.reim` defines an executable and `src/package.reim` a library.
+Integration tests under `tests/` are independent programs whose `main` returns
+`0` on success. `debug` and `release` profiles control real Cranelift
+optimization strategy.
 
-## D-010: concurrencia estructurada y runtime aislado
+## D-010: structured concurrency and isolated runtime
 
-`Send` y `Sync` son capacidades estructurales conocidas por el compilador. Un
-agregado las satisface únicamente si todos sus campos las satisfacen; los
-punteros raw no son `Send` ni `Sync`. Los threads nativos solo reciben datos
-propietarios y los préstamos locales se limitan a `scope`, que garantiza el
-join antes de devolver.
+`Send` and `Sync` are structural capabilities known to the compiler. An
+aggregate satisfies one only when every field satisfies it; raw pointers are
+neither `Send` nor `Sync`. Native threads receive only owned data, and local
+borrows are limited to `scope`, which guarantees a join before returning.
 
-El job system usa un número fijo de workers persistentes, colas locales y work
-stealing. `parallel_for_mut` crea slices mutables no solapados y espera todos
-los chunks dentro de la misma llamada. El préstamo del array, slice o tensor
-original permanece exclusivo hasta ese punto.
+The job system uses a fixed number of persistent workers, local queues, and
+work stealing. `parallel_for_mut` creates nonoverlapping mutable slices and
+waits for every chunk in the same call. The original array, slice, or tensor
+remains exclusively borrowed until that point.
 
-Locks, channels, atomics, barriers, semaphores y thread-local storage son APIs
-seguras de `std::thread`. Los atomics de v0.1 son secuencialmente consistentes.
-Las llamadas ABI y los function thunks permanecen privados y documentan cada
-uso de `unsafe`.
+Locks, channels, atomics, barriers, semaphores, and thread-local storage are
+safe `std::thread` APIs. v0.1 atomics are sequentially consistent. ABI calls
+and function thunks remain private and document every use of `unsafe`.
 
-Cada programa JIT obtiene una sesión de runtime. Sus threads y pools conservan
-esa identidad, y el backend solo espera o destruye los recursos de la sesión
-que está terminando. Esto evita interferencias entre compilaciones concurrentes
-sin permitir que código generado siga ejecutándose después de liberar su
-módulo.
+Each JIT program receives a runtime session. Its threads and pools preserve
+that identity, and the backend waits for or destroys only the resources of the
+session being terminated. Concurrent compilations cannot interfere, and
+generated code cannot continue after its module is released.

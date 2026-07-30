@@ -1,48 +1,50 @@
-# Cobertura de implementación del LDD
+# LDD implementation coverage
 
-Esta matriz usa el roadmap del LDD v0.1 y las decisiones congeladas en
-[`language-decisions-v0.1.md`](language-decisions-v0.1.md). Un hito solo se
-considera completo cuando tiene especificación, implementación, pruebas
-positivas y negativas y un programa `.reim` ejecutable.
+This matrix follows the v0.1 LDD roadmap and the decisions frozen in
+[`language-decisions-v0.1.md`](language-decisions-v0.1.md). A milestone is only
+complete when it has a specification, implementation, positive and negative
+tests, and an executable `.reim` program.
 
-| Hito | Estado | Evidencia actual | Trabajo restante |
+| Milestone | Status | Current evidence | Remaining work |
 |---|---|---|---|
-| M0 — Esqueleto | Completo | Workspace Rust, CLI, spans, diagnósticos, JIT y objeto nativo; `examples/exit_42.reim` | Enlazado autónomo pertenece al runtime nativo |
-| M1 — Lenguaje básico | Completo | Precedencia, `let`/`let mut`, shadowing, asignación, funciones, `if`, `while`, `break`, `continue`, HIR tipada y `examples/m1_language.reim` | Los tipos y controles adicionales pertenecen a M2 |
-| M2 — Tipos | Completo | Todos los escalares (`i8`…`i128`, `u8`…`u128`, tamaños de puntero, `f32`/`f64`, `bool`, `char`, `()` y `never`); structs, enums, tuplas, arrays, slices y referencias con layouts nativos; constructores, campos, índices comprobados, mutación de places, ABI de agregados; `match` exhaustivo con guards y patrones, `for` y `loop` con valor; tres programas M2 ejecutables | — |
-| M3 — Errores y memoria | Completo | Referencias `&T`/`&mut T`, punteros raw limitados por `unsafe`, slices con bounds checks e iteración, `str` UTF-8 como vista `(pointer, length)`, `Option`, `Result`, `?`, movimientos implícitos, `Copy`, `defer` y `panic`; allocators general, page, arena y fixed-buffer con OOM recuperable; stdin/stdout/stderr seguros con lecturas acotadas, escritura parcial/completa, flush, terminal y conversión UTF-8 sin copia; `String` con crecimiento y `clone_in`; `Vec`, `HashMap`, `HashSet` y `RingBuffer` propietarios; diez programas M3 y pruebas nativas | — |
-| M4 — Módulos | Completo | Descubrimiento multarchivo, `package.reim`, imports selectivos y de módulo, aliases, reexports, `self::`/`super::`, acceso absoluto `x::y::z`, privacidad, ciclos completos, ambigüedades y diagnósticos por archivo; `examples/m4_modules/main.reim` ejecutable | — |
-| M5 — FFI | Completo | Bloques `@link(...) extern "C"`, símbolos preservados, `@repr(C)`, `cstr` y literales `c"..."` con NUL validado, tipos ABI-safe, llamadas obligatoriamente `unsafe`, wrappers seguros, carga dinámica en JIT y directivas COFF `/DEFAULTLIB`; `examples/m5_ffi.reim` prueba llamadas escalares y `examples/m5_sdl_window.reim` abre y cierra una ventana SDL3 real mediante `defer`; descarga oficial reproducible y verificada por SHA-256 en `scripts/run-sdl-demo.ps1` | El enlazado autónomo completo pertenece al runtime/tooling; la clasificación de agregados C por valor puede ampliarse cuando un binding real la necesite |
-| M6 — Generics | Completo | Parámetros de tipo y `const`, defaults, bounds y cláusulas `where`; monomorfización bajo demanda y cacheada de funciones, structs, enums, funciones asociadas y métodos; inferencia desde argumentos y retorno esperado; traits, supertraits, coherencia básica, validación de contratos, markers `Copy` y despacho estático; `examples/m6_methods.reim` y `examples/m6_generics.reim` ejecutables, este último verificado por JIT con resultado `42` | — |
-| M7 — Tensor | Completo | `tensor<T, Rank>` move-only con `Vec<T>` contiguo y allocator explícito; shape/strides row-major, overflow de forma recuperable, `TensorView`/`TensorViewMut` scoped, `get` por referencia, indexación multidimensional `[]` comprobada, `fill`, `multiply_scalar`, `add_into` y `matmul_into`; demos `m7_tensor.reim` y `m7_matmul.reim`, pruebas de lifetime y copia real de agregados | — |
-| M8 — Paquetes | Completo | `reimer.toml` estricto, SemVer, perfiles, lockfile reproducible y portable, checksums, path/git fijado por commit, unificación, ciclos y visibilidad directa; CLI `new/init/check/build/run/test/fmt/clean/add/remove`; paquetes ejecutables y biblioteca, tests ordenados, ejemplo `m8_packages`, linter/LSP conscientes del manifest | Registry y publicación pertenecen a un hito posterior según el LDD |
-| M9 — Concurrencia | Completo | Function pointers tipados; `Send`/`Sync` estructurales sin punteros raw; threads nativos y scoped; `Mutex`, `RwLock`, `Channel`, `Barrier`, `Semaphore`, atomics y `ThreadLocal`; pool fijo con colas locales/work stealing, jobs tipados y `parallel_for_mut` para slices, arrays y tensors; sesiones JIT aisladas; cinco demos positivas y tres pruebas negativas de préstamos/transferencia | Async, fibers, scheduler ECS y ordenamientos atómicos configurables están fuera de v0.1 |
-| M10 — Comptime | Completo | Constantes globales tipadas y const generics; funciones/bloques `comptime` deterministas con límites; `@repr`, `@derive`, `@align`, `@inline`, `@test` y `@must_use`; derives cerrados `Copy`, `Clone`, `Debug`, `Eq`, `Hash` y `Default`; reflexión tipada `size_of`, `align_of` y `meta::*`; layout compartido entre reflexión y Cranelift; tests unitarios aislados y `examples/m10_comptime.reim` verificado por JIT | `@inline` es una sugerencia del frontend; una política avanzada de inlining y reflexión runtime quedan fuera de v0.1 |
+| M0 - Skeleton | Complete | Rust workspace, CLI, spans, diagnostics, JIT, and native object; `examples/exit_42.reim` | Standalone linking belongs to the native runtime |
+| M1 - Basic language | Complete | Precedence, `let`/`let mut`, shadowing, assignment, functions, `if`, `while`, `break`, `continue`, typed HIR, and `examples/m1_language.reim` | Additional types and control flow belong to M2 |
+| M2 - Types | Complete | All scalars (`i8`...`i128`, `u8`...`u128`, pointer-sized integers, `f32`/`f64`, `bool`, `char`, `()`, and `never`); structs, enums, tuples, arrays, slices, and references with native layouts; constructors, fields, checked indexes, place mutation, aggregate ABI; exhaustive `match` with guards and patterns, `for`, and value-producing `loop`; three executable M2 programs | - |
+| M3 - Errors and memory | Complete | `&T`/`&mut T`, raw pointers limited by `unsafe`, slices with bounds checks and iteration, UTF-8 `str` as `(pointer, length)`, `Option`, `Result`, `?`, implicit moves, `Copy`, `defer`, and `panic`; general, page, arena, and fixed-buffer allocators with recoverable OOM; safe stdin/stdout/stderr with bounded reads, partial/full writes, flush, terminal detection, and zero-copy UTF-8 conversion; growing `String` with `clone_in`; owned `Vec`, `HashMap`, `HashSet`, and `RingBuffer`; ten M3 programs and native tests | - |
+| M4 - Modules | Complete | Multi-file discovery, `package.reim`, selective and module imports, aliases, reexports, `self::`/`super::`, absolute `x::y::z` access, privacy, complete cycle and ambiguity diagnostics by file; executable `examples/m4_modules/main.reim` | - |
+| M5 - FFI | Complete | `@link(...) extern "C"` blocks, preserved symbols, `@repr(C)`, `cstr` and validated `c"..."` literals, ABI-safe types, mandatory `unsafe` calls, safe wrappers, JIT dynamic loading, and COFF `/DEFAULTLIB` directives; `examples/m5_ffi.reim` tests scalar calls and `examples/m5_sdl_window.reim` opens and closes a real SDL3 window through `defer`; reproducible official download with SHA-256 verification in `scripts/run-sdl-demo.ps1` | Full standalone linking belongs to runtime/tooling; by-value C aggregate classification can grow when a real binding requires it |
+| M6 - Generics | Complete | Type and `const` parameters, defaults, bounds, and `where` clauses; demand-driven cached monomorphization of functions, structs, enums, associated functions, and methods; inference from arguments and expected returns; traits, supertraits, basic coherence, contract validation, `Copy` markers, and static dispatch; executable `examples/m6_methods.reim` and `examples/m6_generics.reim`, with the latter verified by JIT result `42` | - |
+| M7 - Tensor | Complete | Move-only `tensor<T, Rank>` with contiguous `Vec<T>` and explicit allocator; row-major shape/strides, recoverable shape overflow, scoped `TensorView`/`TensorViewMut`, reference-returning `get`, checked multidimensional `[]`, `fill`, `multiply_scalar`, `add_into`, and `matmul_into`; `m7_tensor.reim` and `m7_matmul.reim` demos, lifetime tests, and real aggregate copies | - |
+| M8 - Packages | Complete | Strict `reimer.toml`, SemVer, profiles, reproducible portable lockfile, checksums, path/Git sources pinned by commit, unification, cycles, and direct visibility; CLI `new/init/check/build/run/test/fmt/clean/add/remove`; executable and library packages, ordered tests, `m8_packages` example, manifest-aware linter/LSP | Registry and publishing belong to a later LDD milestone |
+| M9 - Concurrency | Complete | Typed function pointers; structural `Send`/`Sync` without raw pointers; native and scoped threads; `Mutex`, `RwLock`, `Channel`, `Barrier`, `Semaphore`, atomics, and `ThreadLocal`; fixed pool with local queues/work stealing, typed jobs, and `parallel_for_mut` for slices, arrays, and tensors; isolated JIT sessions; five positive demos and three negative borrow/transfer tests | Async, fibers, an ECS scheduler, and configurable atomic orderings are outside v0.1 |
+| M10 - Comptime | Complete | Typed global constants and const generics; deterministic `comptime` functions/blocks with limits; `@repr`, `@derive`, `@align`, `@inline`, `@test`, and `@must_use`; closed derives `Copy`, `Clone`, `Debug`, `Eq`, `Hash`, and `Default`; typed `size_of`, `align_of`, and `meta::*` reflection; layout shared by reflection and Cranelift; isolated unit tests and JIT-verified `examples/m10_comptime.reim` | `@inline` is a frontend hint; advanced inlining policy and runtime reflection are outside v0.1 |
 
-## Herramientas de editor
+## Editor tooling
 
-`reimer-lint` reutiliza el lexer, parser, resolver, grafo de paquetes y HIR del compilador para
-producir diagnósticos, typos con quick fix, tipos inferidos, antipatrones y
-estimaciones estáticas de allocator. `reimer-lsp` los publica por LSP junto con
-hover, inlay hints, completado, definiciones, símbolos, CodeLens y organización
-de imports. Los cambios en `reimer.toml` o `reimer.lock` reanalizan los
-documentos abiertos. `editors/vscode` aporta el resaltado TextMate y empaqueta el servidor
-para que los archivos `.reim` funcionen sin una extensión de Rust o Pylance.
+`reimer-lint` reuses the compiler's lexer, parser, resolver, package graph, and
+HIR to produce diagnostics, typo quick fixes, inferred types, antipatterns, and
+static allocator estimates. `reimer-lsp` publishes them through LSP together
+with hover, inlay hints, completion, definitions, symbols, CodeLens, and import
+organization. Changes to `reimer.toml` or `reimer.lock` reanalyze open
+documents. `editors/vscode` provides TextMate highlighting and bundles the
+server and client so `.reim` files work without a Rust or Pylance extension.
+The active in-memory document participates in full package resolution before
+it is saved.
 
-## Diferencias deliberadas frente al borrador
+## Deliberate differences from the draft
 
-- El backend C fue sustituido por generación nativa con Cranelift.
-- Los paths usan `::`; `.` queda reservado para campos y métodos.
-- El único tipo unidad es `()`.
-- Los movimientos de valores no `Copy` son implícitos.
-- `str` es una vista UTF-8 no propietaria `(pointer, length)`.
-- `Clone` derivado solo existe para valores cuya copia es infalible y no asigna;
-  las copias propietarias siguen usando APIs que hacen visible el allocator o
-  la operación de recurso.
+- Native Cranelift generation replaced the C backend.
+- Paths use `::`; `.` is reserved for fields and methods.
+- The only unit type is `()`.
+- Moves of non-`Copy` values are implicit.
+- `str` is a non-owning UTF-8 `(pointer, length)` view.
+- Derived `Clone` only exists for values whose copy is infallible and
+  allocation-free; owned copies still expose their allocator or resource
+  operation.
 
-## Gates permanentes
+## Permanent gates
 
-Cada hito debe mantener en verde:
+Every milestone must keep these commands green:
 
 ```text
 cargo fmt --all --check
@@ -50,7 +52,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -W clippy::perf -W clippy::redundant_clone -W clippy::needless_collect -D warnings
 ```
 
-Además, `reimer check` debe ejecutar todo el frontend sin codegen, `reimer run`
-debe ejecutar al menos un programa representativo y `reimer build` debe
-producir un objeto nativo válido hasta que el runtime de arranque permita
-enlazar ejecutables autónomos.
+In addition, `reimer check` must run the complete frontend without codegen,
+`reimer run` must execute at least one representative program, and
+`reimer build` must produce a valid native object until the startup runtime can
+link standalone executables.

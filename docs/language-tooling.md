@@ -1,86 +1,85 @@
-# Tooling de lenguaje y VS Code
+# Language tooling and VS Code
 
-El tooling usa una sola fuente de verdad: `reimer-lint` consume las APIs
-públicas del lexer, parser y resolver, y `reimer-lsp` transforma ese análisis a
-LSP. La gramática TextMate se mantiene conforme a los tokens reales, pero solo
-se ocupa de color; nunca decide si un programa es válido.
+The tooling has one source of truth: `reimer-lint` consumes the public lexer,
+parser, and resolver APIs, while `reimer-lsp` translates that analysis to LSP.
+The TextMate grammar follows real tokens but only controls color; it never
+decides whether a program is valid.
 
-## Componentes
+## Components
 
-- `crates/reimer-lint`: diagnósticos del compilador, lints de antipatrones,
-  quick fixes, organización de imports, índice de tipos inferidos, enlaces
-  locales de definición y estimación de allocators.
-- `crates/reimer-lsp`: servidor por stdin/stdout con sincronización completa,
-  diagnósticos push, hover, go-to-definition intradocumento, símbolos,
-  completado, code actions, inlay hints y CodeLens.
-- `editors/vscode`: reconocimiento `.reim`, gramática TextMate original,
-  configuración de pares/indentación, snippets y cliente LSP.
+- `crates/reimer-lint`: compiler diagnostics, antipattern lints, quick fixes,
+  import organization, inferred-type indexes, local definition links, and
+  allocator estimates.
+- `crates/reimer-lsp`: stdin/stdout server with full synchronization, pushed
+  diagnostics, hover, intradocument go-to-definition, symbols, completion,
+  code actions, inlay hints, and CodeLens.
+- `editors/vscode`: `.reim` recognition, original TextMate grammar,
+  pair/indentation configuration, snippets, and the LSP client.
 
-El protocolo LSP se mantiene separado de la lógica de análisis. Esto permite
-probar offsets UTF-8/UTF-16, acciones y estimaciones sin levantar VS Code.
+The LSP protocol remains separate from analysis logic. UTF-8/UTF-16 offsets,
+actions, and estimates can therefore be tested without launching VS Code.
 
-## Reglas editoriales
+## Editor rules
 
-La acción `source.organizeImports`:
+The `source.organizeImports` action:
 
-1. coloca los imports de `std` primero;
-2. ordena paths con el separador canónico `::`;
-3. ordena y deduplica nombres de imports selectivos;
-4. no produce un edit si encuentra comentarios dentro de la sección, evitando
-   perder o reasociar documentación.
+1. places `std` imports first;
+2. sorts paths with the canonical `::` separator;
+3. sorts and deduplicates names in selective imports;
+4. declines to edit when comments occur inside the section, avoiding lost or
+   reassociated documentation.
 
-Los typos se comparan con símbolos, bindings, campos, imports, tipos primitivos
-y nombres core visibles en el documento. Solo se ofrece un reemplazo cuando la
-distancia de edición es pequeña; la validación final sigue perteneciendo al
-resolver.
+Typo detection compares symbols, bindings, fields, imports, primitive types,
+and core names visible in the document. A replacement is offered only for a
+small edit distance; final validation still belongs to the resolver.
 
-Los lints propios incluyen, entre otros:
+Language-specific lints include:
 
-- `L1001`: imports no canónicos;
-- `L2001`: `mut` que nunca recibe una asignación;
-- `L2002`: comparación redundante con booleanos;
-- `L2003`: `while true` en lugar de `loop`;
-- `L2004`: bloque `unsafe` vacío;
-- `L2010`: owner de allocation/string/input buffer sin cleanup o transferencia
-  visible.
+- `L1001`: noncanonical imports;
+- `L2001`: `mut` that never receives an assignment;
+- `L2002`: redundant comparison with a boolean;
+- `L2003`: `while true` instead of `loop`;
+- `L2004`: empty `unsafe` block;
+- `L2010`: allocation/string/input-buffer owner without visible cleanup or
+  transfer;
+- `L2020`: discarded `@must_use` function or value.
 
-`reimer-lint` también puede ejecutarse directamente:
+`reimer-lint` can also run directly:
 
 ```text
 cargo run -p reimer-lint -- examples/exit_42.reim
 cargo run -p reimer-lint -- --deny-warnings examples/exit_42.reim
 ```
 
-## Inferencia y allocators
+## Inference and allocators
 
-Cuando el resolver produce HIR, el servidor indexa el tipo de expresiones y
-bindings sin anotación. Los hovers e inlay hints muestran esa inferencia, no una
-heurística paralela.
+When the resolver produces HIR, the server indexes expression types and
+unannotated bindings. Hover and inlay hints display compiler inference, not a
+parallel heuristic.
 
-Las cifras de memoria siempre dicen **static estimate**. Actualmente se
-reconocen reservas explícitas de bytes, buffers de entrada acotados, fixed
-buffers, `String::from`, `clone_in` dinámico y operaciones de capacidad con
-allocator. Se evalúa aritmética constante checked y se distinguen:
+Memory figures always say **static estimate**. The analyzer currently
+recognizes explicit byte reservations, bounded input buffers, fixed buffers,
+`String::from`, dynamic `clone_in`, and allocator-backed capacity operations.
+It evaluates checked constant arithmetic and distinguishes:
 
-- bytes exactos por llamada;
-- límite máximo;
-- bytes por iteración cuando la operación está dentro de un loop;
-- tamaño dinámico cuando depende del runtime.
+- exact bytes per call;
+- maximum bounds;
+- bytes per iteration when an operation is inside a loop;
+- dynamic size when it depends on runtime data.
 
-La suma no pretende representar el pico de memoria: no inventa conteos de
-iteraciones, exclusión entre ramas ni lifetimes que el análisis no ha probado.
+The sum does not claim to be peak memory: it does not invent iteration counts,
+branch exclusion, or lifetimes that analysis has not proved.
 
-## Paquetes y snapshots
+## Packages and snapshots
 
-Un archivo sin imports se resuelve directamente desde el buffer abierto. Para
-paquetes multiarchivo guardados, el servidor usa el package loader y vuelve a
-resolver el programa canónico. Mientras hay cambios intermodulares sin guardar,
-se mantienen lexer/parser/lints locales y la semántica intermodular vuelve a
-actualizarse al guardar.
+The active document is always resolved from its in-memory snapshot. When it has
+imports, the package loader overlays that snapshot onto the package graph and
+reads dependency modules from disk before rebuilding the canonical program.
+Changes in another open module become visible after that module is saved.
 
-## Instalación y verificación
+## Installation and verification
 
-El VSIX autocontenido para Windows se genera con:
+Generate the self-contained Windows VSIX with:
 
 ```text
 cd editors/vscode
@@ -89,17 +88,19 @@ npm test
 npm run package
 ```
 
-El paquete `reimer-language-win32-x64-0.1.0.vsix` incluye
-`extension/server/reimer-lsp.exe`. `scripts/test-grammar.mjs` carga Oniguruma y
-tokeniza casos reales, incluyendo la diferencia contextual entre:
+`reimer-language-win32-x64-0.1.0.vsix` includes
+`extension/server/reimer-lsp.exe`, and the extension client is bundled into one
+JavaScript entry point without external runtime dependencies.
+`scripts/test-grammar.mjs` loads Oniguruma and tokenizes real cases, including
+the contextual distinction between:
 
 ```reimer
 from std::string import String;
-let text = String::from(&allocator, "dato")?;
+let text = String::from(&allocator, "data")?;
 fn from(value: str) -> str { value }
 ```
 
-Los gates Rust dirigidos son:
+Targeted Rust gates are:
 
 ```text
 cargo test -p reimer-lint -p reimer-lsp --locked

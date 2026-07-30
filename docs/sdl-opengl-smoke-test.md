@@ -1,43 +1,43 @@
-# Prueba mínima de SDL3 y OpenGL
+# SDL3 and OpenGL smoke test
 
-`examples/m5_sdl_opengl.reim` valida la ruta gráfica nativa más pequeña:
+`examples/m5_sdl_opengl.reim` validates the smallest native graphics path:
 
-1. inicializa el subsistema de vídeo de SDL3;
-2. crea una ventana marcada para OpenGL;
-3. crea y activa el contexto OpenGL asociado;
-4. limpia el framebuffer con un color azul;
-5. intercambia los buffers y mantiene la ventana visible durante 1,2 segundos;
-6. destruye el contexto antes de la ventana y termina SDL mediante `defer`.
+1. initialize the SDL3 video subsystem;
+2. create a window flagged for OpenGL;
+3. create and activate the associated OpenGL context;
+4. clear the framebuffer to blue;
+5. swap buffers and keep the window visible for 1.2 seconds;
+6. destroy the context before the window and stop SDL through `defer`.
 
-La API pública del ejemplo es segura. Los bloques `unsafe` quedan limitados a
-las llamadas FFI, donde se usan los handles opacos entregados por SDL.
+The example's public API is safe. `unsafe` blocks are limited to FFI calls and
+use opaque handles returned by SDL.
 
-## Ejecutar en Windows x64
+## Run on Windows x64
 
-Desde la raíz del repositorio:
+From the repository root:
 
 ```powershell
 .\scripts\run-sdl-opengl-demo.ps1
 ```
 
-El script descarga SDL 3.4.12 desde su release oficial solo cuando falta,
-comprueba el SHA-256 del archivo y añade temporalmente la carpeta de `SDL3.dll`
-al `PATH`. OpenGL 1.1 procede de `opengl32.dll`, incluido en Windows; el ejemplo
-solo usa `glClearColor` y `glClear`, por lo que no necesita un loader de
-extensiones.
+The script downloads SDL 3.4.12 from its official release only when missing,
+verifies the archive SHA-256, and temporarily adds the `SDL3.dll` directory to
+`PATH`. OpenGL 1.1 comes from `opengl32.dll`, which is included with Windows.
+The example only calls `glClearColor` and `glClear`, so it does not require an
+extension loader.
 
-Un resultado correcto muestra una ventana azul y termina con
+A successful run displays a blue window and ends with
 `program returned 42`.
 
-## Comprobar sin librerías nativas
+## Check without native libraries
 
-La generación del objeto valida lexer, parser, tipos, FFI y backend sin cargar
-SDL ni abrir una ventana:
+Object generation validates the lexer, parser, types, FFI, and backend without
+loading SDL or opening a window:
 
 ```powershell
 cargo run -p reimer-cli --locked -- emit-object examples/m5_sdl_opengl.reim
 ```
 
-Para ejecutarlo se necesita Windows x64 con un controlador OpenGL funcional.
-En otros sistemas debe sustituirse el enlace `opengl32` por la biblioteca
-OpenGL de la plataforma y proporcionar SDL3 en la ruta de carga dinámica.
+Execution requires Windows x64 with a working OpenGL driver. On other systems,
+replace the `opengl32` link with the platform OpenGL library and provide SDL3
+on the dynamic loader path.

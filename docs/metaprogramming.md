@@ -1,12 +1,12 @@
-# Metaprogramación de compilación
+# Compile-time metaprogramming
 
-M10 añade evaluación determinista al frontend sin introducir una máquina
-virtual runtime ni permitir efectos externos durante la compilación.
+M10 adds deterministic frontend evaluation without introducing a runtime
+virtual machine or allowing external effects during compilation.
 
-## Constantes y funciones `comptime`
+## Constants and `comptime` functions
 
-Una constante global debe tener tipo explícito. Su inicializador se evalúa
-durante la resolución y el valor resultante se integra en la HIR tipada:
+A global constant must have an explicit type. Its initializer is evaluated
+during resolution, and the resulting value is integrated into typed HIR:
 
 ```reimer
 comptime fn factorial(value: usize) -> usize {
@@ -24,8 +24,8 @@ struct Table<T, const N: usize> {
 }
 ```
 
-Los bloques `comptime` se ejecutan al comprobar el programa y son apropiados
-para invariantes:
+`comptime` blocks run while checking the program and are suitable for
+invariants:
 
 ```reimer
 comptime {
@@ -33,25 +33,23 @@ comptime {
 }
 ```
 
-La evaluación admite escalares, strings, tuplas, arrays y structs, llamadas
-puras, variables locales, ramas, `match`, loops y casts comprobados. Un
-`panic` o `assert` fallido se convierte en un diagnóstico del compilador.
+Evaluation supports scalars, strings, tuples, arrays, structs, pure calls,
+local variables, branches, `match`, loops, and checked casts. A failing `panic`
+or `assert` becomes a compiler diagnostic.
 
-Cada unidad de compilación aplica los siguientes límites:
+Each compilation unit enforces these limits:
 
-- 1 000 000 de pasos;
-- 16 MiB de valores conservados;
-- 128 llamadas anidadas.
+- 1,000,000 steps;
+- 16 MiB of retained values;
+- 128 nested calls.
 
-No están disponibles red, reloj, aleatoriedad, threads, E/S, filesystem, FFI,
-punteros raw, préstamos, `unsafe`, `defer` ni llamadas a funciones runtime.
-Estas reglas también se validan en funciones `comptime` que todavía no hayan
-sido invocadas.
+Network access, clocks, randomness, threads, I/O, filesystem access, FFI, raw
+pointers, borrows, `unsafe`, `defer`, and runtime calls are unavailable. These
+rules are also validated in `comptime` functions that have not been called.
 
-## Atributos
+## Attributes
 
-Los atributos válidos forman una lista cerrada y se rechazan si aparecen en un
-destino incompatible:
+Valid attributes form a closed list and are rejected on incompatible targets:
 
 ```reimer
 @repr(C)
@@ -74,21 +72,21 @@ fn header_default_should_be_zeroed() {
 }
 ```
 
-- `@repr(C)` conserva la representación interoperable de un struct FFI.
-- `@align(N)` aumenta el alineamiento a una potencia de dos válida.
-- `@derive(...)` solicita implementaciones estructurales conocidas.
-- `@inline` es una sugerencia de optimización; no cambia la semántica.
-- `@test` exige una función sin parámetros, genéricos ni retorno.
-- `@must_use` advierte en el linter/LSP cuando se descarta el resultado.
+- `@repr(C)` preserves the interoperable representation of an FFI struct.
+- `@align(N)` raises alignment to a valid power of two.
+- `@derive(...)` requests known structural implementations.
+- `@inline` is an optimization hint and does not change semantics.
+- `@test` requires a function with no parameters, generics, or return value.
+- `@must_use` warns through the linter/LSP when a result is discarded.
 
-`Copy`, `Eq`, `Hash`, `Debug` y `Default` solo se aceptan si todos los campos
-permiten la operación. `Default` de un enum usa su primera variante. `Clone`
-solo se deriva para campos `Copy`: `value.clone()` nunca asigna, falla ni
-requiere allocator. Los contenedores propietarios mantienen `clone_in`.
+`Copy`, `Eq`, `Hash`, `Debug`, and `Default` are accepted only when every field
+supports the operation. An enum's `Default` uses its first variant. `Clone` is
+only derived for `Copy` fields: `value.clone()` never allocates, fails, or
+requires an allocator. Owned containers retain `clone_in`.
 
-## Reflexión tipada
+## Typed reflection
 
-Los descriptores existen únicamente durante la compilación:
+Descriptors only exist during compilation:
 
 ```reimer
 const HEADER_SIZE: usize = size_of<Header>();
@@ -102,18 +100,18 @@ comptime {
 }
 ```
 
-- `size_of<T>()` y `align_of<T>()` consultan el mismo cálculo de layout usado
-  por el backend nativo.
-- `meta::name<T>()` devuelve el nombre canónico.
-- `meta::fields<T>()` devuelve descriptores `{ name, type }`.
-- `meta::variants<T>()` devuelve los nombres de las variantes.
-- `meta::traits<T>()` devuelve traits satisfechos en orden determinista.
+- `size_of<T>()` and `align_of<T>()` query the same layout calculation used by
+  the native backend.
+- `meta::name<T>()` returns the canonical name.
+- `meta::fields<T>()` returns `{ name, type }` descriptors.
+- `meta::variants<T>()` returns variant names.
+- `meta::traits<T>()` returns satisfied traits in deterministic order.
 
-Estas funciones requieren argumentos genéricos explícitos y no pueden llamarse
-desde código runtime. Los const generics usan los mismos valores evaluados y
-comprobados por el frontend.
+These functions require explicit generic arguments and cannot be called from
+runtime code. Const generics use the same values evaluated and checked by the
+frontend.
 
-## Ejecución
+## Running the example
 
 ```text
 cargo run -p reimer-cli -- check examples/m10_comptime.reim

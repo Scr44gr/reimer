@@ -1,18 +1,18 @@
 # Reimer
 
-Reimer es un lenguaje compilado orientado inicialmente al desarrollo de
-videojuegos, motores y herramientas de contenido. El compilador está escrito en
-Rust y su primer backend genera código máquina mediante Cranelift.
+Reimer is a compiled language initially aimed at games, engines, and content
+tools. The compiler is written in Rust, and its first backend generates machine
+code through Cranelift.
 
-El compilador implementa los hitos M0–M10 del documento de diseño. Además del
-programa mínimo, ya compila todos los tipos
-escalares y agregados, control de flujo completo, errores recuperables,
-movimientos y referencias, módulos con paths `::`, FFI C, métodos, genéricos de
-tipo y `const`, monomorfización, traits con despacho estático, evaluación
-`comptime`, atributos, derives cerrados y reflexión tipada. La biblioteca
-estándar incluye allocators explícitos, E/S segura, `String`, `Vec`, `HashMap`,
-`HashSet`, `RingBuffer`, tensors contiguos con vistas seguras, threads,
-sincronización, atomics y un job pool con work stealing:
+The compiler implements milestones M0-M10 from the language design document.
+In addition to the minimum program, it compiles every scalar and aggregate
+type, complete control flow, recoverable errors, moves and references, modules
+with `::` paths, C FFI, methods, type and `const` generics, monomorphization,
+traits with static dispatch, `comptime` evaluation, attributes, closed derives,
+and typed reflection. The standard library includes explicit allocators, safe
+I/O, `String`, `Vec`, `HashMap`, `HashSet`, `RingBuffer`, contiguous tensors
+with safe views, threads, synchronization, atomics, and a work-stealing job
+pool:
 
 ```reimer
 fn factorial(value: i32) -> i32 {
@@ -26,11 +26,11 @@ fn factorial(value: i32) -> i32 {
 }
 ```
 
-El recorrido cubre fuente `.reim` → tokens con spans → AST → resolución y
-comprobación de tipos → HIR tipada → Cranelift. `run` ejecuta el programa por
-JIT y `build` emite un objeto nativo.
+The pipeline covers `.reim` source -> tokens with spans -> AST -> name
+resolution and type checking -> typed HIR -> Cranelift. `run` executes the
+program through JIT, while `build` emits a native object.
 
-## Uso
+## Usage
 
 ```text
 cargo run -p reimer-cli -- check examples/exit_42.reim
@@ -63,7 +63,7 @@ cargo run -p reimer-cli -- run examples/m10_comptime.reim
 cargo run -p reimer-cli -- test examples/m10_comptime.reim
 ```
 
-Para crear un proyecto:
+To create a project:
 
 ```text
 reimer new game
@@ -72,25 +72,25 @@ reimer check game
 reimer build game --release --locked
 ```
 
-El formato de `reimer.toml`, la semántica del lockfile, los perfiles y las
-dependencias path/git están documentados en
-[`docs/package-system.md`](docs/package-system.md).
-La evaluación de compilación, los atributos y la reflexión se especifican en
+The `reimer.toml` format, lockfile semantics, profiles, and path/Git
+dependencies are documented in
+[`docs/package-system.md`](docs/package-system.md). Compile-time evaluation,
+attributes, and reflection are specified in
 [`docs/metaprogramming.md`](docs/metaprogramming.md).
 
-El objeto generado todavía no es un ejecutable autónomo. El enlazado con el
-runtime de arranque y LLD es el siguiente incremento del backend.
+The generated object is not yet a standalone executable. Linking it with the
+startup runtime and LLD is the next backend increment.
 
 ## VS Code
 
-`editors/vscode` contiene resaltado TextMate y una extensión conectada a
-`reimer-lsp`. El servidor publica diagnósticos, tipos inferidos, hover,
-completado, definiciones, organización de imports, quick fixes para typos y
-antipatrones, y estimaciones estáticas de reservas por allocator. La instalación
-y el empaquetado se describen en
+`editors/vscode` contains TextMate highlighting and an extension connected to
+`reimer-lsp`. The server publishes diagnostics, inferred types, hover,
+completion, definitions, import organization, quick fixes for typos and
+antipatterns, and static allocator reservation estimates. Installation and
+packaging are described in
 [`editors/vscode/README.md`](editors/vscode/README.md).
 
-## Desarrollo
+## Development
 
 ```text
 cargo fmt --all --check
@@ -98,6 +98,6 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -W clippy::perf -W clippy::redundant_clone -W clippy::needless_collect -D warnings
 ```
 
-La arquitectura y el alcance exacto del hito están descritos en
-[`docs/architecture.md`](docs/architecture.md). La cobertura completa del LDD
-se mantiene en [`docs/implementation-status.md`](docs/implementation-status.md).
+The architecture and exact milestone scope are described in
+[`docs/architecture.md`](docs/architecture.md). Full LDD coverage is tracked in
+[`docs/implementation-status.md`](docs/implementation-status.md).

@@ -1,32 +1,35 @@
 # Reimer Language Support for VS Code
 
-Soporte de editor basado en la gramática y el compilador reales del repositorio.
-La extensión no copia gramáticas de Rust ni componentes de Pylance: ofrece una
-experiencia equivalente en intención mediante TextMate y un servidor LSP propio.
+Editor support backed by the repository's real grammar and compiler. The
+extension does not copy Rust grammars or Pylance components; it provides a
+similar quality of experience through an original TextMate grammar and LSP.
 
-## Capacidades
+## Capabilities
 
-- reconocimiento de archivos `.reim` y resaltado de comentarios anidados,
-  literales UTF-8/C, declaraciones, genéricos, atributos, paths `::`, operadores
-  y control de flujo;
-- diagnósticos del lexer, parser, manifest/lockfile, package loader y resolver;
-- hover e inlay hints con tipos inferidos;
-- ir a definición local, símbolos del documento y completado;
-- quick fixes para typos cercanos y antipatrones;
-- `source.organizeImports` para ordenar `std` primero y normalizar imports
-  selectivos sin eliminar comentarios;
-- estimaciones estáticas, explícitamente etiquetadas, de reservas conocidas por
-  allocator, con inlay hints y CodeLens.
-- resolución de dependencias path/git desde `reimer.toml`, con reanálisis al
-  cambiar el manifest, el lockfile o una fuente `.reim`.
-- resaltado y completado para `comptime`, constantes, reflexión y atributos de
-  M10; `*` y `->` comparten el mismo scope de operador.
-- advertencias de `@must_use` respaldadas por la HIR, también en paquetes
-  multarchivo guardados.
+- `.reim` recognition and highlighting for nested comments, UTF-8/C literals,
+  declarations, generics, attributes, `::` paths, operators, and control flow;
+- diagnostics from the lexer, parser, manifest/lockfile, package loader, and
+  resolver;
+- hover and inlay hints with inferred types;
+- local go-to-definition, document symbols, and completion;
+- quick fixes for close typos and antipatterns;
+- `source.organizeImports` to place `std` first and normalize selective imports
+  without deleting comments;
+- explicitly labeled static allocator reservation estimates through inlay hints
+  and CodeLens;
+- path/Git dependency resolution from `reimer.toml`, with reanalysis when a
+  manifest, lockfile, or `.reim` source changes;
+- highlighting and completion for `comptime`, constants, reflection, and M10
+  attributes; `*` and `->` share the same operator scope;
+- HIR-backed `@must_use` warnings, including saved multi-file packages;
+- package-aware inference for the active in-memory document, including unsaved
+  changes in files with imports;
+- reliable matching and active guides for `{}`, `[]`, and `()`. Angle brackets
+  remain operators so `->` and comparisons are not mistaken for bracket pairs.
 
-## Instalación para desarrollo
+## Development installation
 
-Desde la raíz del repositorio:
+From the repository root:
 
 ```powershell
 cargo build --release -p reimer-lsp
@@ -35,31 +38,30 @@ npm install
 npm run compile
 ```
 
-En VS Code ejecuta **Developer: Install Extension from Location...** y elige
-`editors/vscode`. Durante el desarrollo, configura `reimer.server.path` con la
-ruta absoluta a `target/release/reimer-lsp.exe`.
+In VS Code, run **Developer: Install Extension from Location...** and choose
+`editors/vscode`. During development, configure `reimer.server.path` with the
+absolute path to `target/release/reimer-lsp.exe`.
 
-Para generar un paquete instalable:
+To generate an installable package:
 
 ```powershell
 npm run package
 ```
 
-El comando compila e incluye el servidor y produce un VSIX `win32-x64`
-autocontenido. En esa instalación no hace falta configurar el path. Para otras
-plataformas, compila el servidor local y usa `reimer.server.path`.
+The command compiles and bundles the server and produces a self-contained
+`win32-x64` VSIX. That installation does not require a server path. On other
+platforms, compile the server locally and set `reimer.server.path`.
 
-## Precisión de memoria
+## Memory-estimate precision
 
-Las cifras mostradas son estimaciones estáticas, no perfiles de memoria. Una
-cantidad constante en `allocate_bytes`, entrada acotada o `String::from` puede
-calcularse exactamente; valores de runtime se muestran como dinámicos. Las
-reservas dentro de loops se expresan por iteración. No se afirma un pico total
-cuando el control de flujo o la vida útil no pueden demostrarse.
+Displayed figures are static estimates, not memory profiles. Constant sizes in
+`allocate_bytes`, bounded input, or `String::from` can be calculated exactly;
+runtime values are reported as dynamic. Reservations inside loops are shown
+per iteration. The extension does not claim a total peak when control flow or
+lifetime cannot be proved.
 
-## Limitaciones actuales
+## Current limitations
 
-Los cambios sin guardar se analizan completamente cuando no dependen de imports.
-Para un paquete multiarchivo, los diagnósticos e inferencia intermodular se
-actualizan contra el snapshot guardado en disco. El soporte actual de ir a
-definición es intradocumento.
+Imported dependency files are read from disk while the active document uses its
+latest in-memory snapshot. Changes in another open module become visible after
+that module is saved. Go-to-definition is currently intradocument.

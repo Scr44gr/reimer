@@ -1,15 +1,15 @@
-# Concurrencia en Reimer
+# Concurrency in Reimer
 
-M9 ofrece concurrencia nativa sin ampliar la superficie pública de `unsafe`.
-Los programas usan `std::thread` y `std::job`; los punteros, buffers ABI y
-function thunks quedan encapsulados entre el backend y el runtime.
+M9 provides native concurrency without expanding the public `unsafe` surface.
+Programs use `std::thread` and `std::job`; pointers, ABI buffers, and function
+thunks remain encapsulated between the backend and runtime.
 
-## Threads y seguridad de tipos
+## Threads and type safety
 
-`Thread::spawn` transfiere el argumento al worker y devuelve un `Thread<T>` que
-entrega el resultado una sola vez mediante `join`. `scope` crea un worker
-estructurado, espera su finalización antes de retornar y por eso puede recibir
-un agregado con préstamos locales.
+`Thread::spawn` transfers an argument to a worker and returns a `Thread<T>` that
+delivers its result exactly once through `join`. `scope` creates a structured
+worker and waits for completion before returning, so it may receive an
+aggregate containing local borrows.
 
 ```reimer
 from std::thread import Thread, ThreadError, scope;
@@ -22,38 +22,38 @@ fn increment_borrowed(value: &mut i32) -> i32 {
 }
 ```
 
-`Send` y `Sync` son capacidades estructurales integradas:
+`Send` and `Sync` are built-in structural capabilities:
 
-- un valor es `Send` cuando todos sus campos pueden transferirse;
-- un valor es `Sync` cuando todos sus campos permiten acceso compartido;
-- los punteros raw nunca reciben ninguna de las dos capacidades;
-- una referencia scoped no puede escapar dentro de un thread nativo;
-- los channels y jobs mueven valores no `Copy`.
+- a value is `Send` when every field can be transferred;
+- a value is `Sync` when every field permits shared access;
+- raw pointers never receive either capability;
+- a scoped reference cannot escape into a native thread;
+- channels and jobs move non-`Copy` values.
 
-Los errores de creación, handles retirados, panics de workers y layouts
-incompatibles se representan con `ThreadError` o `JobError`.
+Creation errors, retired handles, worker panics, and incompatible layouts are
+represented by `ThreadError` or `JobError`.
 
-## Sincronización
+## Synchronization
 
-`std::thread` expone:
+`std::thread` exposes:
 
-- `Mutex<T>` y `RwLock<T>`;
-- `Channel<T>` acotado;
-- `Barrier` y `Semaphore`;
-- `ThreadLocal<T>` para valores `Copy`;
-- `AtomicBool`, `AtomicI64`, `AtomicU64`, `AtomicIsize` y `AtomicUsize`.
+- `Mutex<T>` and `RwLock<T>`;
+- bounded `Channel<T>`;
+- `Barrier` and `Semaphore`;
+- `ThreadLocal<T>` for `Copy` values;
+- `AtomicBool`, `AtomicI64`, `AtomicU64`, `AtomicIsize`, and `AtomicUsize`.
 
-Los atomics usan orden secuencialmente consistente. Clone conserva ownership
-compartido del recurso; `deinit` retira cada handle explícitamente. Todo acceso
-posterior a un handle retirado es una violación de invariantes y termina con
-`panic`, nunca con una desreferencia inválida.
+Atomics use sequential consistency. Cloning preserves shared resource
+ownership; `deinit` retires each handle explicitly. Access after a handle is
+retired violates an invariant and ends in `panic`, never an invalid
+dereference.
 
-## Jobs y paralelismo por datos
+## Jobs and data parallelism
 
-Un `JobPool` recibe allocator y una cantidad fija de workers. Los workers son
-persistentes, cada uno posee una cola local y puede robar trabajo del extremo
-de otras colas. `submit` mueve su argumento al pool y `Job::wait` transfiere el
-resultado al caller.
+A `JobPool` receives an allocator and a fixed worker count. Workers persist,
+each owns a local queue, and each can steal work from the opposite end of
+another queue. `submit` moves its argument into the pool, and `Job::wait`
+transfers the result to the caller.
 
 ```reimer
 from std::alloc import general_allocator;
@@ -66,32 +66,31 @@ let pool = JobPool::init(
 )?;
 ```
 
-`parallel_for_mut` parte un slice en regiones exclusivas no solapadas. La
-variante para arrays conserva su longitud estática y `tensor::parallel_for_mut`
-opera sobre el almacenamiento contiguo del tensor. La llamada espera todos los
-chunks antes de devolver, de modo que el préstamo exclusivo termina de forma
-estructurada. `minimum_chunk` es un mínimo preferido; el runtime también
-balancea la cantidad de tareas según el número de workers.
+`parallel_for_mut` splits a slice into nonoverlapping exclusive regions. The
+array variant preserves static length, while `tensor::parallel_for_mut`
+operates over contiguous tensor storage. The call waits for every chunk before
+returning, so the exclusive borrow ends structurally. `minimum_chunk` is a
+preferred minimum; the runtime also balances task count against worker count.
 
-El type checker rechaza:
+The type checker rejects:
 
-- dos préstamos mutables solapados del mismo array;
-- punteros raw enviados como argumento de un job;
-- referencias locales que escapan a un thread nativo;
-- callbacks de `parallel_for_mut` que no reciben `&mut [T]`.
+- two overlapping mutable borrows of the same array;
+- raw pointers sent as job arguments;
+- local references escaping to a native thread;
+- `parallel_for_mut` callbacks that do not receive `&mut [T]`.
 
-## Aislamiento del runtime
+## Runtime isolation
 
-Cada ejecución JIT recibe una sesión propia. Threads, jobs y pools conservan
-esa identidad, incluso al crear recursos desde un worker. Al terminar un
-programa, el backend espera y retira únicamente sus recursos. Esto permite que
-las pruebas y herramientas ejecuten varios programas concurrentemente sin que
-la limpieza de uno cierre handles de otro.
+Each JIT execution receives its own session. Threads, jobs, and pools preserve
+that identity, including resources created from a worker. When a program ends,
+the backend waits for and retires only that program's resources. Tests and
+tools can therefore execute several programs concurrently without one
+cleanup closing another program's handles.
 
-Async/await, fibers, un scheduler ECS y atomics con orden configurable
-permanecen fuera de Reimer v0.1.
+Async/await, fibers, an ECS scheduler, and configurable atomic orderings remain
+outside Reimer v0.1.
 
-## Pruebas manuales
+## Manual tests
 
 ```text
 cargo run -p reimer-cli -- run examples/m9_threads/main.reim

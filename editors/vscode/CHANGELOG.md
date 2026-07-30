@@ -2,8 +2,12 @@
 
 ## 0.1.0
 
-- Resaltado de sintaxis y configuración de lenguaje para `.reim`.
-- Cliente LSP, diagnósticos, hover, tipos inferidos, símbolos, completado e ir a
-  definición local.
-- Organización segura de imports, quick fixes, lints de antipatrones y
-  estimaciones estáticas de allocator.
+- Syntax highlighting and language configuration for `.reim`.
+- LSP client, diagnostics, hover, inferred types, symbols, completion, and
+  local go-to-definition.
+- Safe import organization, quick fixes, antipattern lints, and static
+  allocator estimates.
+- Self-contained client bundle so installed VSIX packages start the LSP
+  without external Node dependencies.
+- Unsaved package-aware type inference and explicit bracket-pair editor
+  defaults.
