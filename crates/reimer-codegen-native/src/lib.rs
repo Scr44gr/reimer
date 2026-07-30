@@ -19,9 +19,9 @@ use cranelift_object::object::{BinaryFormat, SectionKind};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_hir::{
-    AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, Function, FunctionId,
-    IntegerAdditionMode, LocalId, MatchExpression, Pattern, PatternKind, Place, PlaceKind, Program,
-    Statement, SynchronizationKind, TypeDefinitionKind, UnaryOperator,
+    AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, ForIteration, Function,
+    FunctionId, IntegerAdditionMode, LocalId, MatchExpression, Pattern, PatternKind, Place,
+    PlaceKind, Program, Statement, SynchronizationKind, TypeDefinitionKind, UnaryOperator,
 };
 use reimer_layout::{AggregateLayoutKind, Layouts};
 use reimer_runtime::Failure;
@@ -385,6 +385,10 @@ fn register_core_symbols(builder: &mut JITBuilder) {
         (
             reimer_runtime::UTF8_IS_VALID_SYMBOL,
             reimer_runtime::utf8_is_valid as *const u8,
+        ),
+        (
+            reimer_runtime::UTF8_DECODE_NEXT_SYMBOL,
+            reimer_runtime::utf8_decode_next as *const u8,
         ),
         (
             reimer_runtime::THREAD_SPAWN_SYMBOL,
@@ -893,6 +897,27 @@ fn runtime_buffer_equals_reference<M: Module>(
     Ok(module.declare_func_in_func(function, builder.func))
 }
 
+fn runtime_utf8_decode_next_reference<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+) -> Result<ir::FuncRef, String> {
+    let mut signature = module.make_signature();
+    signature.params.extend([
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+    ]);
+    signature.returns.push(AbiParam::new(types::I32));
+    let function = module
+        .declare_function(
+            reimer_runtime::UTF8_DECODE_NEXT_SYMBOL,
+            Linkage::Import,
+            &signature,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(module.declare_func_in_func(function, builder.func))
+}
+
 fn runtime_thread_spawn_reference<M: Module>(
     builder: &mut FunctionBuilder<'_>,
     module: &mut M,
@@ -1270,6 +1295,7 @@ struct LoopTargets {
 struct ForParts<'hir> {
     pattern: &'hir Pattern,
     element_type: Type,
+    iteration: ForIteration,
     iterable: &'hir Expression,
     body: &'hir Block,
 }
@@ -1587,24 +1613,7 @@ fn emit_statement<M: Module>(
         Statement::While {
             condition, body, ..
         } => emit_while(builder, module, functions, state, condition, body),
-        Statement::For {
-            pattern,
-            element_type,
-            iterable,
-            body,
-            ..
-        } => emit_for(
-            builder,
-            module,
-            functions,
-            state,
-            &ForParts {
-                pattern,
-                element_type: *element_type,
-                iterable,
-                body,
-            },
-        ),
+        Statement::For { .. } => emit_for_statement(builder, module, functions, state, statement),
         Statement::Break { value, .. } => {
             let targets = state
                 .loops
@@ -1653,6 +1662,39 @@ fn emit_statement<M: Module>(
             Ok(Emitted::terminated())
         }
     }
+}
+
+fn emit_for_statement<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    statement: &Statement,
+) -> Result<Emitted, String> {
+    let Statement::For {
+        pattern,
+        element_type,
+        iteration,
+        iterable,
+        body,
+        ..
+    } = statement
+    else {
+        return Err("for lowering received a different statement".to_owned());
+    };
+    emit_for(
+        builder,
+        module,
+        functions,
+        state,
+        &ForParts {
+            pattern,
+            element_type: *element_type,
+            iteration: *iteration,
+            iterable,
+            body,
+        },
+    )
 }
 
 fn preserve_deferred_value(
@@ -1810,6 +1852,19 @@ fn emit_for<M: Module>(
     state: &mut CodegenState<'_>,
     parts: &ForParts<'_>,
 ) -> Result<Emitted, String> {
+    match parts.iteration {
+        ForIteration::Indexed => emit_indexed_for(builder, module, functions, state, parts),
+        ForIteration::Chars => emit_chars_for(builder, module, functions, state, parts),
+    }
+}
+
+fn emit_indexed_for<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    parts: &ForParts<'_>,
+) -> Result<Emitted, String> {
     let iterable = emit_expression(builder, module, functions, state, parts.iterable)?;
     if iterable.terminated {
         return Ok(iterable);
@@ -1855,6 +1910,56 @@ fn emit_for<M: Module>(
     let next = builder.ins().iadd_imm_u(current, 1);
     builder.def_var(index, next);
     builder.ins().jump(header, &[]);
+
+    builder.switch_to_block(exit);
+    Ok(Emitted::unit())
+}
+
+fn emit_chars_for<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    parts: &ForParts<'_>,
+) -> Result<Emitted, String> {
+    let iterable = emit_expression(builder, module, functions, state, parts.iterable)?;
+    if iterable.terminated {
+        return Ok(iterable);
+    }
+    let iterator = require_value(iterable, "character iterator")?;
+    let (data, length, cursor_address) =
+        chars_iterator_parts(builder, state.layouts, parts.iterable.ty, iterator)?;
+    let header = builder.create_block();
+    let body_block = builder.create_block();
+    let exit = builder.create_block();
+    builder.ins().jump(header, &[]);
+
+    builder.switch_to_block(header);
+    let cursor = builder
+        .ins()
+        .load(pointer_type(), MemFlagsData::new(), cursor_address, 0);
+    let (has_character, character, next_cursor) =
+        decode_next_character(builder, module, data, length, cursor)?;
+    builder
+        .ins()
+        .store(MemFlagsData::new(), next_cursor, cursor_address, 0);
+    builder
+        .ins()
+        .brif(has_character, body_block, &[], exit, &[]);
+
+    builder.switch_to_block(body_block);
+    bind_pattern(builder, state, parts.pattern, character)?;
+    state.loops.push(LoopTargets {
+        continue_target: header,
+        exit,
+        result_type: Type::Unit,
+        defer_depth: state.defer_scopes.len(),
+    });
+    let emitted = emit_block(builder, module, functions, state, parts.body)?;
+    state.loops.pop();
+    if !emitted.terminated {
+        builder.ins().jump(header, &[]);
+    }
 
     builder.switch_to_block(exit);
     Ok(Emitted::unit())
@@ -1957,6 +2062,9 @@ fn emit_expression<M: Module>(
         ExpressionKind::StringData(_)
         | ExpressionKind::StringLength(_)
         | ExpressionKind::SliceLength(_)
+        | ExpressionKind::StringBytes(_)
+        | ExpressionKind::StringChars(_)
+        | ExpressionKind::CharsNext { .. }
         | ExpressionKind::StringFromParts { .. }
         | ExpressionKind::SliceFromParts { .. }
         | ExpressionKind::TypeStride { .. }
@@ -1980,7 +2088,9 @@ fn emit_expression<M: Module>(
         ExpressionKind::Try { .. } => {
             emit_try_expression(builder, module, functions, state, expression)
         }
-        ExpressionKind::Field { .. } | ExpressionKind::Index { .. } => {
+        ExpressionKind::Field { .. }
+        | ExpressionKind::Index { .. }
+        | ExpressionKind::SliceGet { .. } => {
             emit_access_expression(builder, module, functions, state, expression)
         }
     }
@@ -2076,6 +2186,9 @@ fn emit_access_expression<M: Module>(
             index,
             expression.ty,
         ),
+        ExpressionKind::SliceGet { .. } => {
+            emit_slice_get(builder, module, functions, state, expression)
+        }
         _ => Err("non-access expression reached access code generation".to_owned()),
     }
 }
@@ -2106,6 +2219,15 @@ fn emit_runtime_intrinsic_expression<M: Module>(
         ),
         ExpressionKind::SliceLength(value) => {
             emit_slice_length(builder, module, functions, state, value)
+        }
+        ExpressionKind::StringBytes(value) => {
+            emit_string_bytes(builder, module, functions, state, expression.ty, value)
+        }
+        ExpressionKind::StringChars(value) => {
+            emit_string_chars(builder, module, functions, state, expression.ty, value)
+        }
+        ExpressionKind::CharsNext { iterator } => {
+            emit_chars_next(builder, module, functions, state, expression.ty, iterator)
         }
         ExpressionKind::StringFromParts { data, length } => {
             emit_string_from_parts(builder, module, functions, state, data, length)
@@ -2889,6 +3011,125 @@ fn emit_slice_length<M: Module>(
         native_offset(length_offset, "slice length")?,
     );
     Ok(Emitted::value(length))
+}
+
+fn emit_string_bytes<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    result_type: Type,
+    value: &Expression,
+) -> Result<Emitted, String> {
+    let emitted = emit_expression(builder, module, functions, state, value)?;
+    if emitted.terminated {
+        return Ok(emitted);
+    }
+    let source = require_value(emitted, "string byte view")?;
+    let (data, length) = load_string_view(builder, state.layouts, source)?;
+    let descriptor = allocate_composite(builder, state.layouts, result_type)?;
+    store_dynamic_fat_view(
+        builder,
+        state.layouts,
+        result_type,
+        descriptor,
+        data,
+        length,
+    )?;
+    Ok(Emitted::value(descriptor))
+}
+
+fn emit_string_chars<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    result_type: Type,
+    value: &Expression,
+) -> Result<Emitted, String> {
+    let emitted = emit_expression(builder, module, functions, state, value)?;
+    if emitted.terminated {
+        return Ok(emitted);
+    }
+    let source = require_value(emitted, "string character iterator")?;
+    let offset = builder.ins().iconst(pointer_type(), 0);
+    build_product_from_values(
+        builder,
+        state,
+        result_type,
+        &[(Type::Str, source), (Type::Usize, offset)],
+    )
+    .map(Emitted::value)
+}
+
+fn emit_chars_next<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    result_type: Type,
+    iterator: &Place,
+) -> Result<Emitted, String> {
+    let address = emit_place_address(builder, module, functions, state, iterator)?;
+    let (data, length, cursor_address) =
+        chars_iterator_parts(builder, state.layouts, iterator.ty, address)?;
+    let cursor = builder
+        .ins()
+        .load(pointer_type(), MemFlagsData::new(), cursor_address, 0);
+    let (has_character, character, stored_cursor) =
+        decode_next_character(builder, module, data, length, cursor)?;
+    builder
+        .ins()
+        .store(MemFlagsData::new(), stored_cursor, cursor_address, 0);
+    let some = build_enum_from_values(builder, state, result_type, 0, &[(Type::Char, character)])?;
+    let none = build_enum_from_values(builder, state, result_type, 1, &[])?;
+    Ok(Emitted::value(builder.ins().select(
+        has_character,
+        some,
+        none,
+    )))
+}
+
+fn chars_iterator_parts(
+    builder: &mut FunctionBuilder<'_>,
+    layouts: &Layouts,
+    iterator_type: Type,
+    address: Value,
+) -> Result<(Value, Value, Value), String> {
+    let layout = layouts.aggregate(iterator_type)?;
+    let AggregateLayoutKind::Product { offsets } = &layout.kind else {
+        return Err("character iterator requires a product layout".to_owned());
+    };
+    let [source_offset, cursor_offset] = offsets.as_slice() else {
+        return Err("character iterator layout must contain source and cursor fields".to_owned());
+    };
+    let source = address_at_offset(builder, address, *source_offset);
+    let cursor_address = address_at_offset(builder, address, *cursor_offset);
+    let (data, length) = load_string_view(builder, layouts, source)?;
+    Ok((data, length, cursor_address))
+}
+
+fn decode_next_character<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    data: Value,
+    length: Value,
+    cursor: Value,
+) -> Result<(Value, Value, Value), String> {
+    let function = runtime_utf8_decode_next_reference(builder, module)?;
+    let call = builder.ins().call(function, &[data, length, cursor]);
+    let encoded = call_result(builder, call, "UTF-8 decode")?;
+    let has_character = builder.ins().icmp_imm_u(IntCC::NotEqual, encoded, 0);
+    let width = builder.ins().band_imm_u(encoded, 0b111);
+    let character = builder.ins().ushr_imm_u(encoded, 3);
+    let width = if pointer_type() == types::I32 {
+        width
+    } else {
+        builder.ins().uextend(pointer_type(), width)
+    };
+    let advanced = builder.ins().iadd(cursor, width);
+    let next_cursor = builder.ins().select(has_character, advanced, cursor);
+    Ok((has_character, character, next_cursor))
 }
 
 fn emit_panic<M: Module>(
@@ -4394,6 +4635,50 @@ fn emit_index<M: Module>(
 ) -> Result<Emitted, String> {
     let address = emit_array_element_address(builder, module, functions, state, base, index)?;
     load_at_address(builder, element_type, address)
+}
+
+fn emit_slice_get<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    expression: &Expression,
+) -> Result<Emitted, String> {
+    let ExpressionKind::SliceGet {
+        slice,
+        index,
+        reference_type,
+        ..
+    } = &expression.kind
+    else {
+        return Err("slice access lowering received an incompatible expression".to_owned());
+    };
+    let emitted_slice = emit_expression(builder, module, functions, state, slice)?;
+    if emitted_slice.terminated {
+        return Ok(emitted_slice);
+    }
+    let emitted_index = emit_expression(builder, module, functions, state, index)?;
+    if emitted_index.terminated {
+        return Ok(emitted_index);
+    }
+    let slice_value = require_value(emitted_slice, "recoverable slice access")?;
+    let index_value = require_value(emitted_index, "recoverable slice index")?;
+    let (data, length, stride) =
+        indexed_sequence_parts(builder, state.layouts, slice.ty, slice_value)?;
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, index_value, length);
+    let byte_offset = builder.ins().imul_imm_u(index_value, i64::from(stride));
+    let address = builder.ins().iadd(data, byte_offset);
+    let some = build_enum_from_values(
+        builder,
+        state,
+        expression.ty,
+        0,
+        &[(*reference_type, address)],
+    )?;
+    let none = build_enum_from_values(builder, state, expression.ty, 1, &[])?;
+    Ok(Emitted::value(builder.ins().select(in_bounds, some, none)))
 }
 
 fn emit_array_element_address<M: Module>(

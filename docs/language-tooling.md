@@ -63,6 +63,11 @@ unannotated bindings. Hover and inlay hints display canonical source-level
 types from the compiler, not a parallel heuristic. Internal package symbols
 are never part of the editor presentation.
 
+Built-in methods participate in the same index. Hover shows the resolved
+signatures and behavior of integer overflow modes, recoverable slice
+`get`/`get_mut`, zero-copy `str.bytes()`, `str.chars()`, and `Chars.next()`.
+Completion advertises those method names alongside source declarations.
+
 Memory figures always say **static estimate**. The analyzer currently
 recognizes explicit byte reservations, bounded input buffers, fixed buffers,
 `String::from`, dynamic `clone_in`, and allocator-backed capacity operations.

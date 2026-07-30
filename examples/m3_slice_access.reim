@@ -1,0 +1,40 @@
+/// Reads one element without raising a bounds panic.
+fn read_at(values: &[i32], index: usize) -> i32 {
+    match values.get(index) {
+        Some(value) => *value,
+        None => -1,
+    }
+}
+
+/// Replaces one element when the index is valid.
+fn write_at(values: &mut [i32], index: usize, replacement: i32) -> bool {
+    match values.get_mut(index) {
+        Some(value) => {
+            *value = replacement;
+            true
+        },
+        None => false,
+    }
+}
+
+fn main() -> i32 {
+    let mut values: [i32; 2] = [20, 0];
+    {
+        let slice: &mut [i32] = &mut values;
+        if !write_at(slice, 1, 22) {
+            return 1;
+        }
+    }
+    {
+        let slice: &mut [i32] = &mut values;
+        if write_at(slice, 8, 99) {
+            return 2;
+        }
+    }
+
+    let slice: &[i32] = &values;
+    if read_at(slice, 8) != -1 {
+        return 3;
+    }
+    read_at(slice, 0) + read_at(slice, 1)
+}

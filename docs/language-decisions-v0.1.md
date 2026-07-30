@@ -86,11 +86,18 @@ fn load(path: str) -> Result<Asset, AssetError>;
 let name: str = "player";
 let owned = String::from(allocator, name)?;
 let view: str = owned.as_str();
+let bytes: &[u8] = view.bytes();
+for character in view.chars() {
+    inspect(character);
+}
 ```
 
 `String` is the move-only owned buffer with a length, capacity, and allocator.
 A `str` view cannot outlive the storage containing its bytes. The type checker
 applies the same conservative scoped rules used for other non-owning views.
+`bytes()` returns a zero-copy byte slice. `chars()` decodes Unicode scalar
+values without allocating; grapheme segmentation remains an optional Unicode
+library concern.
 
 ## D-005: explicit copies of owned values
 

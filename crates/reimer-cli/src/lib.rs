@@ -387,6 +387,29 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_should_complete_recoverable_slice_access() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_slice_access.reim");
+
+        let result = execute_file(&path).expect("slice access program should execute");
+        let object = compile_file_to_object(&path).expect("slice access program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn execute_file_should_complete_utf8_views_and_iteration() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_utf8.reim");
+
+        let result = execute_file(&path).expect("UTF-8 program should execute");
+        let object = compile_file_to_object(&path).expect("UTF-8 program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
     fn execute_file_should_complete_safe_standard_output_vertical_slice() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_io.reim");
 

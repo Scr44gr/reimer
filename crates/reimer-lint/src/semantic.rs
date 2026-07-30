@@ -696,6 +696,21 @@ impl HirIndexer<'_> {
             ExpressionKind::IntegerAddition { mode, left, right } => {
                 self.integer_addition(*mode, left, right, expression.span);
             }
+            ExpressionKind::StringBytes(source) => {
+                self.string_iteration("bytes", source, expression.ty, expression.span);
+            }
+            ExpressionKind::StringChars(source) => {
+                self.string_iteration("chars", source, expression.ty, expression.span);
+            }
+            ExpressionKind::CharsNext { iterator } => {
+                self.chars_next(iterator, expression.ty, expression.span);
+            }
+            ExpressionKind::SliceGet {
+                slice,
+                index,
+                reference_type,
+                mutable,
+            } => self.slice_get(slice, index, *reference_type, *mutable, expression.span),
             ExpressionKind::If(_)
             | ExpressionKind::Match(_)
             | ExpressionKind::Loop(_)
@@ -928,6 +943,73 @@ impl HirIndexer<'_> {
         }
         self.expression(left);
         self.expression(right);
+    }
+
+    fn slice_get(
+        &mut self,
+        slice: &hir::Expression,
+        index: &hir::Expression,
+        reference_type: Type,
+        mutable: bool,
+        span: Span,
+    ) {
+        if let Some(use_span) = self.syntax_index.call_callees.get(&span_key(span)).copied() {
+            let name = if mutable { "get_mut" } else { "get" };
+            let slice_label = type_label(slice.ty, self.typed);
+            let reference_label = type_label(reference_type, self.typed);
+            let mutability = if mutable { "mutable " } else { "" };
+            self.type_hints.push(TypeHint {
+                span: use_span,
+                label: format!(
+                    "fn {name}(self: {slice_label}, index: usize) -> Option<{reference_label}>"
+                ),
+                documentation: format!(
+                    "Returns `Some({mutability}reference)` when `index` is within the slice; otherwise returns `None`. No bounds panic is raised."
+                ),
+                kind: TypeHintKind::Callable,
+            });
+        }
+        self.expression(slice);
+        self.expression(index);
+    }
+
+    fn string_iteration(
+        &mut self,
+        name: &str,
+        source: &hir::Expression,
+        result_type: Type,
+        span: Span,
+    ) {
+        if let Some(use_span) = self.syntax_index.call_callees.get(&span_key(span)).copied() {
+            let result = type_label(result_type, self.typed);
+            let documentation = if name == "bytes" {
+                "Returns an immutable borrowed slice containing the exact UTF-8 encoding bytes. No allocation or decoding is performed."
+            } else {
+                "Creates a forward iterator that decodes the string as Unicode scalar values without allocating."
+            };
+            self.type_hints.push(TypeHint {
+                span: use_span,
+                label: format!("fn {name}(self: str) -> {result}"),
+                documentation: documentation.to_owned(),
+                kind: TypeHintKind::Callable,
+            });
+        }
+        self.expression(source);
+    }
+
+    fn chars_next(&mut self, iterator: &hir::Place, result_type: Type, span: Span) {
+        if let Some(use_span) = self.syntax_index.call_callees.get(&span_key(span)).copied() {
+            self.type_hints.push(TypeHint {
+                span: use_span,
+                label: format!(
+                    "fn next(self: &mut Chars) -> {}",
+                    type_label(result_type, self.typed)
+                ),
+                documentation: "Returns the next decoded Unicode scalar as `Some(char)`, or `None` after the string is exhausted.".to_owned(),
+                kind: TypeHintKind::Callable,
+            });
+        }
+        self.place(iterator);
     }
 
     fn direct_call(&mut self, function: FunctionId, arguments: &[hir::Expression], span: Span) {
@@ -1245,6 +1327,10 @@ fn named_struct_documentation(label: &str, field_count: usize) -> String {
         "std::collections::HashSet" => "Allocator-backed collection of unique values.".to_owned(),
         "std::collections::RingBuffer" => {
             "Fixed-capacity first-in, first-out circular buffer.".to_owned()
+        }
+        "Chars" => {
+            "Forward, allocation-free iterator over the Unicode scalar values in a UTF-8 string."
+                .to_owned()
         }
         "std::string::String" => {
             "Owned, growable UTF-8 string backed by an explicit allocator.".to_owned()

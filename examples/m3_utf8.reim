@@ -1,0 +1,45 @@
+fn main() -> i32 {
+    let text: str = "Aé🦀";
+    let bytes = text.bytes();
+    let missing_byte = match bytes.get(7) {
+        Some(_) => false,
+        None => true,
+    };
+
+    let mut characters = text.chars();
+    let first = match characters.next() {
+        Some(value) => value,
+        None => 'x',
+    };
+    let second = match characters.next() {
+        Some(value) => value,
+        None => 'x',
+    };
+    let third = match characters.next() {
+        Some(value) => value,
+        None => 'x',
+    };
+    let exhausted = match characters.next() {
+        Some(_) => false,
+        None => true,
+    };
+    let mut scalar_count: usize = 0;
+    for _ in text.chars() {
+        scalar_count += 1;
+    }
+
+    if bytes[0] == 65
+        && bytes[1] == 195
+        && bytes[2] == 169
+        && first == 'A'
+        && second == 'é'
+        && third == '🦀'
+        && missing_byte
+        && exhausted
+        && scalar_count == 3
+    {
+        42
+    } else {
+        0
+    }
+}

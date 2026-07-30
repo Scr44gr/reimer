@@ -859,6 +859,23 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
         CompletionItemKind::METHOD,
         "integer overflow",
     ),
+    (
+        "get",
+        CompletionItemKind::METHOD,
+        "recoverable slice access",
+    ),
+    (
+        "get_mut",
+        CompletionItemKind::METHOD,
+        "recoverable mutable slice access",
+    ),
+    ("bytes", CompletionItemKind::METHOD, "UTF-8 byte view"),
+    (
+        "chars",
+        CompletionItemKind::METHOD,
+        "Unicode scalar iteration",
+    ),
+    ("next", CompletionItemKind::METHOD, "iterator advancement"),
     ("Thread", CompletionItemKind::STRUCT, "std::thread"),
     ("scope", CompletionItemKind::FUNCTION, "std::thread"),
     ("Mutex", CompletionItemKind::STRUCT, "std::thread"),
@@ -1204,6 +1221,120 @@ mod tests {
         assert!(checked_contents.value.contains("Option<u8>"));
         assert!(checked_contents.value.contains("`Some`"));
         assert!(checked_contents.value.contains("`None`"));
+    }
+
+    #[test]
+    fn document_should_describe_recoverable_slice_access() {
+        let source = "fn main() -> i32 {\n\
+                          let values: [i32; 2] = [20, 22];\n\
+                          let slice: &[i32] = &values;\n\
+                          let found = slice.get(0);\n\
+                          match found {\n\
+                              Some(value) => *value,\n\
+                              None => 0,\n\
+                          }\n\
+                      }\n"
+        .to_owned();
+        let method_offset = source.find("get(0)").expect("slice method should exist");
+        let method_position = LineIndex::new(Arc::from(source.as_str())).position(method_offset);
+        let result_offset = source.rfind("found {").expect("result use should exist");
+        let result_position = LineIndex::new(Arc::from(source.as_str())).position(result_offset);
+        let document = Document::new(
+            Url::parse("untitled:slice-access.reim").expect("URL should parse"),
+            source,
+        );
+
+        let method_hover = document
+            .hover(method_position)
+            .expect("slice method should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(method_contents) = method_hover.contents
+        else {
+            panic!("hover should use markdown");
+        };
+        assert!(
+            method_contents
+                .value
+                .contains("fn get(self: &[i32], index: usize) -> Option<&i32>")
+        );
+        assert!(method_contents.value.contains("No bounds panic"));
+
+        let result_hover = document
+            .hover(result_position)
+            .expect("slice access result should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(result_contents) = result_hover.contents
+        else {
+            panic!("hover should use markdown");
+        };
+        assert!(result_contents.value.contains("Option<&i32>"));
+        assert!(result_contents.value.contains("`Some`"));
+        assert!(result_contents.value.contains("`None`"));
+    }
+
+    #[test]
+    fn document_should_describe_utf8_views_and_character_iteration() {
+        let source = "fn main() -> i32 {\n\
+                          let text: str = \"Aé🦀\";\n\
+                          let bytes = text.bytes();\n\
+                          let mut characters = text.chars();\n\
+                          let value = characters.next();\n\
+                          match value {\n\
+                              Some(character) => character as i32,\n\
+                              None => 0,\n\
+                          }\n\
+                      }\n"
+        .to_owned();
+        let lines = LineIndex::new(Arc::from(source.as_str()));
+        let bytes_position =
+            lines.position(source.find("bytes()").expect("bytes call should exist"));
+        let chars_position =
+            lines.position(source.find("chars()").expect("chars call should exist"));
+        let next_position = lines.position(source.find("next()").expect("next call should exist"));
+        let document = Document::new(
+            Url::parse("untitled:utf8.reim").expect("URL should parse"),
+            source,
+        );
+
+        let bytes_hover = document
+            .hover(bytes_position)
+            .expect("bytes method should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(bytes_contents) = bytes_hover.contents
+        else {
+            panic!("hover should use markdown");
+        };
+        assert!(
+            bytes_contents
+                .value
+                .contains("fn bytes(self: str) -> &[u8]")
+        );
+        assert!(bytes_contents.value.contains("No allocation or decoding"));
+
+        let chars_hover = document
+            .hover(chars_position)
+            .expect("chars method should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(chars_contents) = chars_hover.contents
+        else {
+            panic!("hover should use markdown");
+        };
+        assert!(
+            chars_contents
+                .value
+                .contains("fn chars(self: str) -> Chars")
+        );
+        assert!(chars_contents.value.contains("Unicode scalar values"));
+
+        let next_hover = document
+            .hover(next_position)
+            .expect("next method should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(next_contents) = next_hover.contents else {
+            panic!("hover should use markdown");
+        };
+        assert!(
+            next_contents
+                .value
+                .contains("fn next(self: &mut Chars) -> Option<char>")
+        );
+        assert!(next_contents.value.contains("exhausted"));
+        assert!(!next_contents.value.contains("__module_"));
     }
 
     #[test]

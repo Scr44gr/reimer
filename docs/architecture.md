@@ -64,6 +64,21 @@ Cranelift lowering evaluates each operand once and uses native overflow flags:
 `None`, and `saturating_add` selects the correct minimum or maximum for the
 integer width. No operation relies on host-language overflow behavior.
 
+## Slices and UTF-8
+
+Checked `slice[index]` remains the concise access form and raises a bounds
+panic for an invalid index. `slice.get(index)` and `slice.get_mut(index)`
+instead return `Option<&T>` and `Option<&mut T>` without calling the panic
+boundary. Their Cranelift lowering evaluates the view and index once, compares
+against the descriptor length, and constructs `Some(reference)` or `None`.
+
+`str.bytes()` creates an immutable `&[u8]` descriptor over the exact same UTF-8
+storage without copying. `str.chars()` creates a scoped, allocation-free
+`Chars` iterator. Its `next()` method and `for character in text.chars()` decode
+Unicode scalar values through one bounded runtime ABI. The runtime validates
+the byte boundary before creating a Rust slice; generated code owns the cursor
+and never exposes raw pointers to source programs.
+
 Frozen syntax and semantic decisions are recorded in
 [`language-decisions-v0.1.md`](language-decisions-v0.1.md).
 

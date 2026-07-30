@@ -113,6 +113,8 @@ pub const BUFFER_EQUALS_SYMBOL: &str = "buffer_equals";
 pub const COPY_BYTES_SYMBOL: &str = "copy_bytes";
 /// ABI symbol used for validating bounded UTF-8 byte regions.
 pub const UTF8_IS_VALID_SYMBOL: &str = "utf8_is_valid";
+/// ABI symbol used for decoding one Unicode scalar from a bounded UTF-8 view.
+pub const UTF8_DECODE_NEXT_SYMBOL: &str = "utf8_decode_next";
 /// ABI symbol used to start one native worker thread.
 pub const THREAD_SPAWN_SYMBOL: &str = "thread_spawn";
 /// ABI symbol used to join one native worker thread.
@@ -792,6 +794,46 @@ pub unsafe extern "C" fn utf8_is_valid(data: *const u8, length: usize) -> bool {
     std::str::from_utf8(bytes).is_ok()
 }
 
+/// Decodes one Unicode scalar at `offset` in a bounded UTF-8 byte region.
+///
+/// The low three result bits contain the consumed byte width and the remaining
+/// bits contain the Unicode scalar. Zero denotes the end of the view or an
+/// invalid boundary.
+///
+/// # Safety
+///
+/// `data` must either be null with a zero `length`, or identify `length`
+/// readable bytes for the duration of this call.
+#[must_use]
+#[unsafe(no_mangle)]
+#[expect(
+    unsafe_code,
+    reason = "the runtime ABI decodes a raw bounded UTF-8 view from generated code"
+)]
+pub unsafe extern "C" fn utf8_decode_next(data: *const u8, length: usize, offset: usize) -> u32 {
+    // SAFETY: The public ABI contract guarantees a live readable byte region.
+    let Some(bytes) = (unsafe { bytes_from_raw_parts(data, length) }) else {
+        return 0;
+    };
+    let Some(suffix) = bytes.get(offset..) else {
+        return 0;
+    };
+    let Ok(text) = std::str::from_utf8(suffix) else {
+        return 0;
+    };
+    let Some(character) = text.chars().next() else {
+        return 0;
+    };
+    let width = match character.len_utf8() {
+        1 => 1_u32,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        _ => return 0,
+    };
+    (u32::from(character) << 3) | width
+}
+
 /// Returns the checked absolute value used by the FFI reference program.
 #[must_use]
 #[unsafe(no_mangle)]
@@ -1080,7 +1122,7 @@ mod tests {
         allocate_bytes, arena_allocator_deinit, arena_allocator_init, buffer_equals, copy_bytes,
         deallocate_bytes, failure_message, fixed_buffer_allocator_deinit,
         fixed_buffer_allocator_init, read_line_into, read_to_end_into, thread_join, thread_spawn,
-        utf8_is_valid, write_all_with_optional_newline,
+        utf8_decode_next, utf8_is_valid, write_all_with_optional_newline,
     };
 
     #[expect(
@@ -1303,5 +1345,32 @@ mod tests {
         assert!(unsafe { utf8_is_valid(valid.as_ptr(), valid.len()) });
         // SAFETY: Both slices remain live for their exact supplied lengths.
         assert!(!unsafe { utf8_is_valid(invalid.as_ptr(), invalid.len()) });
+    }
+
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test supplies a live string view to the UTF-8 decoding ABI"
+    )]
+    fn utf8_decoder_should_report_scalars_and_byte_widths() {
+        let text = "Aé🦀\0";
+        let mut offset = 0;
+        let expected = [('A', 1_u32), ('é', 2), ('🦀', 4), ('\0', 1)];
+
+        for (character, width) in expected {
+            // SAFETY: `text` remains live for its exact supplied byte length.
+            let decoded = unsafe { utf8_decode_next(text.as_ptr(), text.len(), offset) };
+            assert_eq!(decoded & 0b111, width);
+            assert_eq!(decoded >> 3, u32::from(character));
+            offset += usize::try_from(width).expect("UTF-8 width should fit usize");
+        }
+
+        // SAFETY: `offset` is exactly at the end of the same live string.
+        assert_eq!(
+            unsafe { utf8_decode_next(text.as_ptr(), text.len(), offset) },
+            0
+        );
+        // SAFETY: The byte region is live; the offset intentionally targets a continuation byte.
+        assert_eq!(unsafe { utf8_decode_next(text.as_ptr(), text.len(), 2) }, 0);
     }
 }

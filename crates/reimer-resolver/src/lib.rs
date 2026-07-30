@@ -237,6 +237,7 @@ struct TypeRegistry {
     names: HashMap<String, Type>,
     structural: HashMap<StructuralType, Type>,
     definitions: Vec<hir::TypeDefinition>,
+    chars: Option<Type>,
     intrinsics: HashMap<Type, IntrinsicType>,
     generic_templates: HashMap<String, GenericTypeTemplate>,
     generic_instances: HashMap<GenericTypeKey, Type>,
@@ -653,6 +654,48 @@ impl TypeRegistry {
         self.structural.insert(key, ty);
         self.intrinsics.insert(ty, IntrinsicType::Option { value });
         Some(ty)
+    }
+
+    fn intern_chars(&mut self, span: Span, diagnostics: &mut Vec<Diagnostic>) -> Option<Type> {
+        if let Some(ty) = self.chars {
+            return Some(ty);
+        }
+        let kind = hir::TypeDefinitionKind::Struct {
+            fields: vec![
+                hir::TypeField {
+                    name: "source".to_owned(),
+                    is_public: false,
+                    ty: Type::Str,
+                    span,
+                },
+                hir::TypeField {
+                    name: "offset".to_owned(),
+                    is_public: false,
+                    ty: Type::Usize,
+                    span,
+                },
+            ],
+        };
+        let Some(id) = self.push_definition(Some("Chars".to_owned()), kind, Span::empty(0)) else {
+            diagnostics.push(Diagnostic::error(
+                "E3999",
+                "this compilation unit contains too many types",
+                span,
+            ));
+            return None;
+        };
+        let ty = Type::Struct(id);
+        if let Ok(index) = usize::try_from(id.0)
+            && let Some(definition) = self.definitions.get_mut(index)
+        {
+            definition.must_use = true;
+        }
+        self.chars = Some(ty);
+        Some(ty)
+    }
+
+    fn is_chars(&self, ty: Type) -> bool {
+        self.chars == Some(ty)
     }
 
     fn intern_result(
@@ -4203,11 +4246,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 if binding.local.0 >= self.parameter_count {
                     return false;
                 }
-                binding.ty == self.signature.return_type
-                    || self
-                        .types
-                        .pointer_shape(binding.ty)
-                        .is_some_and(|(_, _, raw)| !raw)
+                self.types.is_scoped(binding.ty)
             });
         if !safe_parameter {
             self.diagnostics.push(
@@ -4216,7 +4255,7 @@ impl<'context> FunctionAnalyzer<'context> {
                     "a scoped reference or view cannot escape this function",
                     span,
                 )
-                .with_help("return a reference parameter directly or return owned data"),
+                .with_help("return data rooted in the first scoped parameter or return owned data"),
             );
         }
     }
@@ -4251,7 +4290,7 @@ impl<'context> FunctionAnalyzer<'context> {
 
     fn analyze_for_statement(&mut self, statement: &ast::ForStatement) -> (hir::Statement, Flow) {
         let iterable = self.analyze_expression(&statement.iterable);
-        let element_type = self
+        let indexed_element = self
             .array_shape(iterable.ty)
             .map(|(element, _)| element)
             .or_else(|| {
@@ -4263,14 +4302,23 @@ impl<'context> FunctionAnalyzer<'context> {
                 let (target, _, _) = self.types.pointer_shape(iterable.ty)?;
                 self.array_shape(target).map(|(element, _)| element)
             });
-        let Some(element_type) = element_type else {
+        let iteration = indexed_element
+            .map(|element| (element, hir::ForIteration::Indexed))
+            .or_else(|| {
+                self.types
+                    .is_chars(iterable.ty)
+                    .then_some((Type::Char, hir::ForIteration::Chars))
+            });
+        let Some((element_type, iteration)) = iteration else {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E3130",
                     format!("`for` cannot iterate over `{}`", iterable.ty),
                     statement.iterable.span(),
                 )
-                .with_help("iteration requires an array, array reference, or slice"),
+                .with_help(
+                    "iteration requires an array, array reference, slice, or `str.chars()` iterator",
+                ),
             );
             return (
                 hir::Statement::Expression(invalid_composite_expression(statement.span)),
@@ -4301,6 +4349,7 @@ impl<'context> FunctionAnalyzer<'context> {
             hir::Statement::For {
                 pattern,
                 element_type,
+                iteration,
                 iterable,
                 body,
                 span: statement.span,
@@ -5538,7 +5587,22 @@ impl<'context> FunctionAnalyzer<'context> {
             return invalid_composite_expression(call.span);
         };
         if let Some(expression) =
+            self.analyze_string_iteration_method(call, field, method, expected_return)
+        {
+            return expression;
+        }
+        if let Some(expression) =
+            self.analyze_chars_next_method(call, field, method, expected_return)
+        {
+            return expression;
+        }
+        if let Some(expression) =
             self.analyze_integer_addition_method(call, field, method, expected_return)
+        {
+            return expression;
+        }
+        if let Some(expression) =
+            self.analyze_slice_access_method(call, field, method, expected_return)
         {
             return expression;
         }
@@ -5697,6 +5761,196 @@ impl<'context> FunctionAnalyzer<'context> {
                 mode,
                 left: Box::new(left),
                 right: Box::new(right),
+            },
+            ty: result_type,
+            span: call.span,
+        })
+    }
+
+    fn analyze_string_iteration_method(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        let bytes = match method.name.as_str() {
+            "bytes" => true,
+            "chars" => false,
+            _ => return None,
+        };
+        let receiver_is_string = matches!(&field.base, AstExpression::String(_))
+            || self.place_expression_type(&field.base) == Some(Type::Str);
+        if !receiver_is_string {
+            return None;
+        }
+        self.validate_intrinsic_method_arguments(call, method, "string", 0);
+        self.require_expression_root_available(&field.base, call.span);
+        let source = self.analyze_expression_non_consuming(&field.base);
+        let previous_persistence = self.persistent_borrow;
+        self.persistent_borrow = true;
+        self.check_and_record_borrow(&field.base, false, call.span);
+        self.persistent_borrow = previous_persistence;
+        let result_type = if bytes {
+            self.types
+                .intern_slice(Type::U8, false, call.span, self.diagnostics)
+        } else {
+            self.types.intern_chars(call.span, self.diagnostics)
+        }
+        .unwrap_or(Type::Unit);
+        if let Some(expected) = expected_return {
+            self.require_type(expected, result_type, call.span, "string method result");
+        }
+        Some(Expression {
+            kind: if bytes {
+                ExpressionKind::StringBytes(Box::new(source))
+            } else {
+                ExpressionKind::StringChars(Box::new(source))
+            },
+            ty: result_type,
+            span: call.span,
+        })
+    }
+
+    fn analyze_chars_next_method(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        if method.name != "next" {
+            return None;
+        }
+        let receiver_type = self.place_expression_type(&field.base)?;
+        if !self.types.is_chars(receiver_type) {
+            return None;
+        }
+        self.validate_intrinsic_method_arguments(call, method, "character iterator", 0);
+        self.require_expression_root_available(&field.base, call.span);
+        self.require_mutable_place(&field.base);
+        let iterator = self.analyze_place(&field.base)?;
+        let result_type = self
+            .types
+            .intern_option(Type::Char, call.span, self.diagnostics)
+            .unwrap_or(Type::Unit);
+        if let Some(expected) = expected_return {
+            self.require_type(expected, result_type, call.span, "iterator method result");
+        }
+        Some(Expression {
+            kind: ExpressionKind::CharsNext { iterator },
+            ty: result_type,
+            span: call.span,
+        })
+    }
+
+    fn validate_intrinsic_method_arguments(
+        &mut self,
+        call: &ast::CallExpression,
+        method: &ast::Identifier,
+        receiver: &str,
+        expected: usize,
+    ) {
+        if !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    format!("{receiver} method `{}` is not generic", method.name),
+                    call.span,
+                )
+                .with_help("remove the arguments between `<` and `>`"),
+            );
+        }
+        if call.arguments.len() != expected {
+            self.diagnostics.push(Diagnostic::error(
+                "E3105",
+                format!(
+                    "{receiver} method `{}` expects {expected} argument(s), but {} were provided",
+                    method.name,
+                    call.arguments.len()
+                ),
+                call.span,
+            ));
+        }
+        for argument in &call.arguments {
+            self.analyze_expression(argument);
+        }
+    }
+
+    fn analyze_slice_access_method(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        let mutable = match method.name.as_str() {
+            "get" => false,
+            "get_mut" => true,
+            _ => return None,
+        };
+        let receiver_type = self.place_expression_type(&field.base)?;
+        let (element, receiver_mutable) = self.types.slice_shape(receiver_type)?;
+        if !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    format!("slice method `{}` is not generic", method.name),
+                    call.span,
+                )
+                .with_help("remove the arguments between `<` and `>`"),
+            );
+        }
+        if call.arguments.len() != 1 {
+            self.diagnostics.push(Diagnostic::error(
+                "E3105",
+                format!(
+                    "slice method `{}` expects 1 argument(s), but {} were provided",
+                    method.name,
+                    call.arguments.len()
+                ),
+                call.span,
+            ));
+        }
+        if mutable && !receiver_mutable {
+            self.diagnostics.push(
+                Diagnostic::error("E3107", "`get_mut` requires a mutable slice", field.span)
+                    .with_help("borrow the source as `&mut [T]` before calling `get_mut`"),
+            );
+        }
+
+        self.require_expression_root_available(&field.base, call.span);
+        let slice = self.analyze_expression_non_consuming(&field.base);
+        let previous_persistence = self.persistent_borrow;
+        self.persistent_borrow = true;
+        self.check_and_record_borrow(&field.base, mutable, call.span);
+        self.persistent_borrow = previous_persistence;
+        let index = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+        );
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        self.require_type(Type::Usize, index.ty, index.span, "slice index");
+
+        let reference_type = self
+            .types
+            .intern_reference(element, mutable, call.span, self.diagnostics)
+            .unwrap_or(Type::Unit);
+        let result_type = self
+            .types
+            .intern_option(reference_type, call.span, self.diagnostics)
+            .unwrap_or(Type::Unit);
+        if let Some(expected) = expected_return {
+            self.require_type(expected, result_type, call.span, "slice method result");
+        }
+        Some(Expression {
+            kind: ExpressionKind::SliceGet {
+                slice: Box::new(slice),
+                index: Box::new(index),
+                reference_type,
+                mutable,
             },
             ty: result_type,
             span: call.span,
@@ -10558,6 +10812,113 @@ mod tests {
 
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "E3105" && diagnostic.message.contains("wrapping_add")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_type_recoverable_slice_access() {
+        let source = "
+            fn read(values: &[i32], index: usize) -> Option<&i32> {
+                values.get(index)
+            }
+            fn update(values: &mut [i32], index: usize) -> Option<&mut i32> {
+                values.get_mut(index)
+            }
+            fn main() -> i32 {
+                let mut values: [i32; 2] = [20, 22];
+                {
+                    let slice: &mut [i32] = &mut values;
+                    match update(slice, 1) {
+                        Some(value) => *value,
+                        None => 0,
+                    };
+                }
+                let slice: &[i32] = &values;
+                match read(slice, 0) {
+                    Some(value) => *value,
+                    None => 0,
+                }
+            }";
+
+        resolve_fixture(source).expect("recoverable slice access should resolve");
+    }
+
+    #[test]
+    fn resolve_should_reject_get_mut_on_an_immutable_slice() {
+        let source = "
+            fn invalid(values: &[i32]) -> Option<&mut i32> {
+                values.get_mut(0)
+            }
+            fn main() -> i32 { 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("immutable slice should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E3107" && diagnostic.message.contains("mutable slice")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_reject_wrong_slice_access_arity() {
+        let source = "
+            fn invalid(values: &[i32]) {
+                values.get();
+            }
+            fn main() -> i32 { 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("missing slice index should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E3105" && diagnostic.message.contains("slice method `get`")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_type_utf8_byte_views_and_character_iteration() {
+        let source = "
+            fn encoded(text: str) -> &[u8] {
+                text.bytes()
+            }
+            fn main() -> i32 {
+                let text: str = \"Aé🦀\";
+                let bytes = encoded(text);
+                let mut characters = text.chars();
+                let first = match characters.next() {
+                    Some(value) => value,
+                    None => 'x',
+                };
+                let second = match characters.next() {
+                    Some(value) => value,
+                    None => 'x',
+                };
+                let mut count: usize = 0;
+                for _ in text.chars() {
+                    count += 1;
+                }
+                if bytes[0] == 65 && first == 'A' && second == 'é' && count == 3 {
+                    42
+                } else {
+                    0
+                }
+            }";
+
+        resolve_fixture(source).expect("UTF-8 iteration should resolve");
+    }
+
+    #[test]
+    fn resolve_should_require_a_mutable_character_iterator() {
+        let source = "
+            fn main() -> i32 {
+                let text: str = \"A\";
+                let characters = text.chars();
+                characters.next();
+                0
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("immutable iterator should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E3107" && diagnostic.message.contains("characters")
         }));
     }
 

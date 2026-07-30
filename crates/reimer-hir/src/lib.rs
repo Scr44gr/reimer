@@ -314,7 +314,9 @@ pub enum Statement {
         pattern: Pattern,
         /// Type produced by each iteration.
         element_type: Type,
-        /// Array value evaluated once before iteration.
+        /// Strategy used to advance the iterable.
+        iteration: ForIteration,
+        /// Iterable value evaluated once before iteration.
         iterable: Expression,
         /// Repeated loop body.
         body: Block,
@@ -330,6 +332,15 @@ pub enum Statement {
     },
     /// Starts the next iteration of the innermost loop.
     Continue(Span),
+}
+
+/// Typed advancement strategy for a `for` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForIteration {
+    /// Reads consecutive elements from an array or slice.
+    Indexed,
+    /// Decodes consecutive Unicode scalar values from a string iterator.
+    Chars,
 }
 
 /// An expression annotated with its semantic type.
@@ -486,6 +497,26 @@ pub enum ExpressionKind {
     StringLength(Box<Expression>),
     /// Extracts the element count from a bounded slice view.
     SliceLength(Box<Expression>),
+    /// Reinterprets a valid UTF-8 string view as its borrowed bytes.
+    StringBytes(Box<Expression>),
+    /// Creates a Unicode scalar iterator over a valid UTF-8 string view.
+    StringChars(Box<Expression>),
+    /// Decodes and consumes the next Unicode scalar from a string iterator.
+    CharsNext {
+        /// Mutable iterator storage containing the source view and byte cursor.
+        iterator: Place,
+    },
+    /// Performs recoverable element access on a bounded slice view.
+    SliceGet {
+        /// Slice descriptor evaluated exactly once.
+        slice: Box<Expression>,
+        /// Zero-based element index.
+        index: Box<Expression>,
+        /// Reference stored in the `Some` variant.
+        reference_type: Type,
+        /// Whether the returned reference permits mutation.
+        mutable: bool,
+    },
     /// Builds a bounded UTF-8 string view from validated raw parts.
     StringFromParts {
         /// First byte of the live UTF-8 region.
