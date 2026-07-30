@@ -158,7 +158,7 @@ impl<'ast> SyntaxIndex<'ast> {
                         index.insert_function(method);
                     }
                 }
-                Item::Import(_) => {}
+                Item::Import(_) | Item::Constant(_) | Item::Comptime(_) => {}
             }
         }
         walk::program(&mut index, program);

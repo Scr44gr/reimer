@@ -199,6 +199,17 @@
           }
         },
         {
+          "match": "\\b(const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.reimer"
+            },
+            "2": {
+              "name": "constant.other.reimer"
+            }
+          }
+        },
+        {
           "match": "\\b(impl)\\b",
           "captures": {
             "1": {
@@ -254,7 +265,7 @@
         },
         {
           "name": "storage.modifier.reimer",
-          "match": "\\b(?:pub|mut|const|unsafe|extern|where)\\b"
+          "match": "\\b(?:pub|mut|const|comptime|unsafe|extern|where)\\b"
         }
       ]
     },
@@ -302,11 +313,11 @@
       "patterns": [
         {
           "name": "support.function.builtin.reimer",
-          "match": "\\b(?:panic|print|println|eprint|eprintln|allocate_bytes|general_allocator|page_allocator)\\b(?=\\s*\\()"
+          "match": "\\b(?:panic|print|println|eprint|eprintln|stdin|stdout|stderr|allocate_bytes|general_allocator|page_allocator|size_of|align_of|name|fields|variants|traits)\\b(?=\\s*(?:<[^;{}()]+>\\s*)?\\()"
         },
         {
           "name": "entity.name.function.call.reimer",
-          "match": "\\b[a-z_][A-Za-z0-9_]*\\b(?=\\s*\\()"
+          "match": "\\b[a-z_][A-Za-z0-9_]*\\b(?=\\s*(?:<[^;{}()]+>\\s*)?\\()"
         }
       ]
     },

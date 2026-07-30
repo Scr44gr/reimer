@@ -78,6 +78,11 @@ pub(crate) fn program(visitor: &mut impl Visitor, program: &ast::Program) {
                     function_declaration(visitor, method);
                 }
             }
+            Item::Constant(declaration) => {
+                type_name(visitor, &declaration.ty);
+                expression(visitor, &declaration.value);
+            }
+            Item::Comptime(block) => self::block(visitor, &block.body),
         }
     }
 }
@@ -187,6 +192,12 @@ pub(crate) fn expression(visitor: &mut impl Visitor, expression: &Expression) {
         }
         Expression::Call(call) => {
             self::expression(visitor, &call.callee);
+            for argument in &call.generic_arguments {
+                match argument {
+                    GenericArgument::Type(ty) => type_name(visitor, ty),
+                    GenericArgument::Const(value) => self::expression(visitor, value),
+                }
+            }
             for argument in &call.arguments {
                 self::expression(visitor, argument);
             }

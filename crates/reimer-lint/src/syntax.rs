@@ -408,7 +408,8 @@ impl Visitor for NameCollector {
             Item::Struct(declaration) => Some(&declaration.name),
             Item::Enum(declaration) => Some(&declaration.name),
             Item::Trait(declaration) => Some(&declaration.name),
-            Item::Import(_) | Item::Impl(_) => None,
+            Item::Constant(declaration) => Some(&declaration.name),
+            Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => None,
         };
         if let Some(name) = name {
             self.names.insert(name.name.clone());

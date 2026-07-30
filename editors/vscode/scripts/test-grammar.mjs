@@ -77,6 +77,32 @@ assertScope(
   "window",
   "string.quoted.double.c.reimer",
 );
+assertScope(
+  grammar,
+  "comptime fn factorial(value: usize) -> usize { value }",
+  "comptime",
+  "storage.modifier.reimer",
+);
+assertScope(
+  grammar,
+  "const BYTES: usize = size_of<Header>();",
+  "BYTES",
+  "constant.other.reimer",
+);
+assertScope(
+  grammar,
+  "const BYTES: usize = size_of<Header>();",
+  "size_of",
+  "support.function.builtin.reimer",
+);
+for (const tokenText of ["*", "->"]) {
+  assertScope(
+    grammar,
+    "fn pointer() -> *mut i32 { panic(\"unused\") }",
+    tokenText,
+    "keyword.operator.reimer",
+  );
+}
 
 function assertScope(grammar, line, tokenText, expectedScope) {
   const scopes = scopesFor(grammar, line, tokenText);

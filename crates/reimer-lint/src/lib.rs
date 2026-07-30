@@ -6,6 +6,7 @@
 
 mod imports;
 mod memory;
+mod must_use;
 mod semantic;
 mod syntax;
 mod walk;
@@ -146,7 +147,10 @@ pub fn analyze(source: &str) -> Analysis {
         None
     } else {
         match reimer_resolver::resolve(&syntax) {
-            Ok(program) => Some(program),
+            Ok(program) => {
+                findings.extend(must_use::lint(&program));
+                Some(program)
+            }
             Err(diagnostics) => {
                 findings.extend(diagnostics.into_iter().map(Finding::from_compiler));
                 None
@@ -181,6 +185,15 @@ pub fn index_typed(
     typed: &hir::Program,
 ) -> (Vec<TypeHint>, Vec<DefinitionLink>) {
     semantic::index(syntax, typed)
+}
+
+/// Applies lints that require a fully resolved typed program.
+///
+/// Editor hosts use this after resolving a saved multi-file package, where the
+/// initial in-memory pass cannot type-check imported symbols in isolation.
+#[must_use]
+pub fn lint_typed(typed: &hir::Program) -> Vec<Finding> {
+    must_use::lint(typed)
 }
 
 /// Adds close-name corrections to unresolved compiler diagnostics.
@@ -228,6 +241,24 @@ mod tests {
         assert!(analysis.allocations.iter().any(|estimate| {
             estimate.quantity == AllocationQuantity::Exact(64)
                 && estimate.operation == "allocate_bytes"
+        }));
+    }
+
+    #[test]
+    fn analyze_should_warn_when_a_must_use_result_is_discarded() {
+        let analysis = analyze(
+            "@must_use
+             fn checked() -> i32 { 42 }
+             fn main() -> i32 {
+                 checked();
+                 0
+             }",
+        );
+
+        assert!(analysis.findings.iter().any(|finding| {
+            finding.code == "L2020"
+                && finding.severity == Severity::Warning
+                && finding.message.contains("checked")
         }));
     }
 }

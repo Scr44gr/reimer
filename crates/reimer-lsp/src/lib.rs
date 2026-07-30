@@ -8,7 +8,7 @@ use std::sync::Arc;
 use reimer_ast::Item;
 use reimer_lint::{
     AllocationQuantity, AllocatorSummary, Analysis, Finding, Fix, Severity, analyze,
-    apply_spelling_fixes, index_typed, organize_imports,
+    apply_spelling_fixes, index_typed, lint_typed, organize_imports,
 };
 use reimer_project::{LockMode, Project, ProjectError};
 use tower_lsp::lsp_types::{
@@ -187,7 +187,12 @@ impl Document {
                         CompletionItemKind::INTERFACE,
                         "trait",
                     ),
-                    Item::Import(_) | Item::Impl(_) => continue,
+                    Item::Constant(declaration) => (
+                        &declaration.name.name,
+                        CompletionItemKind::CONSTANT,
+                        "compile-time constant",
+                    ),
+                    Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => continue,
                 };
                 if seen.insert(name.clone()) {
                     items.push(simple_completion(name, kind, detail));
@@ -404,6 +409,7 @@ impl Document {
                 self.analysis
                     .findings
                     .retain(|finding| finding.severity != Severity::Error);
+                self.analysis.findings.extend(lint_typed(&typed));
                 if let Some(syntax) = &self.analysis.syntax {
                     let (type_hints, definitions) = index_typed(syntax, &typed);
                     self.analysis.type_hints = type_hints;
@@ -520,6 +526,22 @@ impl Document {
                 declaration.span,
                 declaration.target.span,
                 Some(self.method_symbols(&declaration.methods)),
+            ),
+            Item::Constant(declaration) => (
+                declaration.name.name.clone(),
+                Some("compile-time constant".to_owned()),
+                SymbolKind::CONSTANT,
+                declaration.span,
+                declaration.name.span,
+                None,
+            ),
+            Item::Comptime(block) => (
+                "comptime".to_owned(),
+                Some("compile-time assertion block".to_owned()),
+                SymbolKind::NAMESPACE,
+                block.span,
+                block.span,
+                None,
             ),
         };
         Some(self.symbol(name, detail, kind, span, selection_span, children))
@@ -701,67 +723,94 @@ fn simple_completion(label: &str, kind: CompletionItemKind, detail: &str) -> Com
     }
 }
 
+const LANGUAGE_KEYWORDS: &[&str] = &[
+    "as", "break", "comptime", "const", "continue", "defer", "else", "enum", "extern", "false",
+    "fn", "for", "from", "if", "impl", "import", "in", "let", "loop", "match", "mut", "pub",
+    "return", "struct", "trait", "true", "unsafe", "where",
+];
+
+const PRIMITIVE_TYPES: &[&str] = &[
+    "bool", "char", "cstr", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8",
+    "u16", "u32", "u64", "u128", "usize",
+];
+
+const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
+    ("print", CompletionItemKind::FUNCTION, "std::io"),
+    ("println", CompletionItemKind::FUNCTION, "std::io"),
+    ("eprint", CompletionItemKind::FUNCTION, "std::io"),
+    ("eprintln", CompletionItemKind::FUNCTION, "std::io"),
+    ("stdin", CompletionItemKind::FUNCTION, "std::io"),
+    ("stdout", CompletionItemKind::FUNCTION, "std::io"),
+    ("stderr", CompletionItemKind::FUNCTION, "std::io"),
+    ("read", CompletionItemKind::METHOD, "Stdin"),
+    ("read_exact", CompletionItemKind::METHOD, "Stdin"),
+    ("read_line", CompletionItemKind::METHOD, "Stdin"),
+    ("read_to_end", CompletionItemKind::METHOD, "Stdin"),
+    ("read_line_string", CompletionItemKind::METHOD, "Stdin"),
+    ("read_to_string", CompletionItemKind::METHOD, "Stdin"),
+    (
+        "size_of",
+        CompletionItemKind::FUNCTION,
+        "compile-time metadata",
+    ),
+    (
+        "align_of",
+        CompletionItemKind::FUNCTION,
+        "compile-time metadata",
+    ),
+    ("name", CompletionItemKind::FUNCTION, "meta"),
+    ("fields", CompletionItemKind::FUNCTION, "meta"),
+    ("variants", CompletionItemKind::FUNCTION, "meta"),
+    ("traits", CompletionItemKind::FUNCTION, "meta"),
+    (
+        "general_allocator",
+        CompletionItemKind::FUNCTION,
+        "std::alloc",
+    ),
+    ("page_allocator", CompletionItemKind::FUNCTION, "std::alloc"),
+    ("allocate_bytes", CompletionItemKind::FUNCTION, "std::alloc"),
+    ("Option", CompletionItemKind::ENUM, "core"),
+    ("Result", CompletionItemKind::ENUM, "core"),
+    ("String", CompletionItemKind::STRUCT, "std::string"),
+    ("from", CompletionItemKind::METHOD, "String::from"),
+    ("as_str", CompletionItemKind::METHOD, "String::as_str"),
+    ("clone_in", CompletionItemKind::METHOD, "String::clone_in"),
+    ("Thread", CompletionItemKind::STRUCT, "std::thread"),
+    ("scope", CompletionItemKind::FUNCTION, "std::thread"),
+    ("Mutex", CompletionItemKind::STRUCT, "std::thread"),
+    ("RwLock", CompletionItemKind::STRUCT, "std::thread"),
+    ("Channel", CompletionItemKind::STRUCT, "std::thread"),
+    ("Barrier", CompletionItemKind::STRUCT, "std::thread"),
+    ("Semaphore", CompletionItemKind::STRUCT, "std::thread"),
+    ("AtomicU64", CompletionItemKind::STRUCT, "std::thread"),
+    ("AtomicI64", CompletionItemKind::STRUCT, "std::thread"),
+    ("AtomicUsize", CompletionItemKind::STRUCT, "std::thread"),
+    ("AtomicIsize", CompletionItemKind::STRUCT, "std::thread"),
+    ("AtomicBool", CompletionItemKind::STRUCT, "std::thread"),
+    ("ThreadLocal", CompletionItemKind::STRUCT, "std::thread"),
+    ("JobPool", CompletionItemKind::STRUCT, "std::job"),
+    ("JobPoolConfig", CompletionItemKind::STRUCT, "std::job"),
+    ("Job", CompletionItemKind::STRUCT, "std::job"),
+    ("chunk_len", CompletionItemKind::FUNCTION, "std::job"),
+    ("parallel_for_mut", CompletionItemKind::FUNCTION, "std::job"),
+    (
+        "parallel_for_array_mut",
+        CompletionItemKind::FUNCTION,
+        "std::job",
+    ),
+    (
+        "deinit",
+        CompletionItemKind::METHOD,
+        "owned resource cleanup",
+    ),
+];
+
 fn language_completions() -> Vec<CompletionItem> {
-    let keywords = [
-        "as", "break", "const", "continue", "defer", "else", "enum", "extern", "false", "fn",
-        "for", "from", "if", "impl", "import", "in", "let", "loop", "match", "mut", "pub",
-        "return", "struct", "trait", "true", "unsafe", "where",
-    ];
-    let primitives = [
-        "bool", "char", "cstr", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str",
-        "u8", "u16", "u32", "u64", "u128", "usize",
-    ];
-    let standard = [
-        ("print", CompletionItemKind::FUNCTION, "std::io"),
-        ("println", CompletionItemKind::FUNCTION, "std::io"),
-        ("eprint", CompletionItemKind::FUNCTION, "std::io"),
-        ("eprintln", CompletionItemKind::FUNCTION, "std::io"),
-        (
-            "general_allocator",
-            CompletionItemKind::FUNCTION,
-            "std::alloc",
-        ),
-        ("page_allocator", CompletionItemKind::FUNCTION, "std::alloc"),
-        ("allocate_bytes", CompletionItemKind::FUNCTION, "std::alloc"),
-        ("Option", CompletionItemKind::ENUM, "core"),
-        ("Result", CompletionItemKind::ENUM, "core"),
-        ("String", CompletionItemKind::STRUCT, "std::string"),
-        ("from", CompletionItemKind::METHOD, "String::from"),
-        ("as_str", CompletionItemKind::METHOD, "String::as_str"),
-        ("clone_in", CompletionItemKind::METHOD, "String::clone_in"),
-        ("Thread", CompletionItemKind::STRUCT, "std::thread"),
-        ("scope", CompletionItemKind::FUNCTION, "std::thread"),
-        ("Mutex", CompletionItemKind::STRUCT, "std::thread"),
-        ("RwLock", CompletionItemKind::STRUCT, "std::thread"),
-        ("Channel", CompletionItemKind::STRUCT, "std::thread"),
-        ("Barrier", CompletionItemKind::STRUCT, "std::thread"),
-        ("Semaphore", CompletionItemKind::STRUCT, "std::thread"),
-        ("AtomicU64", CompletionItemKind::STRUCT, "std::thread"),
-        ("AtomicI64", CompletionItemKind::STRUCT, "std::thread"),
-        ("AtomicUsize", CompletionItemKind::STRUCT, "std::thread"),
-        ("AtomicIsize", CompletionItemKind::STRUCT, "std::thread"),
-        ("AtomicBool", CompletionItemKind::STRUCT, "std::thread"),
-        ("ThreadLocal", CompletionItemKind::STRUCT, "std::thread"),
-        ("JobPool", CompletionItemKind::STRUCT, "std::job"),
-        ("JobPoolConfig", CompletionItemKind::STRUCT, "std::job"),
-        ("Job", CompletionItemKind::STRUCT, "std::job"),
-        ("chunk_len", CompletionItemKind::FUNCTION, "std::job"),
-        ("parallel_for_mut", CompletionItemKind::FUNCTION, "std::job"),
-        (
-            "parallel_for_array_mut",
-            CompletionItemKind::FUNCTION,
-            "std::job",
-        ),
-        (
-            "deinit",
-            CompletionItemKind::METHOD,
-            "owned resource cleanup",
-        ),
-    ];
-    let mut items = keywords
-        .into_iter()
+    let mut items = LANGUAGE_KEYWORDS
+        .iter()
+        .copied()
         .map(|keyword| simple_completion(keyword, CompletionItemKind::KEYWORD, "keyword"))
-        .chain(primitives.into_iter().map(|primitive| {
+        .chain(PRIMITIVE_TYPES.iter().copied().map(|primitive| {
             simple_completion(
                 primitive,
                 CompletionItemKind::TYPE_PARAMETER,
@@ -769,11 +818,29 @@ fn language_completions() -> Vec<CompletionItem> {
             )
         }))
         .chain(
-            standard
-                .into_iter()
+            STANDARD_SYMBOLS
+                .iter()
+                .copied()
                 .map(|(name, kind, module)| simple_completion(name, kind, module)),
         )
         .collect::<Vec<_>>();
+    for (label, insertion) in [
+        ("@derive", "@derive(${1:Copy, Eq})"),
+        ("@repr", "@repr(${1:C})"),
+        ("@align", "@align(${1:16})"),
+        ("@inline", "@inline"),
+        ("@test", "@test"),
+        ("@must_use", "@must_use"),
+    ] {
+        items.push(CompletionItem {
+            label: label.to_owned(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some("built-in attribute".to_owned()),
+            insert_text: Some(insertion.to_owned()),
+            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            ..CompletionItem::default()
+        });
+    }
     items.push(CompletionItem {
         label: "fn".to_owned(),
         kind: Some(CompletionItemKind::SNIPPET),
@@ -932,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn document_should_complete_concurrency_and_job_types() {
+    fn document_should_complete_runtime_and_comptime_symbols() {
         let document = Document::new(
             Url::parse("untitled:main.reim").expect("URL should parse"),
             "fn main() {}\n".to_owned(),
@@ -944,7 +1011,16 @@ mod tests {
             .map(|item| item.label)
             .collect::<Vec<_>>();
 
-        let required = ["Thread", "AtomicBool", "JobPool", "parallel_for_mut"];
+        let required = [
+            "Thread",
+            "AtomicBool",
+            "JobPool",
+            "parallel_for_mut",
+            "comptime",
+            "size_of",
+            "fields",
+            "@derive",
+        ];
         assert!(
             required
                 .iter()
@@ -990,5 +1066,34 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR))
         );
+    }
+
+    #[test]
+    fn document_should_lint_must_use_calls_from_a_manifest_dependency() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2026\"\n\n\
+             [dependencies]\nmath = { path = \"../math\" }\n",
+        );
+        let source = "from math import checked;\nfn main() -> i32 { checked(); 0 }\n";
+        let main = fixture.write("app/src/main.reim", source);
+        fixture.write(
+            "math/reimer.toml",
+            "[package]\nname = \"math\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+        );
+        fixture.write(
+            "math/src/package.reim",
+            "@must_use\npub fn checked() -> i32 { 42 }\n",
+        );
+        let uri = Url::from_file_path(main).expect("file URL should be created");
+
+        let document = Document::new(uri, source.to_owned());
+
+        assert!(document.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code.as_ref().is_some_and(|code| {
+                code == &tower_lsp::lsp_types::NumberOrString::String("L2020".to_owned())
+            })
+        }));
     }
 }
