@@ -19,10 +19,10 @@ use cranelift_object::object::{BinaryFormat, SectionKind};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_hir::{
-    AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, ForIteration, Function,
-    FunctionId, IntegerAdditionMode, LocalId, MatchExpression, Pattern, PatternKind, Place,
-    PlaceKind, Program, Statement, Static, StaticId, SynchronizationKind, TypeDefinitionKind,
-    UnaryOperator,
+    AssertionMode, AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind,
+    ForIteration, Function, FunctionId, IntegerAdditionMode, LocalId, MatchExpression, Pattern,
+    PatternKind, Place, PlaceKind, Program, Statement, Static, StaticId, SynchronizationKind,
+    TypeDefinitionKind, UnaryOperator,
 };
 use reimer_layout::{AggregateLayoutKind, Layouts};
 use reimer_runtime::Failure;
@@ -50,6 +50,10 @@ impl OptimizationLevel {
             Self::Speed => "speed",
             Self::SpeedAndSize => "speed_and_size",
         }
+    }
+
+    const fn debug_assertions(self) -> bool {
+        matches!(self, Self::None)
     }
 }
 
@@ -127,7 +131,7 @@ pub fn emit_object_with_options(
     let builder = ObjectBuilder::new(isa, "program", default_libcall_names())
         .map_err(|error| backend_error(error.to_string()))?;
     let mut module = ObjectModule::new(builder);
-    compile_program(&mut module, program).map_err(backend_error)?;
+    compile_program(&mut module, program, optimization).map_err(backend_error)?;
     let mut product = module.finish();
     add_object_link_metadata(&mut product.object, program);
     product
@@ -197,7 +201,7 @@ pub fn execute_with_options(
         builder.symbol_lookup_fn(Box::new(move |name| libraries.lookup(name)));
     }
     let mut module = JITModule::new(builder);
-    let functions = compile_program(&mut module, program).map_err(backend_error)?;
+    let functions = compile_program(&mut module, program, optimization).map_err(backend_error)?;
     module
         .finalize_definitions()
         .map_err(|error| backend_error(error.to_string()))?;
@@ -268,7 +272,7 @@ pub fn execute_test_with_options(
         builder.symbol_lookup_fn(Box::new(move |name| libraries.lookup(name)));
     }
     let mut module = JITModule::new(builder);
-    let functions = compile_program(&mut module, program).map_err(backend_error)?;
+    let functions = compile_program(&mut module, program, optimization).map_err(backend_error)?;
     module
         .finalize_definitions()
         .map_err(|error| backend_error(error.to_string()))?;
@@ -286,6 +290,7 @@ pub fn execute_test_with_options(
 
 fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_core_symbols(builder);
+    register_target_symbols(builder);
     register_storage_symbols(builder);
     register_coordination_symbols(builder);
 }
@@ -401,6 +406,16 @@ fn register_core_symbols(builder: &mut JITBuilder) {
         ),
     ];
     register_symbol_group(builder, symbols);
+}
+
+fn register_target_symbols(builder: &mut JITBuilder) {
+    register_symbol_group(
+        builder,
+        [(
+            reimer_runtime::TARGET_OS_SYMBOL,
+            reimer_runtime::target_os_code as *const u8,
+        )],
+    );
 }
 
 fn register_storage_symbols(builder: &mut JITBuilder) {
@@ -611,6 +626,7 @@ fn host_isa(optimization: OptimizationLevel) -> Result<OwnedTargetIsa, String> {
 fn compile_program<M: Module>(
     module: &mut M,
     program: &Program,
+    optimization: OptimizationLevel,
 ) -> Result<HashMap<FunctionId, FuncId>, String> {
     let layouts = Layouts::build(&program.types)?;
     let statics = declare_statics(module, program, &layouts)?;
@@ -624,6 +640,7 @@ fn compile_program<M: Module>(
             &statics,
             &thread_thunks,
             &layouts,
+            optimization.debug_assertions(),
         )?;
     }
     Ok(functions)
@@ -1408,6 +1425,7 @@ fn define_function<M: Module>(
     statics: &HashMap<StaticId, DataId>,
     thread_thunks: &HashMap<ThreadThunkKey, FuncId>,
     layouts: &Layouts,
+    debug_assertions: bool,
 ) -> Result<(), String> {
     let function_id = functions
         .get(&function.id)
@@ -1441,6 +1459,7 @@ fn define_function<M: Module>(
             thread_thunks,
             return_destination,
             target_config,
+            debug_assertions,
         );
 
         for parameter in &function.parameters {
@@ -1686,6 +1705,7 @@ struct CodegenState<'layouts> {
     thread_thunks: &'layouts HashMap<ThreadThunkKey, FuncId>,
     return_destination: Option<Value>,
     target_config: TargetFrontendConfig,
+    debug_assertions: bool,
     defer_scopes: Vec<Vec<Expression>>,
 }
 
@@ -1702,6 +1722,7 @@ impl<'layouts> CodegenState<'layouts> {
         thread_thunks: &'layouts HashMap<ThreadThunkKey, FuncId>,
         return_destination: Option<Value>,
         target_config: TargetFrontendConfig,
+        debug_assertions: bool,
     ) -> Self {
         Self {
             locals: HashMap::new(),
@@ -1711,6 +1732,7 @@ impl<'layouts> CodegenState<'layouts> {
             thread_thunks,
             return_destination,
             target_config,
+            debug_assertions,
             defer_scopes: Vec::new(),
         }
     }
@@ -2271,6 +2293,7 @@ fn emit_expression<M: Module>(
         ExpressionKind::Borrow { .. } | ExpressionKind::Dereference(_) => {
             emit_pointer_expression(builder, module, functions, state, expression)
         }
+        ExpressionKind::Assert { .. } => emit_assert(builder, module, functions, state, expression),
         ExpressionKind::Panic { message } => emit_panic(builder, module, functions, state, message),
         ExpressionKind::StringData(_)
         | ExpressionKind::StringLength(_)
@@ -3367,6 +3390,55 @@ fn emit_panic<M: Module>(
     builder.ins().call(function, &[data, length, byte_offset]);
     builder.ins().trap(TrapCode::unwrap_user(2));
     Ok(Emitted::terminated())
+}
+
+fn emit_assert_parts<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    mode: AssertionMode,
+    condition: &Expression,
+    message: &Expression,
+) -> Result<Emitted, String> {
+    if mode == AssertionMode::Debug && !state.debug_assertions {
+        return Ok(Emitted::unit());
+    }
+    let condition = emit_expression(builder, module, functions, state, condition)?;
+    if condition.terminated {
+        return Ok(condition);
+    }
+    let condition = require_value(condition, "assertion condition")?;
+    let succeeded = builder.create_block();
+    let failed = builder.create_block();
+    builder.ins().brif(condition, succeeded, &[], failed, &[]);
+
+    builder.switch_to_block(failed);
+    let panicked = emit_panic(builder, module, functions, state, message)?;
+    if !panicked.terminated {
+        return Err("failed assertion did not terminate execution".to_owned());
+    }
+
+    builder.switch_to_block(succeeded);
+    Ok(Emitted::unit())
+}
+
+fn emit_assert<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    expression: &Expression,
+) -> Result<Emitted, String> {
+    let ExpressionKind::Assert {
+        mode,
+        condition,
+        message,
+    } = &expression.kind
+    else {
+        return Err("assertion lowering received a different expression".to_owned());
+    };
+    emit_assert_parts(builder, module, functions, state, *mode, condition, message)
 }
 
 fn load_string_view(
@@ -6693,6 +6765,43 @@ mod tests {
             .expect("optimized fixture should execute");
 
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_check_assertions_in_every_profile() {
+        let program = compile_fixture(
+            "fn mark(value: &mut i32) -> bool { *value = 42; true }
+             fn main() -> i32 {
+                 let mut value = 0;
+                 assert(mark(&mut value), \"mark should succeed\");
+                 value
+             }",
+        );
+
+        let result = execute_with_options(&program, OptimizationLevel::Speed)
+            .expect("optimized assertion should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_omit_debug_assertion_operands_in_optimized_profiles() {
+        let program = compile_fixture(
+            "fn mark(value: &mut i32) -> bool { *value = 42; true }
+             fn main() -> i32 {
+                 let mut value = 0;
+                 debug_assert(mark(&mut value), \"mark should succeed\");
+                 value
+             }",
+        );
+
+        let debug = execute_with_options(&program, OptimizationLevel::None)
+            .expect("debug assertion should execute");
+        let optimized = execute_with_options(&program, OptimizationLevel::Speed)
+            .expect("optimized fixture should execute");
+
+        assert_eq!(debug, 42);
+        assert_eq!(optimized, 0);
     }
 
     #[test]

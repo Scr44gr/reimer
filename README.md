@@ -10,7 +10,9 @@ type, complete control flow, recoverable errors, moves and references, modules
 with `::` paths, C FFI, methods, type and `const` generics, monomorphization,
 traits with static dispatch, `comptime` evaluation, attributes, closed derives,
 typed reflection, and stable-address `static` storage with `static mut` guarded
-by `unsafe`. The standard library includes explicit allocators, safe I/O,
+by `unsafe`. Runtime `assert` and debug-only `debug_assert` preserve explicit
+failure messages, and `std::target::os()` exposes the host as a typed enum. The
+standard library includes explicit allocators, safe I/O,
 recoverable slice access, allocation-free UTF-8 byte and character
 iteration, `String`, `Vec`, `HashMap`, `HashSet`, `RingBuffer`, contiguous
 tensors with safe views, threads, synchronization, atomics, and a work-stealing
@@ -51,6 +53,7 @@ cargo run -p reimer-cli -- run examples/m3_collections.reim
 cargo run -p reimer-cli -- run examples/m3_integer_overflow.reim
 cargo run -p reimer-cli -- run examples/m3_slice_access.reim
 cargo run -p reimer-cli -- run examples/m3_utf8.reim
+cargo run -p reimer-cli -- run examples/m3_assertions.reim
 cargo run -p reimer-cli -- run examples/m5_ffi.reim
 cargo run -p reimer-cli -- run examples/m6_generics.reim
 cargo run -p reimer-cli -- run examples/m7_tensor.reim

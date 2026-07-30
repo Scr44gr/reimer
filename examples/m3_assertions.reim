@@ -1,0 +1,14 @@
+from std::target import OperatingSystem, os;
+
+fn main() -> i32 {
+    let target = os();
+    assert(true, "runtime assertions are enabled");
+    debug_assert(target == target, "the target identity must be stable");
+    match target {
+        OperatingSystem::Windows => 42,
+        OperatingSystem::Linux => 42,
+        OperatingSystem::MacOs => 42,
+        OperatingSystem::FreeBsd => 42,
+        OperatingSystem::Other => 42,
+    }
+}

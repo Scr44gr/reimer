@@ -869,8 +869,8 @@ impl<'ast, 'metadata, M: Metadata> Evaluator<'ast, 'metadata, M> {
         call: &ast::CallExpression,
         frame: &mut Frame,
     ) -> Option<EvalResult<Value>> {
-        if single_path_name(path) == Some("assert") {
-            return Some(self.evaluate_assert(call, frame));
+        if let Some(name @ ("assert" | "debug_assert")) = single_path_name(path) {
+            return Some(self.evaluate_assert(name, call, frame));
         }
         if single_path_name(path) == Some("panic") {
             let message = call
@@ -908,24 +908,42 @@ impl<'ast, 'metadata, M: Metadata> Evaluator<'ast, 'metadata, M> {
 
     fn evaluate_assert(
         &mut self,
+        name: &str,
         call: &ast::CallExpression,
         frame: &mut Frame,
     ) -> EvalResult<Value> {
-        let Some(condition) = call.arguments.first() else {
+        if !(1..=2).contains(&call.arguments.len()) {
             return self.fail(
                 "E7011",
-                "`assert` expects one condition",
+                format!(
+                    "`{name}` expects one condition and an optional message, but {} argument(s) were provided",
+                    call.arguments.len()
+                ),
                 call.span,
-                "write `assert(condition)`",
+                format!("write `{name}(condition)` or `{name}(condition, message)`"),
             );
+        }
+        let Some(condition) = call.arguments.first() else {
+            unreachable!("assertion arity was checked");
         };
         let value = self.evaluate_expression(condition, frame)?;
+        let message = call
+            .arguments
+            .get(1)
+            .map(|argument| {
+                self.evaluate_expression(argument, frame)
+                    .and_then(|value| match value {
+                        Value::String(message) => Ok(message),
+                        _ => self.type_error("assertion message", argument.span()),
+                    })
+            })
+            .transpose()?;
         if value == Value::Boolean(true) {
             Ok(Value::Unit)
         } else if value == Value::Boolean(false) {
             self.fail(
                 "E7013",
-                "compile-time assertion failed",
+                message.unwrap_or_else(|| format!("compile-time `{name}` failed")),
                 condition.span(),
                 "make the asserted invariant true",
             )

@@ -35,7 +35,10 @@ comptime {
 
 Evaluation supports scalars, strings, tuples, arrays, structs, pure calls,
 local variables, branches, `match`, loops, and checked casts. A failing `panic`
-or `assert` becomes a compiler diagnostic.
+or `assert` becomes a compiler diagnostic. Both `assert` and `debug_assert`
+accept an optional UTF-8 failure message. `debug_assert` is always checked
+during compile-time evaluation because this validation does not represent a
+runtime profile branch.
 
 ## Static initializers
 

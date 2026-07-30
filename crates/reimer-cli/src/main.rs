@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use reimer_cli::{
-    check_file, check_graph, compile_file_to_object, compile_graph_to_object, execute_file,
-    execute_file_test, execute_graph, execute_graph_test, file_test_names, graph_test_names,
+    check_file, check_graph, compile_file_to_object, compile_file_to_object_with_options,
+    compile_graph_to_object, execute_file_test, execute_file_with_options, execute_graph,
+    execute_graph_test, file_test_names, graph_test_names,
 };
 use reimer_codegen_native::OptimizationLevel;
 use reimer_project::{BuildProfile, LockMode, Project};
@@ -145,8 +146,11 @@ fn emit_object(source: &Path, output: Option<&Path>) -> Result<(), String> {
 fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> {
     if is_source_file(&options.path) {
         validate_source_path(&options.path)?;
-        let object = compile_file_to_object(&options.path)
-            .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+        let object = compile_file_to_object_with_options(
+            &options.path,
+            profile_optimization(options.profile),
+        )
+        .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
         let output = output.map_or_else(|| default_source_output(&options.path), Path::to_path_buf);
         write_output(&output, &object)?;
         println!("emitted {}", output.display());
@@ -178,7 +182,8 @@ fn execute(options: &ProjectOptions) -> Result<(), String> {
     if is_source_file(&options.path) {
         validate_source_path(&options.path)?;
         let result =
-            execute_file(&options.path).map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+            execute_file_with_options(&options.path, profile_optimization(options.profile))
+                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
         println!("program returned {result}");
         return Ok(());
     }

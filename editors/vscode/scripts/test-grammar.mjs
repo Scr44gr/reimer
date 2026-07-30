@@ -102,6 +102,18 @@ assertScope(
 );
 assertScope(
   grammar,
+  'debug_assert(os() == OperatingSystem::Windows, "target mismatch");',
+  "debug_assert",
+  "support.function.builtin.reimer",
+);
+assertScope(
+  grammar,
+  'debug_assert(os() == OperatingSystem::Windows, "target mismatch");',
+  "os",
+  "support.function.builtin.reimer",
+);
+assertScope(
+  grammar,
   "static mut COUNTER: i32 = 0;",
   "COUNTER",
   "variable.other.constant.reimer",

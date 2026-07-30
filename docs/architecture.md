@@ -83,6 +83,28 @@ Statics cannot contain borrowed views, strings, raw pointers, or function
 values. Concurrent mutable state should use atomics, locks, or an encapsulated
 synchronization API.
 
+## Assertions and native target inspection
+
+`assert(condition)` and `assert(condition, message)` check their condition in
+every build profile. `debug_assert` has the same type rules but is enabled only
+when profile optimization is `0`. When disabled, neither its condition nor its
+message is evaluated, so debug checks cannot introduce release-build side
+effects. Failed checks use the same bounded UTF-8 panic boundary as
+`panic(message)`.
+
+```reimer
+assert(index < length, "index must be inside the buffer");
+debug_assert(cached_len == length, "cached length is stale");
+```
+
+The native backend receives the optimization policy explicitly while lowering
+HIR; assertion behavior does not depend on Rust's own build profile.
+
+`std::target::os()` returns `OperatingSystem`, whose variants are `Windows`,
+`Linux`, `MacOs`, `FreeBsd`, and `Other`. The safe public wrapper contains the
+standard library's private runtime ABI call. Application code therefore does
+not require `unsafe` to inspect the target.
+
 ## Slices and UTF-8
 
 Checked `slice[index]` remains the concise access form and raises a bounds

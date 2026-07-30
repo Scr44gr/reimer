@@ -753,6 +753,7 @@ impl HirIndexer<'_> {
                 reference_type,
                 mutable,
             } => self.slice_get(slice, index, *reference_type, *mutable, expression.span),
+            ExpressionKind::Assert { .. } => self.assertion(expression),
             ExpressionKind::If(_)
             | ExpressionKind::Match(_)
             | ExpressionKind::Loop(_)
@@ -935,6 +936,44 @@ impl HirIndexer<'_> {
             }
             _ => {}
         }
+    }
+
+    fn assertion(&mut self, expression: &hir::Expression) {
+        let ExpressionKind::Assert {
+            mode,
+            condition,
+            message,
+        } = &expression.kind
+        else {
+            return;
+        };
+        if let Some(callee) = self
+            .syntax_index
+            .call_callees
+            .get(&span_key(expression.span))
+            .copied()
+        {
+            let (name, documentation) = match mode {
+                hir::AssertionMode::Always => (
+                    "assert",
+                    "Checks `condition` in every build profile and panics with `message` when it is false.",
+                ),
+                hir::AssertionMode::Debug => (
+                    "debug_assert",
+                    "Checks `condition` only in debug builds. Optimized builds do not evaluate the condition or message.",
+                ),
+            };
+            self.type_hints.push(TypeHint {
+                span: callee,
+                label: format!(
+                    "fn {name}(condition: bool, message: str = \"assertion failed\") -> ()"
+                ),
+                documentation: documentation.to_owned(),
+                kind: TypeHintKind::Callable,
+            });
+        }
+        self.expression(condition);
+        self.expression(message);
     }
 
     fn place(&mut self, place: &hir::Place) {

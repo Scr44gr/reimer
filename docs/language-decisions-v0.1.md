@@ -282,3 +282,20 @@ Static storage accepts owned scalar and aggregate values. Borrowed references,
 slices, UTF-8 views, raw pointers, and function values are rejected in v0.1.
 The native backend emits real Cranelift data objects for JIT and object builds;
 it does not emulate stable storage with a function stack slot.
+
+## D-012: assertions and native target identity
+
+`assert(condition)` and `assert(condition, message)` are language intrinsics.
+They require a `bool` condition, accept an optional `str` message, return `()`,
+and remain active in every profile. The default message is
+`"assertion failed"`.
+
+`debug_assert` has the same signature. It is enabled exactly when the selected
+profile has `optimization = 0`. Optimized builds do not evaluate either
+operand. During deterministic `comptime` evaluation, both assertion forms are
+checked because compile-time validation has no runtime build branch.
+
+The host-native backend exposes target identity through the safe standard
+library API `std::target::os() -> OperatingSystem`. The enum distinguishes
+Windows, Linux, macOS, FreeBSD, and other hosts. Its private ABI boundary is
+implemented by the standard library; user code does not need `unsafe`.

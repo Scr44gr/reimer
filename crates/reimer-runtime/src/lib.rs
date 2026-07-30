@@ -75,6 +75,8 @@ pub enum Failure {
 pub const FAIL_SYMBOL: &str = "runtime_fail";
 /// ABI symbol used by the source-level `panic(message)` intrinsic.
 pub const PANIC_SYMBOL: &str = "runtime_panic";
+/// ABI symbol used by `std::target::os()` to inspect the native host.
+pub const TARGET_OS_SYMBOL: &str = "target_os_code";
 /// ABI symbol used for explicit byte allocations.
 pub const ALLOCATE_BYTES_SYMBOL: &str = "allocate_bytes";
 /// ABI symbol used to release explicit byte allocations.
@@ -380,6 +382,31 @@ fn lock_threads() -> std::sync::MutexGuard<'static, HashMap<usize, ThreadRecord>
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Returns the operating-system code for the native host.
+///
+/// The numeric mapping is part of the private runtime ABI consumed by
+/// `std::target`: Windows is 0, Linux is 1, macOS is 2, FreeBSD is 3, and
+/// every other host is 4.
+#[must_use]
+#[unsafe(no_mangle)]
+#[expect(
+    unsafe_code,
+    reason = "the runtime ABI must expose a stable native symbol"
+)]
+pub extern "C" fn target_os_code() -> u8 {
+    if cfg!(target_os = "windows") {
+        0
+    } else if cfg!(target_os = "linux") {
+        1
+    } else if cfg!(target_os = "macos") {
+        2
+    } else if cfg!(target_os = "freebsd") {
+        3
+    } else {
+        4
+    }
 }
 
 /// Reports a checked runtime failure and terminates the process.
@@ -1121,8 +1148,8 @@ mod tests {
         Failure, GENERAL_ALLOCATOR, PAGE_ALLOCATOR, PAGE_GRANULARITY, THREAD_JOIN_OK,
         allocate_bytes, arena_allocator_deinit, arena_allocator_init, buffer_equals, copy_bytes,
         deallocate_bytes, failure_message, fixed_buffer_allocator_deinit,
-        fixed_buffer_allocator_init, read_line_into, read_to_end_into, thread_join, thread_spawn,
-        utf8_decode_next, utf8_is_valid, write_all_with_optional_newline,
+        fixed_buffer_allocator_init, read_line_into, read_to_end_into, target_os_code, thread_join,
+        thread_spawn, utf8_decode_next, utf8_is_valid, write_all_with_optional_newline,
     };
 
     #[expect(
@@ -1158,6 +1185,23 @@ mod tests {
     #[test]
     fn unknown_failure_codes_should_have_a_stable_message() {
         assert_eq!(failure_message(u32::MAX), "unknown runtime failure");
+    }
+
+    #[test]
+    fn target_os_code_should_match_the_compilation_host() {
+        let expected = if cfg!(target_os = "windows") {
+            0
+        } else if cfg!(target_os = "linux") {
+            1
+        } else if cfg!(target_os = "macos") {
+            2
+        } else if cfg!(target_os = "freebsd") {
+            3
+        } else {
+            4
+        };
+
+        assert_eq!(target_os_code(), expected);
     }
 
     #[test]

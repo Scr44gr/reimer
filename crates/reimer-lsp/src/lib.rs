@@ -836,6 +836,12 @@ const PRIMITIVE_TYPES: &[&str] = &[
 ];
 
 const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
+    ("assert", CompletionItemKind::FUNCTION, "language intrinsic"),
+    (
+        "debug_assert",
+        CompletionItemKind::FUNCTION,
+        "language intrinsic",
+    ),
     ("print", CompletionItemKind::FUNCTION, "std::io"),
     ("println", CompletionItemKind::FUNCTION, "std::io"),
     ("eprint", CompletionItemKind::FUNCTION, "std::io"),
@@ -870,6 +876,8 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ),
     ("page_allocator", CompletionItemKind::FUNCTION, "std::alloc"),
     ("allocate_bytes", CompletionItemKind::FUNCTION, "std::alloc"),
+    ("OperatingSystem", CompletionItemKind::ENUM, "std::target"),
+    ("os", CompletionItemKind::FUNCTION, "std::target"),
     ("Option", CompletionItemKind::ENUM, "core"),
     ("Result", CompletionItemKind::ENUM, "core"),
     ("String", CompletionItemKind::STRUCT, "std::string"),
@@ -1145,6 +1153,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         let required = [
+            "assert",
+            "debug_assert",
             "Thread",
             "AtomicBool",
             "JobPool",
@@ -1161,6 +1171,58 @@ mod tests {
             required
                 .iter()
                 .all(|required| labels.iter().any(|label| label == required))
+        );
+    }
+
+    #[test]
+    fn document_should_explain_assertion_intrinsics_on_hover() {
+        let source = "fn main() -> i32 {
+            assert(true, \"required invariant\");
+            debug_assert(true, \"debug invariant\");
+            42
+        }";
+        let document = Document::new(
+            Url::parse("untitled:main.reim").expect("URL should parse"),
+            source.to_owned(),
+        );
+        let lines = LineIndex::new(Arc::from(source));
+
+        let assert_position = lines.position(
+            source
+                .find("assert(true")
+                .expect("assert call should exist"),
+        );
+        let debug_position = lines.position(
+            source
+                .find("debug_assert")
+                .expect("debug assertion call should exist"),
+        );
+        let assert_hover = document
+            .hover(assert_position)
+            .expect("assert call should have hover");
+        let debug_hover = document
+            .hover(debug_position)
+            .expect("debug assertion call should have hover");
+        let tower_lsp::lsp_types::HoverContents::Markup(assert_contents) = assert_hover.contents
+        else {
+            panic!("assert hover should use markdown");
+        };
+        let tower_lsp::lsp_types::HoverContents::Markup(debug_contents) = debug_hover.contents
+        else {
+            panic!("debug assertion hover should use markdown");
+        };
+
+        assert!(assert_contents.value.contains("fn assert(condition: bool"));
+        assert!(assert_contents.value.contains("every build profile"));
+        assert!(
+            debug_contents
+                .value
+                .contains("fn debug_assert(condition: bool")
+        );
+        assert!(
+            debug_contents
+                .value
+                .contains("Optimized builds do not evaluate")
         );
     }
 
@@ -1726,6 +1788,55 @@ mod tests {
                 .value
                 .contains("Writes all UTF-8 bytes to standard output and appends a newline.")
         );
+    }
+
+    #[test]
+    fn document_should_show_typed_target_documentation() {
+        let source = "from std::target import OperatingSystem, os;
+fn main() -> i32 {
+    let current = os();
+    match current {
+        OperatingSystem::Windows => 42,
+        OperatingSystem::Linux => 42,
+        OperatingSystem::MacOs => 42,
+        OperatingSystem::FreeBsd => 42,
+        OperatingSystem::Other => 42,
+    }
+}
+";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let lines = LineIndex::new(Arc::from(source));
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+        let call_position = lines.position(source.find("os()").expect("target call should exist"));
+        let binding_position =
+            lines.position(source.find("current =").expect("binding should exist"));
+
+        let call_hover = document
+            .hover(call_position)
+            .expect("target call should have hover information");
+        let binding_hover = document
+            .hover(binding_position)
+            .expect("target binding should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(call_contents) = call_hover.contents else {
+            panic!("target call hover should use markdown");
+        };
+        let tower_lsp::lsp_types::HoverContents::Markup(binding_contents) = binding_hover.contents
+        else {
+            panic!("target binding hover should use markdown");
+        };
+
+        assert!(call_contents.value.contains("fn std::target::os"));
+        assert!(
+            call_contents
+                .value
+                .contains("Returns the operating system targeted by the current native build.")
+        );
+        assert!(binding_contents.value.contains("OperatingSystem"));
+        assert!(!binding_contents.value.contains("__module_"));
     }
 
     #[test]

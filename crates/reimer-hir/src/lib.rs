@@ -403,6 +403,15 @@ pub enum IntegerAdditionMode {
     Saturating,
 }
 
+/// Build-profile policy for a source assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionMode {
+    /// Checks the condition in every build profile.
+    Always,
+    /// Checks the condition only when compiler debug assertions are enabled.
+    Debug,
+}
+
 /// A resolved expression form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpressionKind {
@@ -515,6 +524,15 @@ pub enum ExpressionKind {
     },
     /// Reads through a reference or raw pointer.
     Dereference(Box<Expression>),
+    /// Checks an invariant and panics with a source-provided message on failure.
+    Assert {
+        /// Whether the assertion is unconditional or debug-only.
+        mode: AssertionMode,
+        /// Boolean condition evaluated when this assertion is enabled.
+        condition: Box<Expression>,
+        /// UTF-8 diagnostic emitted when the condition is false.
+        message: Box<Expression>,
+    },
     /// Aborts execution with a non-recoverable failure.
     Panic {
         /// UTF-8 diagnostic message.

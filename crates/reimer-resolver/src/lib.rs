@@ -11,8 +11,8 @@ use reimer_ast::{
 };
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_hir::{
-    self as hir, AssignmentOperator, BinaryOperator, Expression, ExpressionKind, FunctionId,
-    IntegerAdditionMode, LocalId, Place, PlaceKind, StaticId, UnaryOperator,
+    self as hir, AssertionMode, AssignmentOperator, BinaryOperator, Expression, ExpressionKind,
+    FunctionId, IntegerAdditionMode, LocalId, Place, PlaceKind, StaticId, UnaryOperator,
 };
 use reimer_layout::Layouts;
 use reimer_types::{Type, TypeId};
@@ -5742,6 +5742,9 @@ impl<'context> FunctionAnalyzer<'context> {
         if single_path_name(path) == Some("panic") {
             return self.analyze_panic_call(call, path);
         }
+        if let Some(mode) = assertion_mode(path) {
+            return self.analyze_assert_call(call, path, mode);
+        }
         if let Some(expression) = self.analyze_runtime_intrinsic_call(call, path, expected) {
             return expression;
         }
@@ -6427,6 +6430,63 @@ impl<'context> FunctionAnalyzer<'context> {
                 message: Box::new(message),
             },
             ty: Type::Never,
+            span: call.span,
+        }
+    }
+
+    fn analyze_assert_call(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        mode: AssertionMode,
+    ) -> Expression {
+        if !(1..=2).contains(&call.arguments.len()) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    format!(
+                        "intrinsic `{}` expects one condition and an optional message, but {} argument(s) were provided",
+                        path.display(),
+                        call.arguments.len()
+                    ),
+                    call.span,
+                )
+                .with_help(format!(
+                    "write `{}(condition)` or `{}(condition, message)`",
+                    path.display(),
+                    path.display()
+                )),
+            );
+        }
+        let condition = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Bool)),
+        );
+        self.require_type(
+            Type::Bool,
+            condition.ty,
+            condition.span,
+            "assertion condition",
+        );
+        let message = call.arguments.get(1).map_or_else(
+            || Expression {
+                kind: ExpressionKind::String("assertion failed".to_owned()),
+                ty: Type::Str,
+                span: call.span,
+            },
+            |argument| self.analyze_expression_expected(argument, Some(Type::Str)),
+        );
+        self.require_type(Type::Str, message.ty, message.span, "assertion message");
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        Expression {
+            kind: ExpressionKind::Assert {
+                mode,
+                condition: Box::new(condition),
+                message: Box::new(message),
+            },
+            ty: Type::Unit,
             span: call.span,
         }
     }
@@ -10794,6 +10854,14 @@ fn single_path_name(path: &ast::Path) -> Option<&str> {
     Some(&name.name)
 }
 
+fn assertion_mode(path: &ast::Path) -> Option<AssertionMode> {
+    match single_path_name(path)? {
+        "assert" => Some(AssertionMode::Always),
+        "debug_assert" => Some(AssertionMode::Debug),
+        _ => None,
+    }
+}
+
 fn function_path_name(path: &ast::Path) -> Option<String> {
     match path.segments.as_slice() {
         [name] => Some(name.name.clone()),
@@ -11830,6 +11898,65 @@ mod tests {
     }
 
     #[test]
+    fn resolve_should_type_runtime_and_debug_assertions() {
+        let source = "fn main() -> i32 {
+                assert(true);
+                assert(20 + 22 == 42, \"arithmetic invariant failed\");
+                debug_assert(true, \"debug invariant failed\");
+                42
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert!(matches!(
+            program.functions[0].body.statements[0],
+            reimer_hir::Statement::Expression(reimer_hir::Expression {
+                kind: reimer_hir::ExpressionKind::Assert {
+                    mode: reimer_hir::AssertionMode::Always,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            program.functions[0].body.statements[2],
+            reimer_hir::Statement::Expression(reimer_hir::Expression {
+                kind: reimer_hir::ExpressionKind::Assert {
+                    mode: reimer_hir::AssertionMode::Debug,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_should_reject_invalid_assertion_arguments() {
+        let source = "fn main() -> i32 {
+                assert();
+                assert(42, \"not a boolean\");
+                debug_assert(true, 42);
+                0
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6004" && diagnostic.message.contains("optional message")
+        }));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("assertion condition"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("assertion message"))
+        );
+    }
+
+    #[test]
     fn resolve_should_allow_borrowing_a_resource_after_registering_its_cleanup() {
         let source = "
             struct Resource { value: i32 }
@@ -12255,5 +12382,21 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "E7013")
         );
+    }
+
+    #[test]
+    fn resolve_should_use_custom_comptime_assertion_messages() {
+        let source = "
+            comptime {
+                debug_assert(true, \"checked during compile-time evaluation\");
+                assert(false, \"header layout changed\");
+            }
+            fn main() -> i32 { 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E7013" && diagnostic.message == "header layout changed"
+        }));
     }
 }

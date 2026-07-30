@@ -50,8 +50,20 @@ pub fn check_file(path: &Path) -> Result<(), Vec<FileDiagnostic>> {
 ///
 /// Returns file-aware package, frontend, or backend diagnostics.
 pub fn compile_file_to_object(path: &Path) -> Result<Vec<u8>, Vec<FileDiagnostic>> {
+    compile_file_to_object_with_options(path, OptimizationLevel::None)
+}
+
+/// Compiles an entry file and its module graph with the selected optimization.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, or backend diagnostics.
+pub fn compile_file_to_object_with_options(
+    path: &Path,
+    optimization: OptimizationLevel,
+) -> Result<Vec<u8>, Vec<FileDiagnostic>> {
     let (package, program) = analyze_file(path)?;
-    reimer_codegen_native::emit_object(&program)
+    reimer_codegen_native::emit_object_with_options(&program, optimization)
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
@@ -61,8 +73,20 @@ pub fn compile_file_to_object(path: &Path) -> Result<Vec<u8>, Vec<FileDiagnostic
 ///
 /// Returns file-aware package, frontend, or backend diagnostics.
 pub fn execute_file(path: &Path) -> Result<i32, Vec<FileDiagnostic>> {
+    execute_file_with_options(path, OptimizationLevel::None)
+}
+
+/// JIT-compiles and executes an entry file with the selected optimization.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, or backend diagnostics.
+pub fn execute_file_with_options(
+    path: &Path,
+    optimization: OptimizationLevel,
+) -> Result<i32, Vec<FileDiagnostic>> {
     let (package, program) = analyze_file(path)?;
-    reimer_codegen_native::execute(&program)
+    reimer_codegen_native::execute_with_options(&program, optimization)
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 

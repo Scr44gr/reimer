@@ -1,0 +1,29 @@
+/// Operating systems distinguished by the host-native compiler.
+@derive(Copy, Eq)
+pub enum OperatingSystem {
+    Windows,
+    Linux,
+    MacOs,
+    FreeBsd,
+    Other,
+}
+
+@link("runtime")
+extern "C" {
+    fn target_os_code() -> u8;
+}
+
+/// Returns the operating system targeted by the current native build.
+///
+/// This safe wrapper contains the standard library's private ABI call, so
+/// application code does not need an `unsafe` block.
+pub fn os() -> OperatingSystem {
+    let code = unsafe { target_os_code() };
+    match code {
+        0 => OperatingSystem::Windows,
+        1 => OperatingSystem::Linux,
+        2 => OperatingSystem::MacOs,
+        3 => OperatingSystem::FreeBsd,
+        _ => OperatingSystem::Other,
+    }
+}
