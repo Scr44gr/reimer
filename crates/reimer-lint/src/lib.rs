@@ -147,7 +147,8 @@ pub fn analyze(source: &str) -> Analysis {
         None
     } else {
         match reimer_resolver::resolve(&syntax) {
-            Ok(program) => {
+            Ok(mut program) => {
+                semantic::attach_type_documentation(source, &mut program);
                 findings.extend(must_use::lint(&program));
                 Some(program)
             }

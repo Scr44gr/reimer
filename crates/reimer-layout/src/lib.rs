@@ -531,6 +531,7 @@ mod tests {
         let definitions = [TypeDefinition {
             id: TypeId(0),
             name: Some("Header".to_owned()),
+            documentation: None,
             kind: TypeDefinitionKind::Struct {
                 fields: vec![
                     TypeField {
@@ -579,6 +580,7 @@ mod tests {
         let definitions = [TypeDefinition {
             id: TypeId(0),
             name: Some("Recursive".to_owned()),
+            documentation: None,
             kind: TypeDefinitionKind::Struct {
                 fields: vec![TypeField {
                     name: "next".to_owned(),

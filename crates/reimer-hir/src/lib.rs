@@ -33,6 +33,12 @@ pub struct TypeDefinition {
     pub id: TypeId,
     /// Source name for nominal types.
     pub name: Option<String>,
+    /// Markdown documentation associated with a named source declaration.
+    ///
+    /// Compiler-only structural types leave this empty. Editor hosts may
+    /// populate it after package resolution, when the original source text is
+    /// available.
+    pub documentation: Option<String>,
     /// Composite shape.
     pub kind: TypeDefinitionKind,
     /// Externally observable layout policy.

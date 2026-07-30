@@ -93,9 +93,12 @@ fn add(left: i32, right: i32) -> i32 {
 ```
 
 The language server shows this text with the resolved signature when hovering
-over the declaration or any direct call. It also attaches local declaration
-documentation to completion items. Documentation from imported source modules
-is retained during package resolution.
+over a function declaration or any direct call. Documented structs and enums
+also retain their Markdown when hovering over values of those types, including
+generic instances such as `Container<i32>`. It attaches local declaration
+documentation to completion items as well. Documentation from imported source
+modules is retained during package resolution, and internal compiler symbol
+names are never exposed.
 
 The same comments generate package documentation:
 

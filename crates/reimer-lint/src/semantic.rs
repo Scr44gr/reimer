@@ -67,6 +67,15 @@ pub(crate) fn index(
     index_with_documentation(syntax, typed, &documentation)
 }
 
+pub(crate) fn attach_type_documentation(source: &str, typed: &mut hir::Program) {
+    for definition in &mut typed.types {
+        if definition.name.is_some() {
+            definition.documentation =
+                reimer_package::documentation_before(source, definition.span.start);
+        }
+    }
+}
+
 pub(crate) fn index_with_documentation(
     syntax: &ast::Program,
     typed: &hir::Program,
@@ -1114,6 +1123,9 @@ fn type_documentation(ty: Type, program: &hir::Program) -> String {
     let Some(definition) = definition(ty, program) else {
         return format!("Value of type `{label}`.");
     };
+    if let Some(documentation) = &definition.documentation {
+        return documentation.clone();
+    }
     match &definition.kind {
         TypeDefinitionKind::Struct { fields } => named_struct_documentation(&label, fields.len()),
         TypeDefinitionKind::Enum { variants } => {

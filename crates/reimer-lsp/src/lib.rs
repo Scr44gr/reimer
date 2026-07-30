@@ -421,7 +421,12 @@ impl Document {
             reimer_resolver::resolve_library(&package.program)
         };
         match resolved {
-            Ok(typed) => {
+            Ok(mut typed) => {
+                for definition in &mut typed.types {
+                    if definition.name.is_some() {
+                        definition.documentation = package.documentation(definition.span);
+                    }
+                }
                 self.analysis
                     .findings
                     .retain(|finding| finding.severity != Severity::Error);
@@ -1241,6 +1246,42 @@ mod tests {
     }
 
     #[test]
+    fn document_should_show_generic_struct_documentation_on_values() {
+        let source = "/// Stores one value without changing its type.\n\
+                      struct MyAwesomeStruct<T> { value: T }\n\
+                      fn main() -> i32 {\n\
+                          let item: MyAwesomeStruct<i32> = MyAwesomeStruct { value: 42 };\n\
+                          item.value\n\
+                      }\n"
+        .to_owned();
+        let use_offset = source.rfind("item.value").expect("local use should exist");
+        let position = LineIndex::new(Arc::from(source.as_str())).position(use_offset);
+        let document = Document::new(
+            Url::parse("untitled:documented-struct.reim").expect("URL should parse"),
+            source,
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("generic struct value should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents.value.contains("MyAwesomeStruct<i32>"),
+            "unexpected hover contents: {}",
+            contents.value
+        );
+        assert!(
+            contents
+                .value
+                .contains("Stores one value without changing its type.")
+        );
+        assert!(!contents.value.contains("__module_"));
+    }
+
+    #[test]
     fn document_should_hide_internal_module_names_in_generic_type_hovers() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -1368,6 +1409,56 @@ mod tests {
             contents
                 .value
                 .contains("Returns the canonical demonstration value.")
+        );
+        assert!(!contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_documentation_for_imported_generic_struct_values() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2026\"\n\n\
+             [dependencies]\nmodels = { path = \"../models\" }\n",
+        );
+        let source = "from models import Documented;\n\
+                      fn main() -> i32 {\n\
+                          let item: Documented<i32> = Documented { value: 42 };\n\
+                          item.value\n\
+                      }\n";
+        let main = fixture.write("app/src/main.reim", source);
+        fixture.write(
+            "models/reimer.toml",
+            "[package]\nname = \"models\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+        );
+        fixture.write(
+            "models/src/package.reim",
+            "/// Carries a documented value across a package boundary.\n\
+             pub struct Documented<T> { pub value: T }\n",
+        );
+        let use_offset = source.rfind("item.value").expect("local use should exist");
+        let position = LineIndex::new(Arc::from(source)).position(use_offset);
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("imported generic struct value should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents.value.contains("Documented<i32>"),
+            "unexpected hover contents: {}",
+            contents.value
+        );
+        assert!(
+            contents
+                .value
+                .contains("Carries a documented value across a package boundary.")
         );
         assert!(!contents.value.contains("__module_"));
     }

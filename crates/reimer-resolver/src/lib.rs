@@ -459,6 +459,7 @@ impl TypeRegistry {
         self.definitions.push(hir::TypeDefinition {
             id,
             name,
+            documentation: None,
             kind,
             representation: hir::TypeRepresentation::Native,
             alignment: None,
