@@ -70,6 +70,7 @@ reimer new game
 reimer add physics --path ../physics --project game
 reimer check game
 reimer build game --release --locked
+reimer doc game
 ```
 
 The `reimer.toml` format, lockfile semantics, profiles, and path/Git
@@ -77,6 +78,8 @@ dependencies are documented in
 [`docs/package-system.md`](docs/package-system.md). Compile-time evaluation,
 attributes, and reflection are specified in
 [`docs/metaprogramming.md`](docs/metaprogramming.md).
+`reimer doc` validates the complete package and writes its public `///`
+documentation to `target/reimer/doc/<package>.md`.
 
 The generated object is not yet a standalone executable. Linking it with the
 startup runtime and LLD is the next backend increment.

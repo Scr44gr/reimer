@@ -52,6 +52,52 @@ fn assert_success(output: &Output) {
     );
 }
 
+#[test]
+fn doc_should_generate_documented_public_api_for_the_root_package() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "app/reimer.toml",
+        &manifest("app", "math = { path = \"../math\", version = \"^0.1\" }\n"),
+    );
+    fixture.write(
+        "app/src/package.reim",
+        "from math import answer;\n\
+         /// Adds the dependency answer to `value`.\n\
+         ///\n\
+         /// # Errors\n\
+         /// This function does not fail.\n\
+         pub fn add_answer(value: i32) -> i32 { value + answer() }\n\
+         fn hidden() -> i32 { 0 }\n\
+         /// Stores a visible counter value.\n\
+         pub struct Counter { pub value: i32, secret: i32 }\n\
+         impl Counter {\n\
+             /// Reads the current value.\n\
+             pub fn get(&self) -> i32 { self.value }\n\
+             fn secret(&self) -> i32 { self.secret }\n\
+         }\n",
+    );
+    fixture.write("math/reimer.toml", &manifest("math", ""));
+    fixture.write(
+        "math/src/package.reim",
+        "/// Dependency implementation detail.\npub fn answer() -> i32 { 42 }\n",
+    );
+    let app = fixture.path("app").display().to_string();
+
+    let output = invoke(&["doc", &app]);
+    assert_success(&output);
+
+    let documentation = fs::read_to_string(fixture.path("app/target/reimer/doc/app.md"))
+        .expect("generated documentation should be readable");
+    assert!(documentation.contains("# app 0.1.0"));
+    assert!(documentation.contains("pub fn add_answer(value: i32) -> i32;"));
+    assert!(documentation.contains("Adds the dependency answer to `value`."));
+    assert!(documentation.contains("pub struct Counter"));
+    assert!(documentation.contains("Counter::get"));
+    assert!(documentation.contains("Reads the current value."));
+    assert!(!documentation.contains("fn hidden"));
+    assert!(!documentation.contains("Dependency implementation detail."));
+}
+
 fn manifest(name: &str, dependencies: &str) -> String {
     format!(
         "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2026\"\n\n\

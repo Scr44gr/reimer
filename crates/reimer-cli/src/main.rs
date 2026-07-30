@@ -12,6 +12,8 @@ use reimer_cli::{
 use reimer_codegen_native::OptimizationLevel;
 use reimer_project::{BuildProfile, LockMode, Project};
 
+mod documentation;
+
 const MANIFEST_FILE: &str = "reimer.toml";
 
 fn main() -> ExitCode {
@@ -33,6 +35,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         Invocation::Build { options, output } => build(&options, output.as_deref()),
         Invocation::Run(options) => execute(&options),
         Invocation::Test(options) => test(&options),
+        Invocation::Document { options, output } => document(&options, output.as_deref()),
         Invocation::RunUnitTest {
             options,
             test_index,
@@ -59,6 +62,69 @@ fn check(options: &ProjectOptions) -> Result<(), String> {
         "checked {} {}",
         project.package_name(),
         display_version(&project)
+    );
+    Ok(())
+}
+
+fn document(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> {
+    if is_source_file(&options.path) {
+        validate_source_path(&options.path)?;
+        let package = reimer_package::load(&options.path)
+            .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+        reimer_resolver::resolve_library(&package.program)
+            .map_err(|diagnostics| render_diagnostics(&package.map_diagnostics(diagnostics)))?;
+        let source_root = options.path.parent().unwrap_or_else(|| Path::new("."));
+        let title = options
+            .path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Reimer package");
+        let rendered = documentation::render(&package, source_root, title);
+        let output = output.map_or_else(
+            || {
+                source_root
+                    .join("target")
+                    .join("reimer")
+                    .join("doc")
+                    .join(format!("{title}.md"))
+            },
+            Path::to_path_buf,
+        );
+        write_output(&output, rendered.as_bytes())?;
+        println!("documented {title}\noutput: {}", output.display());
+        return Ok(());
+    }
+
+    let project = open_project(options)?;
+    let entry = project.entry().map_err(|error| error.to_string())?;
+    let graph = project.source_graph(&entry);
+    let package = reimer_package::load_graph(&graph)
+        .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+    let resolved = if entry.file_name().and_then(|name| name.to_str()) == Some("package.reim") {
+        reimer_resolver::resolve_library(&package.program)
+    } else {
+        reimer_resolver::resolve(&package.program)
+    };
+    resolved.map_err(|diagnostics| render_diagnostics(&package.map_diagnostics(diagnostics)))?;
+    let title = format!("{} {}", project.package_name(), display_version(&project));
+    let rendered = documentation::render(&package, &project.root_directory().join("src"), &title);
+    let output = output.map_or_else(
+        || {
+            project
+                .root_directory()
+                .join("target")
+                .join("reimer")
+                .join("doc")
+                .join(format!("{}.md", project.package_name()))
+        },
+        Path::to_path_buf,
+    );
+    write_output(&output, rendered.as_bytes())?;
+    println!(
+        "documented {} {}\noutput: {}",
+        project.package_name(),
+        display_version(&project),
+        output.display()
     );
     Ok(())
 }
@@ -745,6 +811,10 @@ enum Invocation {
     },
     Run(ProjectOptions),
     Test(ProjectOptions),
+    Document {
+        options: ProjectOptions,
+        output: Option<PathBuf>,
+    },
     RunUnitTest {
         options: ProjectOptions,
         test_index: usize,
@@ -790,6 +860,10 @@ impl Invocation {
             }
             "run" => Ok(Self::Run(parse_project_options(arguments, false)?.0)),
             "test" => Ok(Self::Test(parse_project_options(arguments, false)?.0)),
+            "doc" => {
+                let (options, output) = parse_project_options(arguments, true)?;
+                Ok(Self::Document { options, output })
+            }
             "__run-unit-test" => parse_unit_test(arguments),
             "fmt" => parse_format(arguments),
             "clean" => Ok(Self::Clean {
@@ -1140,6 +1214,7 @@ fn usage() -> &'static str {
      reimer build [path] [--release] [--locked|--refresh] [-o <file.obj>]\n  \
      reimer run [path] [--release] [--locked|--refresh]\n  \
      reimer test [path] [--release] [--locked|--refresh]\n  \
+     reimer doc [path] [--locked|--refresh] [-o <file.md>]\n  \
      reimer fmt [path] [--check]\n  \
      reimer clean [path]\n  \
      reimer add <alias> (--path <path>|--git <url>) [--package <name>] [--version <req>]\n  \
@@ -1171,6 +1246,22 @@ mod tests {
         assert_eq!(options.profile, BuildProfile::Release);
         assert_eq!(options.lock_mode, LockMode::Locked);
         assert_eq!(output, Some(PathBuf::from("demo.obj")));
+    }
+
+    #[test]
+    fn invocation_should_parse_documentation_output() {
+        let arguments = ["doc", "demo", "--locked", "-o", "api.md"]
+            .map(OsString::from)
+            .to_vec();
+
+        let invocation = Invocation::parse(arguments).expect("fixture should parse");
+
+        let Invocation::Document { options, output } = invocation else {
+            panic!("expected documentation invocation");
+        };
+        assert_eq!(options.path, Path::new("demo"));
+        assert_eq!(options.lock_mode, LockMode::Locked);
+        assert_eq!(output, Some(PathBuf::from("api.md")));
     }
 
     #[test]

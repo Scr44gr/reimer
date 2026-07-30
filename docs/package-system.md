@@ -77,6 +77,7 @@ reimer check [path] [--locked|--refresh]
 reimer build [path] [--release] [--locked|--refresh]
 reimer run [path] [--release] [--locked|--refresh]
 reimer test [path] [--release] [--locked|--refresh]
+reimer doc [path] [--locked|--refresh] [-o <file.md>]
 reimer fmt [path] [--check]
 reimer clean [path]
 reimer add <alias> (--path <path>|--git <url>)
@@ -91,6 +92,12 @@ size. `run` executes the same graph through JIT.
 Each `.reim` file under `tests/` is an independent integration test. It must
 define `fn main() -> i32`; returning `0` means success. Selection and execution
 are sorted by path for deterministic results.
+
+`doc` runs semantic analysis before generating Markdown. It includes public
+functions, extern functions, constants, structs, enums, traits, and public
+inherent methods from the root package, preserves Markdown written in `///`
+comments, and excludes private items and dependency implementation details.
+The default path is `target/reimer/doc/<package>.md`.
 
 `fmt` normalizes trailing spaces, the final newline, and import order;
 `--check` only verifies. `clean` removes only `target/reimer` after resolving

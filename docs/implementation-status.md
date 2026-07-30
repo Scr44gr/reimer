@@ -15,7 +15,7 @@ tests, and an executable `.reim` program.
 | M5 - FFI | Complete | `@link(...) extern "C"` blocks, preserved symbols, `@repr(C)`, `cstr` and validated `c"..."` literals, ABI-safe types, mandatory `unsafe` calls, safe wrappers, JIT dynamic loading, and COFF `/DEFAULTLIB` directives; `examples/m5_ffi.reim` tests scalar calls and `examples/m5_sdl_window.reim` opens and closes a real SDL3 window through `defer`; reproducible official download with SHA-256 verification in `scripts/run-sdl-demo.ps1` | Full standalone linking belongs to runtime/tooling; by-value C aggregate classification can grow when a real binding requires it |
 | M6 - Generics | Complete | Type and `const` parameters, defaults, bounds, and `where` clauses; demand-driven cached monomorphization of functions, structs, enums, associated functions, and methods; inference from arguments and expected returns; traits, supertraits, basic coherence, contract validation, `Copy` markers, and static dispatch; executable `examples/m6_methods.reim` and `examples/m6_generics.reim`, with the latter verified by JIT result `42` | - |
 | M7 - Tensor | Complete | Move-only `tensor<T, Rank>` with contiguous `Vec<T>` and explicit allocator; row-major shape/strides, recoverable shape overflow, scoped `TensorView`/`TensorViewMut`, reference-returning `get`, checked multidimensional `[]`, `fill`, `multiply_scalar`, `add_into`, and `matmul_into`; `m7_tensor.reim` and `m7_matmul.reim` demos, lifetime tests, and real aggregate copies | - |
-| M8 - Packages | Complete | Strict `reimer.toml`, SemVer, profiles, reproducible portable lockfile, checksums, path/Git sources pinned by commit, unification, cycles, and direct visibility; CLI `new/init/check/build/run/test/fmt/clean/add/remove`; executable and library packages, ordered tests, `m8_packages` example, manifest-aware linter/LSP | Registry and publishing belong to a later LDD milestone |
+| M8 - Packages | Complete | Strict `reimer.toml`, SemVer, profiles, reproducible portable lockfile, checksums, path/Git sources pinned by commit, unification, cycles, and direct visibility; CLI `new/init/check/build/run/test/doc/fmt/clean/add/remove`; executable and library packages, ordered tests, `m8_packages` example, manifest-aware linter/LSP | Registry and publishing belong to a later LDD milestone |
 | M9 - Concurrency | Complete | Typed function pointers; structural `Send`/`Sync` without raw pointers; native and scoped threads; `Mutex`, `RwLock`, `Channel`, `Barrier`, `Semaphore`, atomics, and `ThreadLocal`; fixed pool with local queues/work stealing, typed jobs, and `parallel_for_mut` for slices, arrays, and tensors; isolated JIT sessions; five positive demos and three negative borrow/transfer tests | Async, fibers, an ECS scheduler, and configurable atomic orderings are outside v0.1 |
 | M10 - Comptime | Complete | Typed global constants and const generics; deterministic `comptime` functions/blocks with limits; `@repr`, `@derive`, `@align`, `@inline`, `@test`, and `@must_use`; closed derives `Copy`, `Clone`, `Debug`, `Eq`, `Hash`, and `Default`; typed `size_of`, `align_of`, and `meta::*` reflection; layout shared by reflection and Cranelift; isolated unit tests and JIT-verified `examples/m10_comptime.reim` | `@inline` is a frontend hint; advanced inlining policy and runtime reflection are outside v0.1 |
 
@@ -30,6 +30,21 @@ documents. `editors/vscode` provides TextMate highlighting and bundles the
 server and client so `.reim` files work without a Rust or Pylance extension.
 The active in-memory document participates in full package resolution before
 it is saved.
+
+## Full LDD surface audit
+
+The milestone table proves the vertical v0.1 roadmap, not every API proposed
+elsewhere in the draft. The following items remain open and must not be
+reported as implemented:
+
+| LDD area | Implemented | Remaining |
+|---|---|---|
+| Constants and stable storage | Typed compile-time `const` values | Stable-address `static` values and `unsafe` access to `static mut` |
+| Integer overflow APIs | Checked operators panic in every profile; constant overflow is rejected | `wrapping_add`, `checked_add`, and `saturating_add` source methods |
+| Slices and UTF-8 views | Checked `[]`, slice iteration, and validated `str` representation | Recoverable slice `get`/`get_mut` and `str.bytes()`/`str.chars()` |
+| Standard library plan | `alloc`, `collections`, `io`, `string`, `thread`, `job`, and `tensor` | Planned `fs`, `c`, and `math` modules plus broader formatting/Unicode APIs |
+| Tooling | Formatter, checker, tests, generated `///` Markdown, hover, completion, definitions, CodeLens, and diagnostics | Rename and dependency-aware incremental analysis |
+| First integrated demo | SDL/OpenGL, tensor, allocator, `Result`, and `defer` are each exercised | One program combining the complete LDD section 22.1 scenario |
 
 ## Deliberate differences from the draft
 

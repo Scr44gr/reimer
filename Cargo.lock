@@ -823,6 +823,7 @@ dependencies = [
 name = "reimer-cli"
 version = "0.1.0"
 dependencies = [
+ "reimer-ast",
  "reimer-codegen-native",
  "reimer-diagnostics",
  "reimer-hir",

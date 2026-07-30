@@ -71,6 +71,23 @@ impl Package {
         documentation_before(&source.text, span.start.saturating_sub(source.base))
     }
 
+    /// Returns the source path containing a package span.
+    #[must_use]
+    pub fn source_path(&self, span: Span) -> Option<&Path> {
+        self.sources
+            .iter()
+            .find(|source| source.contains(span))
+            .map(|source| source.path.as_path())
+    }
+
+    /// Returns the exact source text covered by a package span.
+    #[must_use]
+    pub fn source_text(&self, span: Span) -> Option<&str> {
+        let source = self.sources.iter().find(|source| source.contains(span))?;
+        let local = source.local_span(span);
+        source.text.get(local.start..local.end)
+    }
+
     fn map_diagnostic(&self, mut diagnostic: Diagnostic) -> FileDiagnostic {
         let source = self
             .sources
@@ -2268,6 +2285,35 @@ mod tests {
         assert_eq!(
             documentation_before(source, declaration).as_deref(),
             Some("Adds two values.\n\n# Arguments\n- `left`: first value")
+        );
+    }
+
+    #[test]
+    fn package_should_map_global_spans_back_to_exact_source() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "package.reim",
+            "/// Returns the answer.\npub fn answer() -> i32 { 42 }\n",
+        );
+        let path = fixture.path("package.reim");
+        let package = load(&path).expect("documented package should load");
+        let function = package
+            .program
+            .items
+            .iter()
+            .find_map(|item| {
+                let reimer_ast::Item::Function(function) = item else {
+                    return None;
+                };
+                Some(function)
+            })
+            .expect("fixture function should exist");
+
+        assert_eq!(package.source_path(function.span), Some(path.as_path()));
+        assert_eq!(package.source_text(function.name.span), Some("answer"));
+        assert_eq!(
+            package.documentation(function.span).as_deref(),
+            Some("Returns the answer.")
         );
     }
 

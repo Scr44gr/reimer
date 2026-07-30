@@ -92,6 +92,19 @@ over the declaration or any direct call. It also attaches local declaration
 documentation to completion items. Documentation from imported source modules
 is retained during package resolution.
 
+The same comments generate package documentation:
+
+```text
+reimer doc [path]
+reimer doc [path] -o public-api.md
+```
+
+The command first runs the complete semantic analysis. It then generates
+Markdown for the root package's public functions, types, constants, traits,
+fields, variants, and methods. Private items and dependency implementation
+details are not exposed. Without `-o`, the output is written to
+`target/reimer/doc/<package>.md`.
+
 ## Packages and snapshots
 
 The active document is always resolved from its in-memory snapshot. When it has

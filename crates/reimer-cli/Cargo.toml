@@ -11,6 +11,7 @@ name = "reimer"
 path = "src/main.rs"
 
 [dependencies]
+reimer-ast = { path = "../reimer-ast" }
 reimer-codegen-native = { path = "../reimer-codegen-native" }
 reimer-diagnostics = { path = "../reimer-diagnostics" }
 reimer-hir = { path = "../reimer-hir" }
