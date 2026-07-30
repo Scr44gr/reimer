@@ -1,0 +1,123 @@
+{
+  "name": "reimer-language",
+  "displayName": "Reimer Language Support",
+  "description": "Compiler-backed language support for .reim files",
+  "version": "0.1.0",
+  "publisher": "reimer-lang",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
+  "keywords": [
+    "reimer",
+    "language server",
+    "linter"
+  ],
+  "activationEvents": [
+    "onLanguage:reimer"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "check": "tsc -p ./ --noEmit",
+    "test": "npm run check && npm run test:grammar",
+    "test:grammar": "node scripts/test-grammar.mjs",
+    "package": "cargo build --release --manifest-path ../../Cargo.toml -p reimer-lsp && node scripts/prepare-server.mjs && npm run compile && vsce package --target win32-x64 --no-dependencies --allow-missing-repository",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.7.2",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.2.1"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "reimer",
+        "aliases": [
+          "Reimer",
+          "reimer"
+        ],
+        "extensions": [
+          ".reim"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "reimer",
+        "scopeName": "source.reimer",
+        "path": "./syntaxes/reimer.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "reimer",
+        "path": "./snippets/language.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "reimer.organizeImports",
+        "title": "Reimer: Organize Imports"
+      },
+      {
+        "command": "reimer.restartServer",
+        "title": "Reimer: Restart Language Server"
+      },
+      {
+        "command": "reimer.showAllocatorEstimate",
+        "title": "Reimer: Show Allocator Estimate"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "reimer.organizeImports",
+          "when": "editorLangId == reimer",
+          "group": "1_modification"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Reimer",
+      "properties": {
+        "reimer.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to the language-server executable. When empty, the bundled binary is used, then PATH as a fallback."
+        },
+        "reimer.server.arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional language-server arguments."
+        },
+        "reimer.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace communication between VS Code and the language server."
+        }
+      }
+    }
+  }
+}

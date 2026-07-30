@@ -1,0 +1,46 @@
+{
+  "Function": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2}) -> ${3:()} {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "Declare a function"
+  },
+  "Fallible function": {
+    "prefix": "fnresult",
+    "body": [
+      "fn ${1:name}(${2}) -> Result<${3:()}, ${4:Error}> {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "Declare a function returning Result"
+  },
+  "Allocator with cleanup": {
+    "prefix": "arena",
+    "body": [
+      "let ${1:arena} = ArenaAllocator::init(&${2:parent})?;",
+      "defer ${1:arena}.deinit();",
+      "${0}"
+    ],
+    "description": "Create an arena and register deterministic cleanup"
+  },
+  "Match result": {
+    "prefix": "matchresult",
+    "body": [
+      "match ${1:value} {",
+      "    Ok(${2:value}) => ${3:value},",
+      "    Err(${4:error}) => ${0},",
+      "}"
+    ],
+    "description": "Handle both Result variants"
+  },
+  "Selective import": {
+    "prefix": "from",
+    "body": [
+      "from ${1:module}::${2:submodule} import ${3:name};"
+    ],
+    "description": "Import selected names using canonical :: paths"
+  }
+}

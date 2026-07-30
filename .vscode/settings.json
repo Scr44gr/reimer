@@ -1,0 +1,10 @@
+{
+  "[reimer]": {
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "editor.inlayHints.enabled": "on"
+  },
+  "editor.codeLens": true,
+  "reimer.trace.server": "off"
+}

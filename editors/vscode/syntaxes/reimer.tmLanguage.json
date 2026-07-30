@@ -1,0 +1,368 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Reimer",
+  "scopeName": "source.reimer",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#attributes"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#imports"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#function-calls"
+    },
+    {
+      "include": "#fields"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.documentation.reimer",
+          "match": "///.*$"
+        },
+        {
+          "name": "comment.line.double-slash.reimer",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.documentation.reimer",
+          "begin": "/\\*\\*",
+          "end": "\\*/",
+          "patterns": [
+            {
+              "include": "#block-comment"
+            }
+          ]
+        },
+        {
+          "include": "#block-comment"
+        }
+      ]
+    },
+    "block-comment": {
+      "name": "comment.block.reimer",
+      "begin": "/\\*",
+      "end": "\\*/",
+      "patterns": [
+        {
+          "include": "#block-comment"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.c.reimer",
+          "begin": "\\bc\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.reimer"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.reimer"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escapes"
+            },
+            {
+              "name": "invalid.illegal.nul.reimer",
+              "match": "\\\\0"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.reimer",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.reimer"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.reimer"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escapes"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.reimer",
+          "begin": "'",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.reimer"
+            }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.reimer"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escapes"
+            }
+          ]
+        }
+      ]
+    },
+    "escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.reimer",
+          "match": "\\\\(?:[nrt0\\\\\"']|u\\{[0-9A-Fa-f_]{1,6}\\})"
+        },
+        {
+          "name": "invalid.illegal.escape.reimer",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "attributes": {
+      "patterns": [
+        {
+          "match": "(@)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "punctuation.definition.annotation.reimer"
+            },
+            "2": {
+              "name": "entity.name.function.attribute.reimer"
+            }
+          }
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.function.reimer"
+            },
+            "2": {
+              "name": "entity.name.function.reimer"
+            }
+          }
+        },
+        {
+          "match": "\\b(struct|enum|trait)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.reimer"
+            },
+            "2": {
+              "name": "entity.name.type.reimer"
+            }
+          }
+        },
+        {
+          "match": "\\b(impl)\\b",
+          "captures": {
+            "1": {
+              "name": "storage.type.impl.reimer"
+            }
+          }
+        },
+        {
+          "match": "\\b(let)\\s+(mut\\s+)?([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.reimer"
+            },
+            "2": {
+              "name": "storage.modifier.mutable.reimer"
+            },
+            "3": {
+              "name": "variable.other.definition.reimer"
+            }
+          }
+        }
+      ]
+    },
+    "imports": {
+      "patterns": [
+        {
+          "name": "keyword.control.import.from.reimer",
+          "match": "\\bfrom\\b(?=\\s+[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*\\s+import\\b)"
+        },
+        {
+          "name": "keyword.control.import.reimer",
+          "match": "\\b(?:import|as)\\b"
+        },
+        {
+          "name": "entity.name.namespace.reimer",
+          "match": "\\b(?:std|core)(?=::)"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.conditional.reimer",
+          "match": "\\b(?:if|else|match)\\b"
+        },
+        {
+          "name": "keyword.control.loop.reimer",
+          "match": "\\b(?:while|for|in|loop|break|continue)\\b"
+        },
+        {
+          "name": "keyword.control.flow.reimer",
+          "match": "\\b(?:return|defer)\\b"
+        },
+        {
+          "name": "storage.modifier.reimer",
+          "match": "\\b(?:pub|mut|const|unsafe|extern|where)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.reimer",
+          "match": "\\b(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|f32|f64|bool|char|str|cstr)\\b"
+        },
+        {
+          "name": "support.type.core.reimer",
+          "match": "\\b(?:Option|Result|String|Allocator|ArenaAllocator|FixedBufferAllocator|OwnedBytes)\\b"
+        },
+        {
+          "name": "entity.name.type.reimer",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.reimer",
+          "match": "\\b(?:true|false)\\b"
+        },
+        {
+          "name": "constant.language.variant.reimer",
+          "match": "\\b(?:Some|None|Ok|Err)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.reimer",
+          "match": "(?<![A-Za-z0-9_])(?:[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*)(?![A-Za-z0-9_])"
+        },
+        {
+          "name": "constant.numeric.integer.reimer",
+          "match": "(?<![A-Za-z0-9_])[0-9][0-9_]*(?![A-Za-z0-9_])"
+        }
+      ]
+    },
+    "function-calls": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.reimer",
+          "match": "\\b(?:panic|print|println|eprint|eprintln|allocate_bytes|general_allocator|page_allocator)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "entity.name.function.call.reimer",
+          "match": "\\b[a-z_][A-Za-z0-9_]*\\b(?=\\s*\\()"
+        }
+      ]
+    },
+    "fields": {
+      "patterns": [
+        {
+          "match": "(\\.)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "punctuation.accessor.reimer"
+            },
+            "2": {
+              "name": "variable.other.member.reimer"
+            }
+          }
+        },
+        {
+          "match": "(::)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "punctuation.accessor.double-colon.reimer"
+            },
+            "2": {
+              "name": "entity.name.function.call.reimer"
+            }
+          }
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.reimer",
+          "match": "<<=|>>=|->|=>|::|==|!=|<=|>=|&&|\\|\\||\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|[+\\-*/%&|^!<>=?]"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.comma.reimer",
+          "match": ","
+        },
+        {
+          "name": "punctuation.terminator.statement.reimer",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.type.reimer",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.section.group.reimer",
+          "match": "[(){}\\[\\]]"
+        }
+      ]
+    }
+  }
+}
