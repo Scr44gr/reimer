@@ -9,8 +9,9 @@
    tipos, mutabilidad, aridad, ciclos de almacenamiento y control de flujo.
 4. `reimer-hir` representa el programa tipado mediante IDs de funciones,
    locales y tipos compuestos; el backend no depende del AST.
-5. `reimer-codegen-native` baja la HIR a Cranelift, con overflow y división
-   comprobados.
+5. `reimer-layout` calcula una única representación nativa compartida por
+   reflexión y codegen; `reimer-codegen-native` baja la HIR a Cranelift, con
+   overflow y división comprobados.
 6. `reimer-project` valida `reimer.toml`, resuelve dependencias path/git,
    sincroniza `reimer.lock` y construye un grafo portable.
 7. `reimer-cli` expone el ciclo completo
@@ -83,7 +84,18 @@ wrappers seguros.
 La API y sus invariantes se describen en
 [`concurrency.md`](concurrency.md).
 
-## Siguiente recorrido: M10 Comptime
+## M10 Comptime
 
-El próximo incremento amplía const evaluation, atributos, derives cerrados y
-la primera reflexión tipada de compilación.
+El resolver evalúa constantes, funciones y bloques `comptime` sin delegar
+operaciones al host. Impone presupuestos de pasos, profundidad y memoria, y
+rechaza E/S, FFI, threads, punteros, préstamos y llamadas runtime. El mismo
+layout validado que consume Cranelift alimenta `size_of<T>()` y `align_of<T>()`,
+evitando dos calculadores con resultados distintos.
+
+Los atributos se conservan en AST/HIR y se validan por destino. Los derives son
+una lista cerrada y estructural; `Clone` no puede ocultar un allocator. `@test`
+registra funciones unitarias y la CLI ejecuta cada una en un proceso JIT
+aislado. `@must_use` se publica como diagnóstico del linter/LSP.
+
+La sintaxis, los límites y las garantías se describen en
+[`metaprogramming.md`](metaprogramming.md).

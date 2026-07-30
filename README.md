@@ -4,11 +4,12 @@ Reimer es un lenguaje compilado orientado inicialmente al desarrollo de
 videojuegos, motores y herramientas de contenido. El compilador está escrito en
 Rust y su primer backend genera código máquina mediante Cranelift.
 
-El compilador implementa los hitos M0–M9 del documento de diseño. Además del
+El compilador implementa los hitos M0–M10 del documento de diseño. Además del
 programa mínimo, ya compila todos los tipos
 escalares y agregados, control de flujo completo, errores recuperables,
 movimientos y referencias, módulos con paths `::`, FFI C, métodos, genéricos de
-tipo y `const`, monomorfización y traits con despacho estático. La biblioteca
+tipo y `const`, monomorfización, traits con despacho estático, evaluación
+`comptime`, atributos, derives cerrados y reflexión tipada. La biblioteca
 estándar incluye allocators explícitos, E/S segura, `String`, `Vec`, `HashMap`,
 `HashSet`, `RingBuffer`, tensors contiguos con vistas seguras, threads,
 sincronización, atomics y un job pool con work stealing:
@@ -57,6 +58,9 @@ cargo run -p reimer-cli -- run examples/m9_synchronization/main.reim
 cargo run -p reimer-cli -- run examples/m9_atomics/main.reim
 cargo run -p reimer-cli -- run examples/m9_jobs/main.reim
 cargo run -p reimer-cli -- run examples/m9_tensor_parallel/main.reim
+cargo run -p reimer-cli -- check examples/m10_comptime.reim
+cargo run -p reimer-cli -- run examples/m10_comptime.reim
+cargo run -p reimer-cli -- test examples/m10_comptime.reim
 ```
 
 Para crear un proyecto:
@@ -71,6 +75,8 @@ reimer build game --release --locked
 El formato de `reimer.toml`, la semántica del lockfile, los perfiles y las
 dependencias path/git están documentados en
 [`docs/package-system.md`](docs/package-system.md).
+La evaluación de compilación, los atributos y la reflexión se especifican en
+[`docs/metaprogramming.md`](docs/metaprogramming.md).
 
 El objeto generado todavía no es un ejecutable autónomo. El enlazado con el
 runtime de arranque y LLD es el siguiente incremento del backend.

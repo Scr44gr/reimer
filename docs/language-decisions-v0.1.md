@@ -95,21 +95,32 @@ para otras vistas no propietarias.
 
 ## D-005: copia explícita de valores propietarios
 
-v0.1 no tendrá un trait general `Clone`. Esto evita que una llamada uniforme
-oculte asignaciones, fallos o semántica específica de recursos.
+v0.1 admite `Clone` únicamente como derive cerrado para valores cuya copia sea
+infalible, no asigne y no necesite un allocator. Esto evita que una llamada
+uniforme oculte asignaciones, fallos o semántica específica de recursos.
 
 - `Copy` significa duplicación implícita, bit a bit, infalible y sin allocator.
+- `Clone` derivado significa duplicación explícita con esas mismas restricciones.
 - Los contenedores propietarios ofrecen `clone_in(allocator)`.
 - Los recursos ofrecen operaciones con nombre semántico, como
   `duplicate_handle()` o `retain()`.
 
 ```reimer
+@derive(Copy, Clone)
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+let second = point.clone();
 let copy = bytes.clone_in(allocator)?;
 let handle = texture.duplicate_handle()?;
 ```
 
-Cuando existan suficientes implementaciones reales se podrá añadir un trait
-`CloneIn`, manteniendo el allocator y el posible error visibles en la firma.
+Un tipo propietario, un campo no `Copy` o cualquier clon que pueda fallar
+impide derivar `Clone`. Cuando existan suficientes implementaciones reales se
+podrá añadir un trait `CloneIn`, manteniendo el allocator y el posible error
+visibles en la firma.
 
 ## D-006: backend nativo
 

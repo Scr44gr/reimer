@@ -19,6 +19,10 @@ experiencia equivalente en intención mediante TextMate y un servidor LSP propio
   allocator, con inlay hints y CodeLens.
 - resolución de dependencias path/git desde `reimer.toml`, con reanálisis al
   cambiar el manifest, el lockfile o una fuente `.reim`.
+- resaltado y completado para `comptime`, constantes, reflexión y atributos de
+  M10; `*` y `->` comparten el mismo scope de operador.
+- advertencias de `@must_use` respaldadas por la HIR, también en paquetes
+  multarchivo guardados.
 
 ## Instalación para desarrollo
 

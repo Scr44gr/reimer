@@ -17,7 +17,7 @@ positivas y negativas y un programa `.reim` ejecutable.
 | M7 — Tensor | Completo | `tensor<T, Rank>` move-only con `Vec<T>` contiguo y allocator explícito; shape/strides row-major, overflow de forma recuperable, `TensorView`/`TensorViewMut` scoped, `get` por referencia, indexación multidimensional `[]` comprobada, `fill`, `multiply_scalar`, `add_into` y `matmul_into`; demos `m7_tensor.reim` y `m7_matmul.reim`, pruebas de lifetime y copia real de agregados | — |
 | M8 — Paquetes | Completo | `reimer.toml` estricto, SemVer, perfiles, lockfile reproducible y portable, checksums, path/git fijado por commit, unificación, ciclos y visibilidad directa; CLI `new/init/check/build/run/test/fmt/clean/add/remove`; paquetes ejecutables y biblioteca, tests ordenados, ejemplo `m8_packages`, linter/LSP conscientes del manifest | Registry y publicación pertenecen a un hito posterior según el LDD |
 | M9 — Concurrencia | Completo | Function pointers tipados; `Send`/`Sync` estructurales sin punteros raw; threads nativos y scoped; `Mutex`, `RwLock`, `Channel`, `Barrier`, `Semaphore`, atomics y `ThreadLocal`; pool fijo con colas locales/work stealing, jobs tipados y `parallel_for_mut` para slices, arrays y tensors; sesiones JIT aisladas; cinco demos positivas y tres pruebas negativas de préstamos/transferencia | Async, fibers, scheduler ECS y ordenamientos atómicos configurables están fuera de v0.1 |
-| M10 — Comptime | Pendiente | Sin cobertura | Const evaluation ampliada, atributos, derives y reflexión tipada inicial |
+| M10 — Comptime | Completo | Constantes globales tipadas y const generics; funciones/bloques `comptime` deterministas con límites; `@repr`, `@derive`, `@align`, `@inline`, `@test` y `@must_use`; derives cerrados `Copy`, `Clone`, `Debug`, `Eq`, `Hash` y `Default`; reflexión tipada `size_of`, `align_of` y `meta::*`; layout compartido entre reflexión y Cranelift; tests unitarios aislados y `examples/m10_comptime.reim` verificado por JIT | `@inline` es una sugerencia del frontend; una política avanzada de inlining y reflexión runtime quedan fuera de v0.1 |
 
 ## Herramientas de editor
 
@@ -36,8 +36,9 @@ para que los archivos `.reim` funcionen sin una extensión de Rust o Pylance.
 - El único tipo unidad es `()`.
 - Los movimientos de valores no `Copy` son implícitos.
 - `str` es una vista UTF-8 no propietaria `(pointer, length)`.
-- No existe un `Clone` general en v0.1; las copias propietarias usan APIs que
-  hacen visible el allocator o la operación de recurso.
+- `Clone` derivado solo existe para valores cuya copia es infalible y no asigna;
+  las copias propietarias siguen usando APIs que hacen visible el allocator o
+  la operación de recurso.
 
 ## Gates permanentes
 
