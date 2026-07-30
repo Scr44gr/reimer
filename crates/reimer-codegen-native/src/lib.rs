@@ -14,14 +14,15 @@ use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::object::{BinaryFormat, SectionKind};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_hir::{
     AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, ForIteration, Function,
     FunctionId, IntegerAdditionMode, LocalId, MatchExpression, Pattern, PatternKind, Place,
-    PlaceKind, Program, Statement, SynchronizationKind, TypeDefinitionKind, UnaryOperator,
+    PlaceKind, Program, Statement, Static, StaticId, SynchronizationKind, TypeDefinitionKind,
+    UnaryOperator,
 };
 use reimer_layout::{AggregateLayoutKind, Layouts};
 use reimer_runtime::Failure;
@@ -612,12 +613,206 @@ fn compile_program<M: Module>(
     program: &Program,
 ) -> Result<HashMap<FunctionId, FuncId>, String> {
     let layouts = Layouts::build(&program.types)?;
+    let statics = declare_statics(module, program, &layouts)?;
     let functions = declare_functions(module, program)?;
     let thread_thunks = prepare_thread_thunks(module, program)?;
     for function in &program.functions {
-        define_function(module, function, &functions, &thread_thunks, &layouts)?;
+        define_function(
+            module,
+            function,
+            &functions,
+            &statics,
+            &thread_thunks,
+            &layouts,
+        )?;
     }
     Ok(functions)
+}
+
+fn declare_statics<M: Module>(
+    module: &mut M,
+    program: &Program,
+    layouts: &Layouts,
+) -> Result<HashMap<StaticId, DataId>, String> {
+    let mut declarations = HashMap::with_capacity(program.statics.len());
+    for value in &program.statics {
+        let linkage = if value.is_public {
+            Linkage::Export
+        } else {
+            Linkage::Local
+        };
+        let data = module
+            .declare_data(
+                &mangle_static_name(&value.name),
+                linkage,
+                value.mutable,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        let layout = layouts.value_layout(value.ty)?;
+        let mut description = DataDescription::new();
+        description.set_align(u64::from(layout.align));
+        description.define(serialize_static_initializer(value, layouts)?.into_boxed_slice());
+        module
+            .define_data(data, &description)
+            .map_err(|error| error.to_string())?;
+        declarations.insert(value.id, data);
+    }
+    Ok(declarations)
+}
+
+fn serialize_static_initializer(value: &Static, layouts: &Layouts) -> Result<Vec<u8>, String> {
+    let layout = layouts.value_layout(value.ty)?;
+    let length = usize::try_from(layout.size.max(1))
+        .map_err(|_| "static storage size exceeds the host address space".to_owned())?;
+    let mut bytes = vec![0; length];
+    write_static_value(&mut bytes, 0, &value.initializer, layouts)?;
+    Ok(bytes)
+}
+
+fn write_static_value(
+    bytes: &mut [u8],
+    offset: u32,
+    expression: &Expression,
+    layouts: &Layouts,
+) -> Result<(), String> {
+    match &expression.kind {
+        ExpressionKind::Integer(value) => {
+            write_static_integer(bytes, offset, expression.ty, *value, layouts)
+        }
+        ExpressionKind::Unary {
+            operator: UnaryOperator::Negate,
+            operand,
+        } if operand.ty.is_integer() => {
+            let ExpressionKind::Integer(magnitude) = operand.kind else {
+                return Err("static negative integer initializer is not canonical".to_owned());
+            };
+            let bits = integer_width(expression.ty)?;
+            let mask = if bits == 128 {
+                u128::MAX
+            } else {
+                (1_u128 << bits) - 1
+            };
+            let value = 0_u128.wrapping_sub(magnitude) & mask;
+            write_static_integer(bytes, offset, expression.ty, value, layouts)
+        }
+        ExpressionKind::Float32(value) => write_static_bytes(bytes, offset, &value.to_ne_bytes()),
+        ExpressionKind::Float64(value) => write_static_bytes(bytes, offset, &value.to_ne_bytes()),
+        ExpressionKind::Character(value) => {
+            write_static_bytes(bytes, offset, &u32::from(*value).to_ne_bytes())
+        }
+        ExpressionKind::Boolean(value) => write_static_bytes(bytes, offset, &[u8::from(*value)]),
+        ExpressionKind::Unit => Ok(()),
+        ExpressionKind::Tuple(fields) | ExpressionKind::Struct(fields) => {
+            let layout = layouts.aggregate(expression.ty)?;
+            let AggregateLayoutKind::Product { offsets } = &layout.kind else {
+                return Err("static product initializer has no product layout".to_owned());
+            };
+            if fields.len() != offsets.len() {
+                return Err("static product initializer does not match its layout".to_owned());
+            }
+            for (field, field_offset) in fields.iter().zip(offsets) {
+                write_static_value(
+                    bytes,
+                    offset
+                        .checked_add(*field_offset)
+                        .ok_or_else(|| "static field offset overflowed".to_owned())?,
+                    field,
+                    layouts,
+                )?;
+            }
+            Ok(())
+        }
+        ExpressionKind::Array(elements) => {
+            let layout = layouts.aggregate(expression.ty)?;
+            let AggregateLayoutKind::Array { stride, length } = layout.kind else {
+                return Err("static array initializer has no array layout".to_owned());
+            };
+            if u64::try_from(elements.len()).ok() != Some(length) {
+                return Err("static array initializer does not match its layout".to_owned());
+            }
+            for (index, element) in elements.iter().enumerate() {
+                let index = u32::try_from(index)
+                    .map_err(|_| "static array index exceeds u32".to_owned())?;
+                write_static_value(
+                    bytes,
+                    offset
+                        .checked_add(
+                            stride
+                                .checked_mul(index)
+                                .ok_or_else(|| "static array offset overflowed".to_owned())?,
+                        )
+                        .ok_or_else(|| "static array offset overflowed".to_owned())?,
+                    element,
+                    layouts,
+                )?;
+            }
+            Ok(())
+        }
+        ExpressionKind::Enum { variant, fields } => {
+            let layout = layouts.aggregate(expression.ty)?;
+            let AggregateLayoutKind::Enum { variants } = &layout.kind else {
+                return Err("static enum initializer has no enum layout".to_owned());
+            };
+            let offsets = variants
+                .get(type_index(TypeId(*variant))?)
+                .ok_or_else(|| format!("static enum variant {variant} has no layout"))?;
+            if fields.len() != offsets.len() {
+                return Err("static enum initializer does not match its layout".to_owned());
+            }
+            write_static_bytes(bytes, offset, &variant.to_ne_bytes())?;
+            for (field, field_offset) in fields.iter().zip(offsets) {
+                write_static_value(
+                    bytes,
+                    offset
+                        .checked_add(*field_offset)
+                        .ok_or_else(|| "static enum field offset overflowed".to_owned())?,
+                    field,
+                    layouts,
+                )?;
+            }
+            Ok(())
+        }
+        _ => Err("static initializer contains a runtime-only expression".to_owned()),
+    }
+}
+
+fn write_static_integer(
+    bytes: &mut [u8],
+    offset: u32,
+    ty: Type,
+    value: u128,
+    layouts: &Layouts,
+) -> Result<(), String> {
+    let size = usize::try_from(layouts.value_layout(ty)?.size)
+        .map_err(|_| "static integer size exceeds usize".to_owned())?;
+    let encoded = value.to_ne_bytes();
+    write_static_bytes(bytes, offset, &encoded[..size])
+}
+
+fn write_static_bytes(bytes: &mut [u8], offset: u32, value: &[u8]) -> Result<(), String> {
+    let start =
+        usize::try_from(offset).map_err(|_| "static byte offset exceeds usize".to_owned())?;
+    let end = start
+        .checked_add(value.len())
+        .ok_or_else(|| "static byte range overflowed".to_owned())?;
+    let destination = bytes
+        .get_mut(start..end)
+        .ok_or_else(|| "static initializer exceeds its declared layout".to_owned())?;
+    destination.copy_from_slice(value);
+    Ok(())
+}
+
+fn integer_width(ty: Type) -> Result<u32, String> {
+    match ty {
+        Type::I8 | Type::U8 => Ok(8),
+        Type::I16 | Type::U16 => Ok(16),
+        Type::I32 | Type::U32 | Type::Char => Ok(32),
+        Type::I64 | Type::U64 => Ok(64),
+        Type::I128 | Type::U128 => Ok(128),
+        Type::Isize | Type::Usize => Ok(usize::BITS),
+        _ => Err(format!("type `{ty}` is not an integer")),
+    }
 }
 
 fn prepare_thread_thunks<M: Module>(
@@ -1186,7 +1381,15 @@ fn symbol_name(function: &Function, entry: Option<FunctionId>) -> String {
 }
 
 fn mangle_function_name(name: &str) -> String {
-    let mut symbol = "function_".to_owned();
+    mangle_symbol_name("function_", name)
+}
+
+fn mangle_static_name(name: &str) -> String {
+    mangle_symbol_name("static_", name)
+}
+
+fn mangle_symbol_name(prefix: &str, name: &str) -> String {
+    let mut symbol = prefix.to_owned();
     for byte in name.bytes() {
         if byte.is_ascii_alphanumeric() || byte == b'_' {
             symbol.push(char::from(byte));
@@ -1202,6 +1405,7 @@ fn define_function<M: Module>(
     module: &mut M,
     function: &Function,
     functions: &HashMap<FunctionId, FuncId>,
+    statics: &HashMap<StaticId, DataId>,
     thread_thunks: &HashMap<ThreadThunkKey, FuncId>,
     layouts: &Layouts,
 ) -> Result<(), String> {
@@ -1231,8 +1435,13 @@ fn define_function<M: Module>(
         } else {
             None
         };
-        let mut state =
-            CodegenState::new(layouts, thread_thunks, return_destination, target_config);
+        let mut state = CodegenState::new(
+            layouts,
+            statics,
+            thread_thunks,
+            return_destination,
+            target_config,
+        );
 
         for parameter in &function.parameters {
             if !parameter.ty.has_runtime_value() {
@@ -1473,6 +1682,7 @@ struct CodegenState<'layouts> {
     locals: HashMap<LocalId, LocalStorage>,
     loops: Vec<LoopTargets>,
     layouts: &'layouts Layouts,
+    statics: &'layouts HashMap<StaticId, DataId>,
     thread_thunks: &'layouts HashMap<ThreadThunkKey, FuncId>,
     return_destination: Option<Value>,
     target_config: TargetFrontendConfig,
@@ -1488,6 +1698,7 @@ enum LocalStorage {
 impl<'layouts> CodegenState<'layouts> {
     fn new(
         layouts: &'layouts Layouts,
+        statics: &'layouts HashMap<StaticId, DataId>,
         thread_thunks: &'layouts HashMap<ThreadThunkKey, FuncId>,
         return_destination: Option<Value>,
         target_config: TargetFrontendConfig,
@@ -1496,6 +1707,7 @@ impl<'layouts> CodegenState<'layouts> {
             locals: HashMap::new(),
             loops: Vec::new(),
             layouts,
+            statics,
             thread_thunks,
             return_destination,
             target_config,
@@ -2016,6 +2228,7 @@ fn emit_expression<M: Module>(
             emit_enum_expression(builder, module, functions, state, expression)
         }
         ExpressionKind::Local(local) => emit_local(builder, state, *local, expression.ty),
+        ExpressionKind::Static(value) => emit_static(builder, module, state, *value, expression.ty),
         ExpressionKind::Unary { operator, operand } => {
             emit_unary(builder, module, functions, state, *operator, operand)
         }
@@ -4298,6 +4511,32 @@ fn emit_local(
     Ok(Emitted::value(value))
 }
 
+fn emit_static<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &M,
+    state: &CodegenState<'_>,
+    value: StaticId,
+    ty: Type,
+) -> Result<Emitted, String> {
+    let address = static_address(builder, module, state, value)?;
+    load_at_address(builder, ty, address)
+}
+
+fn static_address<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &M,
+    state: &CodegenState<'_>,
+    value: StaticId,
+) -> Result<Value, String> {
+    let data = state
+        .statics
+        .get(&value)
+        .copied()
+        .ok_or_else(|| format!("static {} has no native data object", value.0))?;
+    let global = module.declare_data_in_func(data, builder.func);
+    Ok(builder.ins().symbol_value(pointer_type(), global))
+}
+
 fn emit_integer_constant(
     builder: &mut FunctionBuilder<'_>,
     ty: Type,
@@ -6121,7 +6360,10 @@ fn emit_assignment<M: Module>(
                 }
             }
         }
-        PlaceKind::Field { .. } | PlaceKind::Index { .. } | PlaceKind::Dereference { .. } => {
+        PlaceKind::Static(_)
+        | PlaceKind::Field { .. }
+        | PlaceKind::Index { .. }
+        | PlaceKind::Dereference { .. } => {
             let address = emit_place_address(builder, module, functions, state, target)?;
             if target.ty.is_composite() {
                 copy_composite(
@@ -6170,6 +6412,7 @@ fn emit_place_address<M: Module>(
                 LocalStorage::Address(address) => address,
             })
         }
+        PlaceKind::Static(value) => static_address(builder, module, state, *value),
         PlaceKind::Field { base, field } => {
             let layout = state.layouts.aggregate(base.ty)?;
             let AggregateLayoutKind::Product { offsets } = &layout.kind else {
@@ -6419,6 +6662,20 @@ mod tests {
     }
 
     #[test]
+    fn emit_object_should_define_static_data_symbols() {
+        let program = compile_fixture("pub static ANSWER: i32 = 42; fn main() -> i32 { ANSWER }");
+
+        let bytes = emit_object(&program).expect("fixture should compile");
+        let object = File::parse(bytes.as_slice()).expect("artifact should be an object");
+
+        assert!(object.symbols().any(|symbol| {
+            symbol
+                .name()
+                .is_ok_and(|name| name.contains("static_ANSWER"))
+        }));
+    }
+
+    #[test]
     fn emit_object_with_options_should_accept_speed_optimization() {
         let program = compile_fixture("fn main() -> i32 { 42 }");
 
@@ -6475,6 +6732,25 @@ mod tests {
         let program = compile_fixture(
             "fn add(left: i32, right: i32) -> i32 { left + right }
              fn main() -> i32 { let value = add(20, 22); value }",
+        );
+
+        let result = execute(&program).expect("fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_read_and_mutate_static_aggregate_storage() {
+        let program = compile_fixture(
+            "struct Pair { left: i32, right: i32 }
+             static PAIR: Pair = Pair { left: 20, right: 22 };
+             static mut VALUES: [i32; 2] = [0, 0];
+             fn main() -> i32 {
+                 unsafe {
+                     VALUES[1] = PAIR.left + PAIR.right;
+                     VALUES[1]
+                 }
+             }",
         );
 
         let result = execute(&program).expect("fixture should execute");

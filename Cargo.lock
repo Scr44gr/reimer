@@ -905,6 +905,7 @@ version = "0.1.0"
 dependencies = [
  "reimer-ast",
  "reimer-diagnostics",
+ "reimer-hir",
  "reimer-lexer",
  "reimer-lint",
  "reimer-package",

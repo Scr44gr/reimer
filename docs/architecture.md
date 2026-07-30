@@ -64,6 +64,25 @@ Cranelift lowering evaluates each operand once and uses native overflow flags:
 `None`, and `saturating_add` selects the correct minimum or maximum for the
 integer width. No operation relies on host-language overflow behavior.
 
+## Stable static storage
+
+`const` names are substituted with values evaluated by the deterministic
+compile-time engine. A `static` declaration instead creates one native
+Cranelift data object with a stable address in both JIT and object output:
+
+```reimer
+static ANSWER: i32 = 42;
+static mut COUNTER: i32 = 0;
+```
+
+Static initializers are evaluated at compile time and serialized through the
+same native layouts used by generated code. Immutable statics can be read or
+borrowed safely. Every read, write, or borrow of `static mut` requires an
+`unsafe` block, and moving a non-`Copy` value out of any static is rejected.
+Statics cannot contain borrowed views, strings, raw pointers, or function
+values. Concurrent mutable state should use atomics, locks, or an encapsulated
+synchronization API.
+
 ## Slices and UTF-8
 
 Checked `slice[index]` remains the concise access form and raises a bounds

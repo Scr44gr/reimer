@@ -201,6 +201,16 @@ impl Document {
                         "compile-time constant",
                         declaration.span,
                     ),
+                    Item::Static(declaration) => (
+                        &declaration.name.name,
+                        CompletionItemKind::VARIABLE,
+                        if declaration.mutable {
+                            "mutable static"
+                        } else {
+                            "static"
+                        },
+                        declaration.span,
+                    ),
                     Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => continue,
                 };
                 if seen.insert(name.clone()) {
@@ -422,11 +432,7 @@ impl Document {
         };
         match resolved {
             Ok(mut typed) => {
-                for definition in &mut typed.types {
-                    if definition.name.is_some() {
-                        definition.documentation = package.documentation(definition.span);
-                    }
-                }
+                attach_package_documentation(&mut typed, &package);
                 self.analysis
                     .findings
                     .retain(|finding| finding.severity != Severity::Error);
@@ -573,6 +579,18 @@ impl Document {
                 declaration.name.span,
                 None,
             ),
+            Item::Static(declaration) => (
+                declaration.name.name.clone(),
+                Some(if declaration.mutable {
+                    "mutable static".to_owned()
+                } else {
+                    "static".to_owned()
+                }),
+                SymbolKind::VARIABLE,
+                declaration.span,
+                declaration.name.span,
+                None,
+            ),
             Item::Comptime(block) => (
                 "comptime".to_owned(),
                 Some("compile-time assertion block".to_owned()),
@@ -672,6 +690,20 @@ impl Document {
             selection_range: self.lines.range(selection_span),
             children,
         }
+    }
+}
+
+fn attach_package_documentation(
+    typed: &mut reimer_hir::Program,
+    package: &reimer_package::Package,
+) {
+    for definition in &mut typed.types {
+        if definition.name.is_some() {
+            definition.documentation = package.documentation(definition.span);
+        }
+    }
+    for value in &mut typed.statics {
+        value.documentation = package.documentation(value.span);
     }
 }
 
@@ -1413,6 +1445,38 @@ mod tests {
     }
 
     #[test]
+    fn document_should_show_static_signatures_and_documentation() {
+        let source = "/// Stores the canonical answer at a stable address.\n\
+                      static ANSWER: i32 = 42;\n\
+                      fn main() -> i32 { ANSWER }\n"
+            .to_owned();
+        let use_offset = source.rfind("ANSWER").expect("static use should exist");
+        let position = LineIndex::new(Arc::from(source.as_str())).position(use_offset);
+        let document = Document::new(
+            Url::parse("untitled:documented-static.reim").expect("URL should parse"),
+            source,
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("static use should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents.value.contains("static ANSWER: i32"),
+            "unexpected hover contents: {}",
+            contents.value
+        );
+        assert!(
+            contents
+                .value
+                .contains("Stores the canonical answer at a stable address.")
+        );
+    }
+
+    #[test]
     fn document_should_hide_internal_module_names_in_generic_type_hovers() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -1591,6 +1655,47 @@ mod tests {
                 .value
                 .contains("Carries a documented value across a package boundary.")
         );
+        assert!(!contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_documentation_for_imported_statics() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2026\"\n\n\
+             [dependencies]\nvalues = { path = \"../values\" }\n",
+        );
+        let source = "from values import ANSWER;\nfn main() -> i32 { ANSWER }\n";
+        let main = fixture.write("app/src/main.reim", source);
+        fixture.write(
+            "values/reimer.toml",
+            "[package]\nname = \"values\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+        );
+        fixture.write(
+            "values/src/package.reim",
+            "/// Stores a shared immutable answer.\npub static ANSWER: i32 = 42;\n",
+        );
+        let use_offset = source.rfind("ANSWER").expect("static use should exist");
+        let position = LineIndex::new(Arc::from(source)).position(use_offset);
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("imported static should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents.value.contains("pub static ANSWER: i32"),
+            "unexpected hover contents: {}",
+            contents.value
+        );
+        assert!(contents.value.contains("Stores a shared immutable answer."));
         assert!(!contents.value.contains("__module_"));
     }
 

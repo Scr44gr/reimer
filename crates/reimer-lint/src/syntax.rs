@@ -409,6 +409,7 @@ impl Visitor for NameCollector {
             Item::Enum(declaration) => Some(&declaration.name),
             Item::Trait(declaration) => Some(&declaration.name),
             Item::Constant(declaration) => Some(&declaration.name),
+            Item::Static(declaration) => Some(&declaration.name),
             Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => None,
         };
         if let Some(name) = name {

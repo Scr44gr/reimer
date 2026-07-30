@@ -11,9 +11,10 @@ use reimer_ast::{
     Function, GenericArgument, GenericParameter, Identifier, IfExpression, ImplDeclaration,
     ImportDeclaration, ImportKind, ImportedName, IndexExpression, IntegerLiteral, Item,
     LetStatement, LoopExpression, MatchArm, MatchExpression, Parameter, Path, Pattern,
-    PatternField, Program, ReturnStatement, Statement, StringLiteral, StructDeclaration,
-    StructExpression, StructField, TraitDeclaration, TraitMethod, TupleExpression, TypeName,
-    TypeNameKind, UnaryExpression, UnaryOperator, WherePredicate, WhileStatement,
+    PatternField, Program, ReturnStatement, Statement, StaticDeclaration, StringLiteral,
+    StructDeclaration, StructExpression, StructField, TraitDeclaration, TraitMethod,
+    TupleExpression, TypeName, TypeNameKind, UnaryExpression, UnaryOperator, WherePredicate,
+    WhileStatement,
 };
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_lexer::{Token, TokenKind};
@@ -91,23 +92,11 @@ impl<'tokens> Parser<'tokens> {
                 .parse_function(attributes)
                 .map(|function| vec![Item::Function(function)]);
         }
-        if self.at(&TokenKind::Const)
-            || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Const))
-        {
-            if !attributes.is_empty() {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "E1020",
-                        "M10 attributes do not apply to constants",
-                        attributes[0].span,
-                    )
-                    .with_help("remove the attribute from the constant declaration"),
-                );
-                return None;
-            }
-            return self
-                .parse_constant_declaration()
-                .map(|constant| vec![Item::Constant(constant)]);
+        if self.at_optional_public(&TokenKind::Const) {
+            return self.parse_constant_item(&attributes);
+        }
+        if self.at_optional_public(&TokenKind::Static) {
+            return self.parse_static_item(&attributes);
         }
         if self.at(&TokenKind::Impl) {
             if !attributes.is_empty() {
@@ -161,10 +150,46 @@ impl<'tokens> Parser<'tokens> {
         let token = self.current();
         self.diagnostics.push(
             Diagnostic::error("E1001", "expected a declaration", token.span).with_help(
-                "start with `fn`, `const`, `comptime`, `struct`, `enum`, `trait`, or an import",
+                "start with `fn`, `const`, `static`, `comptime`, `struct`, `enum`, `trait`, `impl`, `extern`, or an import",
             ),
         );
         None
+    }
+
+    fn at_optional_public(&self, declaration: &TokenKind) -> bool {
+        self.at(declaration) || (self.at(&TokenKind::Pub) && self.at_offset(1, declaration))
+    }
+
+    fn parse_constant_item(&mut self, attributes: &[Attribute]) -> Option<Vec<Item>> {
+        if !attributes.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E1020",
+                    "M10 attributes do not apply to constants",
+                    attributes[0].span,
+                )
+                .with_help("remove the attribute from the constant declaration"),
+            );
+            return None;
+        }
+        self.parse_constant_declaration()
+            .map(|constant| vec![Item::Constant(constant)])
+    }
+
+    fn parse_static_item(&mut self, attributes: &[Attribute]) -> Option<Vec<Item>> {
+        if !attributes.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E1020",
+                    "attributes do not apply to statics",
+                    attributes[0].span,
+                )
+                .with_help("remove the attribute from the static declaration"),
+            );
+            return None;
+        }
+        self.parse_static_declaration()
+            .map(|declaration| vec![Item::Static(declaration)])
     }
 
     fn parse_comptime_item(
@@ -445,6 +470,27 @@ impl<'tokens> Parser<'tokens> {
         let end = self.expect_symbol(&TokenKind::Semicolon, "`;` after the constant")?;
         Some(ConstantDeclaration {
             is_public,
+            name,
+            ty,
+            value,
+            span: Span::new(start, end.span.end),
+        })
+    }
+
+    fn parse_static_declaration(&mut self) -> Option<StaticDeclaration> {
+        let start = self.current().span.start;
+        let is_public = self.take(&TokenKind::Pub).is_some();
+        self.expect_symbol(&TokenKind::Static, "`static`")?;
+        let mutable = self.take(&TokenKind::Mut).is_some();
+        let name = self.expect_identifier("static name")?;
+        self.expect_symbol(&TokenKind::Colon, "`:` after the static name")?;
+        let ty = self.parse_type_name()?;
+        self.expect_symbol(&TokenKind::Equal, "`=` before the static initializer")?;
+        let value = self.parse_expression()?;
+        let end = self.expect_symbol(&TokenKind::Semicolon, "`;` after the static")?;
+        Some(StaticDeclaration {
+            is_public,
+            mutable,
             name,
             ty,
             value,
@@ -2197,6 +2243,8 @@ impl<'tokens> Parser<'tokens> {
             && !self.at(&TokenKind::Enum)
             && !self.at(&TokenKind::From)
             && !self.at(&TokenKind::Import)
+            && !self.at(&TokenKind::Const)
+            && !self.at(&TokenKind::Static)
             && !self.at(&TokenKind::Pub)
         {
             self.advance();
@@ -2628,6 +2676,26 @@ mod tests {
                 Item::Comptime(_),
                 Item::Function(_)
             ] if function.is_comptime
+        ));
+    }
+
+    #[test]
+    fn parse_should_build_immutable_and_mutable_static_declarations() {
+        let tokens = lex("pub static ANSWER: i32 = 42;
+             static mut COUNTER: usize = 0;")
+        .expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+
+        assert!(matches!(
+            program.items.as_slice(),
+            [Item::Static(answer), Item::Static(counter)]
+                if answer.is_public
+                    && !answer.mutable
+                    && answer.name.name == "ANSWER"
+                    && !counter.is_public
+                    && counter.mutable
+                    && counter.name.name == "COUNTER"
         ));
     }
 

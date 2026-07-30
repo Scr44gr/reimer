@@ -37,6 +37,23 @@ Evaluation supports scalars, strings, tuples, arrays, structs, pure calls,
 local variables, branches, `match`, loops, and checked casts. A failing `panic`
 or `assert` becomes a compiler diagnostic.
 
+## Static initializers
+
+A static uses the same deterministic evaluator as a constant initializer, but
+the result is serialized into stable native storage instead of being
+substituted at each use:
+
+```reimer
+static ORIGIN: (i32, i32) = (0, 0);
+static mut FRAME_COUNT: u64 = 0;
+```
+
+The initializer may use previously evaluated constants and `comptime fn`
+calls. It cannot perform runtime I/O, allocation, FFI, or pointer work.
+Immutable static storage can be read and borrowed safely. Every access to a
+mutable static requires `unsafe`, and a non-`Copy` value cannot be moved out of
+either form.
+
 Each compilation unit enforces these limits:
 
 - 1,000,000 steps;

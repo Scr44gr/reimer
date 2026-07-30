@@ -1,0 +1,17 @@
+/// An immutable value with a stable runtime address.
+static ANSWER: i32 = 40 + 2;
+
+/// Mutable global state used only to demonstrate the unsafe access boundary.
+static mut COUNTER: i32 = 0;
+
+fn answer_address() -> &i32 {
+    &ANSWER
+}
+
+fn main() -> i32 {
+    let address = answer_address();
+    unsafe {
+        COUNTER = *address;
+        COUNTER
+    }
+}

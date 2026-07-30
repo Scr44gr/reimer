@@ -82,6 +82,10 @@ pub(crate) fn program(visitor: &mut impl Visitor, program: &ast::Program) {
                 type_name(visitor, &declaration.ty);
                 expression(visitor, &declaration.value);
             }
+            Item::Static(declaration) => {
+                type_name(visitor, &declaration.ty);
+                expression(visitor, &declaration.value);
+            }
             Item::Comptime(block) => self::block(visitor, &block.body),
         }
     }

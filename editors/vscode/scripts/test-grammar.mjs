@@ -100,6 +100,12 @@ assertScope(
   "size_of",
   "support.function.builtin.reimer",
 );
+assertScope(
+  grammar,
+  "static mut COUNTER: i32 = 0;",
+  "COUNTER",
+  "variable.other.constant.reimer",
+);
 for (const tokenText of ["*", "->"]) {
   assertScope(
     grammar,

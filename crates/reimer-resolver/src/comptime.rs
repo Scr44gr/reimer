@@ -160,6 +160,11 @@ pub(crate) struct Evaluation {
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
+pub(crate) struct InitializerEvaluation {
+    pub(crate) value: Option<EvaluatedConstant>,
+    pub(crate) diagnostics: Vec<Diagnostic>,
+}
+
 pub(crate) enum IntrinsicResult {
     NotFound,
     Deferred,
@@ -201,6 +206,31 @@ pub(crate) fn evaluate(
     run_blocks: bool,
 ) -> Evaluation {
     Evaluator::new(program, metadata, seed, emit_errors).evaluate(run_blocks)
+}
+
+pub(crate) fn evaluate_initializer(
+    program: &ast::Program,
+    metadata: &mut impl Metadata,
+    constants: HashMap<String, EvaluatedConstant>,
+    expression: &Expression,
+) -> InitializerEvaluation {
+    let mut evaluator = Evaluator::new(program, metadata, constants, true);
+    let mut frame = Frame::default();
+    let value = evaluator
+        .evaluate_expression(expression, &mut frame)
+        .and_then(|value| {
+            evaluator.charge_memory(&value, expression.span())?;
+            Ok(value)
+        })
+        .ok()
+        .map(|value| EvaluatedConstant {
+            value,
+            span: expression.span(),
+        });
+    InitializerEvaluation {
+        value,
+        diagnostics: evaluator.diagnostics,
+    }
 }
 
 struct Evaluator<'ast, 'metadata, M> {

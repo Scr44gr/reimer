@@ -258,3 +258,27 @@ Each JIT program receives a runtime session. Its threads and pools preserve
 that identity, and the backend waits for or destroys only the resources of the
 session being terminated. Concurrent compilations cannot interfere, and
 generated code cannot continue after its module is released.
+
+## D-011: constants and stable static storage
+
+`const` declares a typed compile-time value and does not allocate runtime
+storage. `static` declares one native data object whose address remains stable
+for the program's lifetime. Both forms require an explicit type and a
+deterministic compile-time initializer.
+
+```reimer
+const BUFFER_SIZE: usize = 4096;
+static ANSWER: i32 = 42;
+static mut COUNTER: i32 = 0;
+```
+
+Immutable statics are safe to read and borrow. Every access to `static mut`
+requires `unsafe`, including reads and borrows, because the compiler cannot
+prove that unsynchronized global mutation is race-free. Concurrent state must
+prefer atomics, locks, or safe encapsulated APIs. A non-`Copy` value cannot be
+moved out of static storage.
+
+Static storage accepts owned scalar and aggregate values. Borrowed references,
+slices, UTF-8 views, raw pointers, and function values are rejected in v0.1.
+The native backend emits real Cranelift data objects for JIT and object builds;
+it does not emulate stable storage with a function stack slot.

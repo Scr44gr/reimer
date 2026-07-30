@@ -2,7 +2,8 @@ use std::path::Path;
 
 use reimer_ast::{
     ConstantDeclaration, EnumDeclaration, ExternFunction, Function, GenericParameter,
-    ImplDeclaration, Item, StructDeclaration, TraitDeclaration, TraitMethod, WherePredicate,
+    ImplDeclaration, Item, StaticDeclaration, StructDeclaration, TraitDeclaration, TraitMethod,
+    WherePredicate,
 };
 use reimer_diagnostics::Span;
 use reimer_package::{Package, display_symbol_name};
@@ -56,6 +57,13 @@ pub(crate) fn render(package: &Package, source_root: &Path, title: &str) -> Stri
                 render_constant(package, &mut output, declaration);
                 documented_items += 1;
             }
+            Item::Static(declaration)
+                if declaration.is_public
+                    && belongs_to_root(package, declaration.span, source_root) =>
+            {
+                render_static(package, &mut output, declaration);
+                documented_items += 1;
+            }
             Item::Impl(implementation)
                 if belongs_to_root(package, implementation.span, source_root) =>
             {
@@ -69,6 +77,7 @@ pub(crate) fn render(package: &Package, source_root: &Path, title: &str) -> Stri
             | Item::Trait(_)
             | Item::Impl(_)
             | Item::Constant(_)
+            | Item::Static(_)
             | Item::Comptime(_) => {}
         }
     }
@@ -251,6 +260,17 @@ fn render_constant(package: &Package, output: &mut String, declaration: &Constan
     let display_name = display_symbol_name(&declaration.name.name);
     let signature = format!(
         "pub const {display_name}: {} = {};",
+        source(package, declaration.ty.span),
+        source(package, declaration.value.span())
+    );
+    render_section(package, output, &display_name, &signature, declaration.span);
+}
+
+fn render_static(package: &Package, output: &mut String, declaration: &StaticDeclaration) {
+    let display_name = display_symbol_name(&declaration.name.name);
+    let mutability = if declaration.mutable { "mut " } else { "" };
+    let signature = format!(
+        "pub static {mutability}{display_name}: {} = {};",
         source(package, declaration.ty.span),
         source(package, declaration.value.span())
     );

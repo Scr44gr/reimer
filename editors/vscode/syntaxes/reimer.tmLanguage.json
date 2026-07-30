@@ -210,6 +210,20 @@
           }
         },
         {
+          "match": "\\b(static)\\s+(mut\\s+)?([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.reimer"
+            },
+            "2": {
+              "name": "storage.modifier.mutable.reimer"
+            },
+            "3": {
+              "name": "variable.other.constant.reimer"
+            }
+          }
+        },
+        {
           "match": "\\b(impl)\\b",
           "captures": {
             "1": {
@@ -265,7 +279,7 @@
         },
         {
           "name": "storage.modifier.reimer",
-          "match": "\\b(?:pub|mut|const|comptime|unsafe|extern|where)\\b"
+          "match": "\\b(?:pub|mut|const|static|comptime|unsafe|extern|where)\\b"
         }
       ]
     },

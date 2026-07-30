@@ -960,6 +960,18 @@ impl Loader {
                         &mut self.diagnostics,
                     );
                 }
+                Item::Static(declaration) if declaration.is_public => {
+                    insert_symbol(
+                        api,
+                        declaration.name.name.clone(),
+                        Symbol {
+                            canonical: canonical_name(module_name, &declaration.name.name),
+                        },
+                        declaration.name.span,
+                        &self.sources,
+                        &mut self.diagnostics,
+                    );
+                }
                 _ => {}
             }
         }
@@ -1117,6 +1129,9 @@ impl Loader {
                     Some((declaration.name.name.clone(), declaration.name.span))
                 }
                 Item::Constant(declaration) => {
+                    Some((declaration.name.name.clone(), declaration.name.span))
+                }
+                Item::Static(declaration) => {
                     Some((declaration.name.name.clone(), declaration.name.span))
                 }
                 Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => None,
@@ -1375,6 +1390,10 @@ fn collect_qualified_paths(program: &ast::Program) -> Vec<&ast::Path> {
                 }
             }
             Item::Constant(declaration) => {
+                visit_type_paths(&declaration.ty, &mut paths);
+                visit_expression_paths(&declaration.value, &mut paths);
+            }
+            Item::Static(declaration) => {
                 visit_type_paths(&declaration.ty, &mut paths);
                 visit_expression_paths(&declaration.value, &mut paths);
             }
@@ -1642,6 +1661,16 @@ impl ItemRewriteContext<'_> {
             Item::Trait(declaration) => self.rewrite_trait(declaration),
             Item::Impl(declaration) => self.rewrite_impl(declaration),
             Item::Constant(declaration) => {
+                rewrite_identifier(&mut declaration.name, self.module);
+                rewrite_type(&mut declaration.ty, self.scope, self.apis, self.diagnostics);
+                rewrite_expression(
+                    &mut declaration.value,
+                    self.scope,
+                    self.apis,
+                    self.diagnostics,
+                );
+            }
+            Item::Static(declaration) => {
                 rewrite_identifier(&mut declaration.name, self.module);
                 rewrite_type(&mut declaration.ty, self.scope, self.apis, self.diagnostics);
                 rewrite_expression(

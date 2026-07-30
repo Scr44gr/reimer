@@ -62,6 +62,8 @@ pub enum Item {
     Impl(ImplDeclaration),
     /// A named compile-time constant.
     Constant(ConstantDeclaration),
+    /// A named value with a stable runtime address.
+    Static(StaticDeclaration),
     /// A block executed by the compiler after type definitions are available.
     Comptime(ComptimeBlock),
 }
@@ -246,6 +248,23 @@ pub struct ConstantDeclaration {
     /// Whether the constant is exported from the module.
     pub is_public: bool,
     /// Constant name.
+    pub name: Identifier,
+    /// Declared value type.
+    pub ty: TypeName,
+    /// Compile-time initializer.
+    pub value: Expression,
+    /// Full declaration span.
+    pub span: Span,
+}
+
+/// A named value stored at a stable runtime address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticDeclaration {
+    /// Whether the static is exported from the module.
+    pub is_public: bool,
+    /// Whether accesses may mutate the stored value.
+    pub mutable: bool,
+    /// Static name.
     pub name: Identifier,
     /// Declared value type.
     pub ty: TypeName,

@@ -12,7 +12,7 @@ use reimer_ast::{
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_hir::{
     self as hir, AssignmentOperator, BinaryOperator, Expression, ExpressionKind, FunctionId,
-    IntegerAdditionMode, LocalId, Place, PlaceKind, UnaryOperator,
+    IntegerAdditionMode, LocalId, Place, PlaceKind, StaticId, UnaryOperator,
 };
 use reimer_layout::Layouts;
 use reimer_types::{Type, TypeId};
@@ -46,6 +46,13 @@ struct Signature {
     return_type: Type,
     requires_unsafe: bool,
     is_public: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StaticSymbol {
+    id: StaticId,
+    mutable: bool,
+    ty: Type,
 }
 
 struct SignatureSource<'ast> {
@@ -2245,6 +2252,45 @@ impl TypeRegistry {
         }
     }
 
+    fn supports_static_storage(&self, ty: Type) -> bool {
+        self.supports_static_storage_at_depth(ty, 0)
+    }
+
+    fn supports_static_storage_at_depth(&self, ty: Type, depth: usize) -> bool {
+        if depth > 64 || matches!(ty, Type::Never | Type::Str | Type::CStr) {
+            return false;
+        }
+        let Some(definition) = self.definition(ty) else {
+            return true;
+        };
+        match &definition.kind {
+            hir::TypeDefinitionKind::Struct { fields } => fields
+                .iter()
+                .all(|field| self.supports_static_storage_at_depth(field.ty, depth + 1)),
+            hir::TypeDefinitionKind::Tuple { elements } => elements
+                .iter()
+                .all(|element| self.supports_static_storage_at_depth(*element, depth + 1)),
+            hir::TypeDefinitionKind::Array { element, .. } => {
+                self.supports_static_storage_at_depth(*element, depth + 1)
+            }
+            hir::TypeDefinitionKind::Enum { variants } => {
+                variants.iter().all(|variant| match &variant.fields {
+                    hir::EnumVariantFields::Unit => true,
+                    hir::EnumVariantFields::Tuple(fields) => fields
+                        .iter()
+                        .all(|field| self.supports_static_storage_at_depth(*field, depth + 1)),
+                    hir::EnumVariantFields::Struct(fields) => fields
+                        .iter()
+                        .all(|field| self.supports_static_storage_at_depth(field.ty, depth + 1)),
+                })
+            }
+            hir::TypeDefinitionKind::Reference { .. }
+            | hir::TypeDefinitionKind::RawPointer { .. }
+            | hir::TypeDefinitionKind::Slice { .. }
+            | hir::TypeDefinitionKind::Function { .. } => false,
+        }
+    }
+
     fn type_name_may_be_scoped(&self, type_name: &ast::TypeName) -> bool {
         self.type_name_may_be_scoped_at_depth(type_name, 0)
     }
@@ -2579,6 +2625,7 @@ fn reflection_entry(name: &str, ty: &str) -> comptime::Value {
 
 struct Resolver {
     signatures: HashMap<String, Signature>,
+    statics: HashMap<String, StaticSymbol>,
     generic_functions: GenericFunctionRegistry,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
@@ -2589,6 +2636,7 @@ impl Resolver {
     fn new() -> Self {
         Self {
             signatures: HashMap::new(),
+            statics: HashMap::new(),
             generic_functions: GenericFunctionRegistry::default(),
             types: TypeRegistry::default(),
             diagnostics: Vec::new(),
@@ -2619,8 +2667,9 @@ impl Resolver {
         self.validate_type_cycles();
         self.validate_derived_traits();
         self.collect_trait_implementations(program);
-        self.evaluate_compiletime(program);
+        let compiletime_constants = self.evaluate_compiletime(program);
         let declarations = self.collect_declarations(program);
+        let statics = self.collect_statics(program, &compiletime_constants);
         self.generic_functions.next_id = u32::try_from(declarations.len()).unwrap_or(u32::MAX);
         let entry = require_entry.then(|| self.validate_entry()).flatten();
         let (mut functions, mut extern_functions) = self.analyze_declarations(declarations);
@@ -2648,6 +2697,7 @@ impl Resolver {
                 types: self.types.definitions,
                 functions,
                 extern_functions,
+                statics,
                 entry,
                 tests,
             })
@@ -2671,7 +2721,10 @@ impl Resolver {
                 } => {
                     let environment = self.types.base_environment();
                     let mut analyzer = FunctionAnalyzer::new(
-                        &mut self.signatures,
+                        ValueSymbols {
+                            functions: &mut self.signatures,
+                            statics: &self.statics,
+                        },
                         &mut self.generic_functions,
                         &mut self.types,
                         &mut self.diagnostics,
@@ -2717,7 +2770,10 @@ impl Resolver {
         while let Some(pending) = self.generic_functions.pending.get(pending_index).cloned() {
             pending_index += 1;
             let mut analyzer = FunctionAnalyzer::new(
-                &mut self.signatures,
+                ValueSymbols {
+                    functions: &mut self.signatures,
+                    statics: &self.statics,
+                },
                 &mut self.generic_functions,
                 &mut self.types,
                 &mut self.diagnostics,
@@ -2768,12 +2824,16 @@ impl Resolver {
                 | Item::ExternFunction(_)
                 | Item::Trait(_)
                 | Item::Constant(_)
+                | Item::Static(_)
                 | Item::Comptime(_) => {}
             }
         }
     }
 
-    fn evaluate_compiletime(&mut self, program: &ast::Program) {
+    fn evaluate_compiletime(
+        &mut self,
+        program: &ast::Program,
+    ) -> HashMap<String, comptime::EvaluatedConstant> {
         let seed = std::mem::take(&mut self.preliminary_constants);
         let evaluation = {
             let mut metadata = ReflectionMetadata {
@@ -2825,6 +2885,104 @@ impl Resolver {
                     .insert(declaration.name.name.clone(), value);
             }
         }
+        evaluation.constants
+    }
+
+    fn collect_statics(
+        &mut self,
+        program: &ast::Program,
+        constants: &HashMap<String, comptime::EvaluatedConstant>,
+    ) -> Vec<hir::Static> {
+        let mut resolved = Vec::new();
+        for item in &program.items {
+            let Item::Static(declaration) = item else {
+                continue;
+            };
+            let name = declaration.name.name.clone();
+            if self.statics.contains_key(&name)
+                || self.types.constants.contains_key(&name)
+                || self.signatures.contains_key(&name)
+                || self.generic_functions.templates.contains_key(&name)
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3155",
+                        format!("static `{name}` conflicts with another value declaration"),
+                        declaration.name.span,
+                    )
+                    .with_help("give the static a unique name"),
+                );
+                continue;
+            }
+            let Some(ty) = self
+                .types
+                .resolve_type_name(&declaration.ty, &mut self.diagnostics)
+            else {
+                continue;
+            };
+            if !self.types.supports_static_storage(ty) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3155",
+                        format!("type `{ty}` cannot be stored in a static"),
+                        declaration.ty.span,
+                    )
+                    .with_help(
+                        "use an owned scalar or aggregate without references, slices, strings, raw pointers, or function values",
+                    ),
+                );
+                continue;
+            }
+            let evaluation = {
+                let mut metadata = ReflectionMetadata {
+                    types: &mut self.types,
+                };
+                comptime::evaluate_initializer(
+                    program,
+                    &mut metadata,
+                    constants.clone(),
+                    &declaration.value,
+                )
+            };
+            self.diagnostics.extend(evaluation.diagnostics);
+            let Some(evaluated) = evaluation.value else {
+                continue;
+            };
+            let Some(initializer) = self.types.lower_compiletime_value(
+                &evaluated.value,
+                ty,
+                evaluated.span,
+                &mut self.diagnostics,
+            ) else {
+                continue;
+            };
+            let Ok(index) = u32::try_from(resolved.len()) else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E3999",
+                    "this compilation unit contains too many statics",
+                    declaration.span,
+                ));
+                continue;
+            };
+            let id = StaticId(index);
+            let symbol = StaticSymbol {
+                id,
+                mutable: declaration.mutable,
+                ty,
+            };
+            self.statics.insert(name.clone(), symbol);
+            resolved.push(hir::Static {
+                id,
+                name,
+                is_public: declaration.is_public,
+                mutable: declaration.mutable,
+                ty,
+                initializer,
+                documentation: None,
+                span: declaration.span,
+            });
+        }
+        resolved
     }
 
     fn collect_type_headers(&mut self, program: &ast::Program) {
@@ -3435,6 +3593,7 @@ impl Resolver {
                 | Item::Enum(_)
                 | Item::Trait(_)
                 | Item::Constant(_)
+                | Item::Static(_)
                 | Item::Comptime(_) => {}
             }
         }
@@ -3870,8 +4029,14 @@ struct DeferredUse {
     consuming: bool,
 }
 
+struct ValueSymbols<'context> {
+    functions: &'context mut HashMap<String, Signature>,
+    statics: &'context HashMap<String, StaticSymbol>,
+}
+
 struct FunctionAnalyzer<'context> {
     signatures: &'context mut HashMap<String, Signature>,
+    statics: &'context HashMap<String, StaticSymbol>,
     generic_functions: &'context mut GenericFunctionRegistry,
     types: &'context mut TypeRegistry,
     diagnostics: &'context mut Vec<Diagnostic>,
@@ -3896,7 +4061,7 @@ struct FunctionAnalyzer<'context> {
 
 impl<'context> FunctionAnalyzer<'context> {
     fn new(
-        signatures: &'context mut HashMap<String, Signature>,
+        symbols: ValueSymbols<'context>,
         generic_functions: &'context mut GenericFunctionRegistry,
         types: &'context mut TypeRegistry,
         diagnostics: &'context mut Vec<Diagnostic>,
@@ -3904,8 +4069,10 @@ impl<'context> FunctionAnalyzer<'context> {
         generic_environment: GenericEnvironment,
         module_identity: Option<String>,
     ) -> Self {
+        let ValueSymbols { functions, statics } = symbols;
         Self {
-            signatures,
+            signatures: functions,
+            statics,
             generic_functions,
             types,
             diagnostics,
@@ -4213,6 +4380,12 @@ impl<'context> FunctionAnalyzer<'context> {
             }
             _ if scoped_return_is_empty(expression) => return,
             _ => {}
+        }
+        let rooted_in_static = scoped_return_root(expression)
+            .and_then(single_path_name)
+            .is_some_and(|name| self.statics.contains_key(name));
+        if rooted_in_static {
+            return;
         }
         let scoped_parameters = self
             .signature
@@ -4966,6 +5139,13 @@ impl<'context> FunctionAnalyzer<'context> {
             return self.analyze_local_path(binding, path.span);
         }
 
+        if let Some(value) = single_path_name(path)
+            .and_then(|name| self.statics.get(name))
+            .cloned()
+        {
+            return self.analyze_static_path(&value, path, expected);
+        }
+
         if let Some(constant) = self.analyze_const_path(path, expected) {
             return constant;
         }
@@ -5047,6 +5227,48 @@ impl<'context> FunctionAnalyzer<'context> {
             kind: ExpressionKind::Unit,
             ty: Type::Unit,
             span: path.span,
+        }
+    }
+
+    fn analyze_static_path(
+        &mut self,
+        value: &StaticSymbol,
+        path: &ast::Path,
+        expected: Option<Type>,
+    ) -> Expression {
+        self.require_static_access(value, path.span);
+        if self.consuming_value && !self.types.is_copy(value.ty) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3144",
+                    format!("cannot move a value out of static `{}`", path.display()),
+                    path.span,
+                )
+                .with_help("borrow the static value or copy one of its `Copy` fields"),
+            );
+        }
+        if let Some(expected) = expected {
+            self.require_type(expected, value.ty, path.span, "static value");
+        }
+        Expression {
+            kind: ExpressionKind::Static(value.id),
+            ty: value.ty,
+            span: path.span,
+        }
+    }
+
+    fn require_static_access(&mut self, value: &StaticSymbol, span: Span) {
+        if value.mutable && self.unsafe_depth == 0 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3156",
+                    "mutable static storage can only be accessed inside `unsafe`",
+                    span,
+                )
+                .with_help(
+                    "wrap the access in `unsafe { ... }` or use atomics, locks, or an encapsulated synchronization API",
+                ),
+            );
         }
     }
 
@@ -5179,7 +5401,21 @@ impl<'context> FunctionAnalyzer<'context> {
         let Some(path) = assignment_root_path(expression) else {
             return;
         };
-        let Some(binding) = single_path_name(path).and_then(|name| self.lookup(name)) else {
+        let Some(name) = single_path_name(path) else {
+            return;
+        };
+        if self.statics.contains_key(name) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3144",
+                    format!("cannot move a value out of static `{name}`"),
+                    span,
+                )
+                .with_help("borrow the static value or copy one of its `Copy` fields"),
+            );
+            return;
+        }
+        let Some(binding) = self.lookup(name) else {
             return;
         };
         self.require_local_available(binding, span);
@@ -9061,20 +9297,30 @@ impl<'context> FunctionAnalyzer<'context> {
     fn analyze_place(&mut self, expression: &AstExpression) -> Option<Place> {
         match expression {
             AstExpression::Path(path) => {
-                let binding = single_path_name(path).and_then(|name| self.lookup(name));
-                let Some(binding) = binding else {
-                    self.diagnostics.push(Diagnostic::error(
-                        "E3102",
-                        format!("cannot resolve binding `{}`", path.display()),
-                        path.span,
-                    ));
-                    return None;
-                };
-                Some(Place {
-                    kind: PlaceKind::Local(binding.local),
-                    ty: binding.ty,
-                    span: path.span,
-                })
+                if let Some(binding) = single_path_name(path).and_then(|name| self.lookup(name)) {
+                    return Some(Place {
+                        kind: PlaceKind::Local(binding.local),
+                        ty: binding.ty,
+                        span: path.span,
+                    });
+                }
+                if let Some(value) = single_path_name(path)
+                    .and_then(|name| self.statics.get(name))
+                    .cloned()
+                {
+                    self.require_static_access(&value, path.span);
+                    return Some(Place {
+                        kind: PlaceKind::Static(value.id),
+                        ty: value.ty,
+                        span: path.span,
+                    });
+                }
+                self.diagnostics.push(Diagnostic::error(
+                    "E3102",
+                    format!("cannot resolve binding `{}`", path.display()),
+                    path.span,
+                ));
+                None
             }
             AstExpression::Field(_) => {
                 let analyzed = self.analyze_expression_non_consuming(expression);
@@ -9125,9 +9371,11 @@ impl<'context> FunctionAnalyzer<'context> {
 
     fn place_expression_type(&self, expression: &AstExpression) -> Option<Type> {
         match expression {
-            AstExpression::Path(path) => {
-                single_path_name(path).and_then(|name| self.lookup(name).map(|binding| binding.ty))
-            }
+            AstExpression::Path(path) => single_path_name(path).and_then(|name| {
+                self.lookup(name)
+                    .map(|binding| binding.ty)
+                    .or_else(|| self.statics.get(name).map(|value| value.ty))
+            }),
             AstExpression::Field(field) => {
                 let base = self.place_expression_type(&field.base)?;
                 let base = self
@@ -9220,6 +9468,21 @@ impl<'context> FunctionAnalyzer<'context> {
         let Some(name) = single_path_name(path) else {
             return;
         };
+        if let Some(value) = self.statics.get(name) {
+            if !value.mutable {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3107",
+                        format!("cannot assign through immutable static `{name}`"),
+                        path.span,
+                    )
+                    .with_help(format!(
+                        "declare it as `static mut {name}` and access it in `unsafe`"
+                    )),
+                );
+            }
+            return;
+        }
         let Some(binding) = self.lookup(name) else {
             return;
         };
@@ -10681,6 +10944,86 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "E3107")
+        );
+    }
+
+    #[test]
+    fn resolve_should_collect_typed_static_initializers() {
+        let source = "static ANSWER: i32 = 40 + 2;
+            static mut COUNTER: i32 = 0;
+            fn main() -> i32 {
+                unsafe { COUNTER = ANSWER; COUNTER }
+            }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+
+        assert_eq!(program.statics.len(), 2);
+        assert!(!program.statics[0].mutable);
+        assert!(program.statics[1].mutable);
+        assert!(matches!(
+            program.statics[0].initializer.kind,
+            reimer_hir::ExpressionKind::Integer(42)
+        ));
+    }
+
+    #[test]
+    fn resolve_should_allow_references_rooted_in_immutable_statics_to_escape() {
+        let source = "static ANSWER: i32 = 42; fn answer_address() -> &i32 { &ANSWER } fn main() -> i32 { *answer_address() }";
+
+        resolve_fixture(source).expect("stable static reference should resolve");
+    }
+
+    #[test]
+    fn resolve_should_require_unsafe_for_mutable_static_access() {
+        let source = "static mut COUNTER: i32 = 0; fn main() -> i32 { COUNTER = 1; COUNTER }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3156")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_assignment_to_immutable_static() {
+        let source = "static ANSWER: i32 = 42; fn main() -> i32 { ANSWER = 0; ANSWER }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3107")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_scoped_static_storage() {
+        let source = "static MESSAGE: str = \"hello\"; fn main() -> i32 { 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3155")
+        );
+    }
+
+    #[test]
+    fn resolve_should_reject_moving_non_copy_values_from_statics() {
+        let source = "struct Holder { value: i32 }
+            static VALUE: Holder = Holder { value: 42 };
+            fn main() -> Holder { VALUE }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3144")
         );
     }
 

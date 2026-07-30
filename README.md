@@ -9,8 +9,9 @@ In addition to the minimum program, it compiles every scalar and aggregate
 type, complete control flow, recoverable errors, moves and references, modules
 with `::` paths, C FFI, methods, type and `const` generics, monomorphization,
 traits with static dispatch, `comptime` evaluation, attributes, closed derives,
-and typed reflection. The standard library includes explicit allocators, safe
-I/O, recoverable slice access, allocation-free UTF-8 byte and character
+typed reflection, and stable-address `static` storage with `static mut` guarded
+by `unsafe`. The standard library includes explicit allocators, safe I/O,
+recoverable slice access, allocation-free UTF-8 byte and character
 iteration, `String`, `Vec`, `HashMap`, `HashSet`, `RingBuffer`, contiguous
 tensors with safe views, threads, synchronization, atomics, and a work-stealing
 job pool:

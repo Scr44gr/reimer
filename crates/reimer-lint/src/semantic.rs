@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use reimer_ast::{self as ast, Expression as AstExpression, Item, TypeNameKind};
 use reimer_diagnostics::Span;
 use reimer_hir::{
-    self as hir, ExpressionKind, FunctionId, IntegerAdditionMode, LocalId, PlaceKind,
+    self as hir, ExpressionKind, FunctionId, IntegerAdditionMode, LocalId, PlaceKind, StaticId,
     TypeDefinitionKind,
 };
 use reimer_types::{Type, TypeId};
@@ -74,6 +74,9 @@ pub(crate) fn attach_type_documentation(source: &str, typed: &mut hir::Program) 
                 reimer_package::documentation_before(source, definition.span.start);
         }
     }
+    for value in &mut typed.statics {
+        value.documentation = reimer_package::documentation_before(source, value.span.start);
+    }
 }
 
 pub(crate) fn index_with_documentation(
@@ -85,7 +88,20 @@ pub(crate) fn index_with_documentation(
     let mut type_hints = Vec::new();
     let mut definitions = syntax_index.type_definition_links();
     let function_targets = function_targets(typed, &syntax_index);
+    let static_targets = static_targets(typed, &syntax_index);
     let callable_hints = callable_hints(typed, documentation);
+
+    for value in &typed.statics {
+        let Some(name_span) = syntax_index.static_name(value.span) else {
+            continue;
+        };
+        type_hints.push(TypeHint {
+            span: name_span,
+            label: static_signature(value, typed),
+            documentation: static_documentation(value, typed),
+            kind: TypeHintKind::Binding,
+        });
+    }
 
     for function in &typed.functions {
         let Some(ast_function) = syntax_index.function(function.span) else {
@@ -126,6 +142,7 @@ pub(crate) fn index_with_documentation(
             local_targets: &local_targets,
             local_types: &local_types,
             function_targets: &function_targets,
+            static_targets: &static_targets,
             callable_hints: &callable_hints,
             type_hints: &mut type_hints,
             definitions: &mut definitions,
@@ -228,6 +245,18 @@ fn function_documentation(
         .map(|(_, documentation)| documentation.as_str())
 }
 
+fn static_targets(typed: &hir::Program, syntax_index: &SyntaxIndex<'_>) -> HashMap<StaticId, Span> {
+    typed
+        .statics
+        .iter()
+        .filter_map(|value| {
+            syntax_index
+                .static_name(value.span)
+                .map(|span| (value.id, span))
+        })
+        .collect()
+}
+
 fn sort_and_deduplicate(type_hints: &mut Vec<TypeHint>, definitions: &mut Vec<DefinitionLink>) {
     type_hints.sort_by(|left, right| {
         left.span
@@ -250,6 +279,7 @@ fn sort_and_deduplicate(type_hints: &mut Vec<TypeHint>, definitions: &mut Vec<De
 struct SyntaxIndex<'ast> {
     functions: HashMap<(usize, usize), &'ast ast::Function>,
     function_names: HashMap<(usize, usize), Span>,
+    static_names: HashMap<(usize, usize), Span>,
     let_names: HashMap<(usize, usize), Span>,
     pattern_names: HashMap<(usize, usize), Span>,
     call_callees: HashMap<(usize, usize), Span>,
@@ -262,6 +292,7 @@ impl<'ast> SyntaxIndex<'ast> {
         let mut index = Self {
             functions: HashMap::new(),
             function_names: HashMap::new(),
+            static_names: HashMap::new(),
             let_names: HashMap::new(),
             pattern_names: HashMap::new(),
             call_callees: HashMap::new(),
@@ -296,6 +327,11 @@ impl<'ast> SyntaxIndex<'ast> {
                         index.insert_function(method);
                     }
                 }
+                Item::Static(declaration) => {
+                    index
+                        .static_names
+                        .insert(span_key(declaration.span), declaration.name.span);
+                }
                 Item::Import(_) | Item::Constant(_) | Item::Comptime(_) => {}
             }
         }
@@ -315,6 +351,10 @@ impl<'ast> SyntaxIndex<'ast> {
 
     fn function_name(&self, span: Span) -> Option<Span> {
         self.function_names.get(&span_key(span)).copied()
+    }
+
+    fn static_name(&self, span: Span) -> Option<Span> {
+        self.static_names.get(&span_key(span)).copied()
     }
 
     fn type_definition_links(&self) -> Vec<DefinitionLink> {
@@ -603,6 +643,7 @@ struct HirIndexer<'context> {
     local_targets: &'context HashMap<LocalId, Span>,
     local_types: &'context HashMap<LocalId, Type>,
     function_targets: &'context HashMap<FunctionId, Span>,
+    static_targets: &'context HashMap<StaticId, Span>,
     callable_hints: &'context HashMap<FunctionId, CallableHint>,
     type_hints: &'context mut Vec<TypeHint>,
     definitions: &'context mut Vec<DefinitionLink>,
@@ -654,6 +695,7 @@ impl HirIndexer<'_> {
     fn expression_kind(&mut self, expression: &hir::Expression) {
         match &expression.kind {
             ExpressionKind::Local(local) => self.link_local(expression.span, *local),
+            ExpressionKind::Static(value) => self.link_static(expression.span, *value),
             ExpressionKind::Call {
                 function,
                 arguments,
@@ -763,6 +805,28 @@ impl HirIndexer<'_> {
                 self.typed,
                 TypeHintKind::Binding,
             ));
+        }
+    }
+
+    fn link_static(&mut self, use_span: Span, value: StaticId) {
+        if let Some(target_span) = self.static_targets.get(&value).copied() {
+            self.definitions.push(DefinitionLink {
+                use_span,
+                target_span,
+            });
+        }
+        if let Some(value) = self
+            .typed
+            .statics
+            .iter()
+            .find(|candidate| candidate.id == value)
+        {
+            self.type_hints.push(TypeHint {
+                span: use_span,
+                label: static_signature(value, self.typed),
+                documentation: static_documentation(value, self.typed),
+                kind: TypeHintKind::Binding,
+            });
         }
     }
 
@@ -882,6 +946,7 @@ impl HirIndexer<'_> {
         ));
         match &place.kind {
             PlaceKind::Local(local) => self.link_local(place.span, *local),
+            PlaceKind::Static(value) => self.link_static(place.span, *value),
             PlaceKind::Field { base, .. } | PlaceKind::Index { base, .. } => {
                 self.expression(base);
                 if let PlaceKind::Index { index, .. } = &place.kind {
@@ -1065,6 +1130,29 @@ fn extern_signature(function: &hir::ExternFunction, program: &hir::Program) -> S
         reimer_package::display_symbol_name(&function.name),
         type_label(function.return_type, program)
     )
+}
+
+fn static_signature(value: &hir::Static, program: &hir::Program) -> String {
+    let visibility = if value.is_public { "pub " } else { "" };
+    let mutability = if value.mutable { "mut " } else { "" };
+    format!(
+        "{visibility}static {mutability}{}: {}",
+        reimer_package::display_symbol_name(&value.name),
+        type_label(value.ty, program)
+    )
+}
+
+fn static_documentation(value: &hir::Static, program: &hir::Program) -> String {
+    value.documentation.clone().unwrap_or_else(|| {
+        let label = type_label(value.ty, program);
+        if value.mutable {
+            format!(
+                "Stable-address mutable storage containing `{label}`. Every access requires `unsafe`; prefer atomics, locks, or an encapsulated synchronization API for concurrent state."
+            )
+        } else {
+            format!("Stable-address immutable storage containing `{label}`.")
+        }
+    })
 }
 
 fn resolved_type_hint(

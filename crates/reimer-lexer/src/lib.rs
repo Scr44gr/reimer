@@ -56,6 +56,8 @@ pub enum TokenKind {
     Defer,
     /// `const`
     Const,
+    /// `static`
+    Static,
     /// `comptime`
     Comptime,
     /// `unsafe`
@@ -375,6 +377,7 @@ impl<'source> Lexer<'source> {
             "continue" => TokenKind::Continue,
             "defer" => TokenKind::Defer,
             "const" => TokenKind::Const,
+            "static" => TokenKind::Static,
             "comptime" => TokenKind::Comptime,
             "unsafe" => TokenKind::Unsafe,
             "extern" => TokenKind::Extern,
@@ -749,6 +752,14 @@ mod tests {
             lex("comptime fn answer() -> usize { 42 }").expect("compile-time function should lex");
 
         assert_eq!(tokens[0].kind, TokenKind::Comptime);
+    }
+
+    #[test]
+    fn lex_should_recognize_static_as_a_keyword() {
+        let tokens = lex("static mut COUNTER: i32 = 0;").expect("fixture should lex");
+
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Static));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Mut));
     }
 
     #[test]

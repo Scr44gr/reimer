@@ -7,6 +7,10 @@ use reimer_types::{Type, TypeId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub u32);
 
+/// Index of a static value in a [`Program`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StaticId(pub u32);
+
 /// Unique local binding within one function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalId(pub u32);
@@ -20,10 +24,33 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// Native functions imported through an explicit ABI.
     pub extern_functions: Vec<ExternFunction>,
+    /// Values stored at stable runtime addresses.
+    pub statics: Vec<Static>,
     /// Validated executable entry point, absent for libraries.
     pub entry: Option<FunctionId>,
     /// Zero-argument functions selected by `@test`.
     pub tests: Vec<FunctionId>,
+}
+
+/// A typed value stored at a stable runtime address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Static {
+    /// Stable index in the compilation unit.
+    pub id: StaticId,
+    /// Canonical source name.
+    pub name: String,
+    /// Whether the symbol is exported from its module.
+    pub is_public: bool,
+    /// Whether accesses may mutate the stored value.
+    pub mutable: bool,
+    /// Stored value type.
+    pub ty: Type,
+    /// Fully evaluated initializer.
+    pub initializer: Expression,
+    /// Markdown documentation associated with the source declaration.
+    pub documentation: Option<String>,
+    /// Source declaration range.
+    pub span: Span,
 }
 
 /// A canonical composite type definition.
@@ -410,6 +437,8 @@ pub enum ExpressionKind {
     },
     /// Read from a resolved local.
     Local(LocalId),
+    /// Read from stable static storage.
+    Static(StaticId),
     /// Prefix operation.
     Unary {
         /// Operation to apply.
@@ -768,6 +797,8 @@ pub struct Place {
 pub enum PlaceKind {
     /// A local binding.
     Local(LocalId),
+    /// Stable static storage.
+    Static(StaticId),
     /// A field within an aggregate value.
     Field {
         /// Aggregate base.
