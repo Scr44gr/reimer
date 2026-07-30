@@ -10,6 +10,7 @@ license.workspace = true
 reimer-ast = { path = "../reimer-ast" }
 reimer-diagnostics = { path = "../reimer-diagnostics" }
 reimer-hir = { path = "../reimer-hir" }
+reimer-layout = { path = "../reimer-layout" }
 reimer-types = { path = "../reimer-types" }
 
 [dev-dependencies]

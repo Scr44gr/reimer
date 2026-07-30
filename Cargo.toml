@@ -6,6 +6,7 @@ members = [
     "crates/reimer-diagnostics",
     "crates/reimer-hir",
     "crates/reimer-lexer",
+    "crates/reimer-layout",
     "crates/reimer-lint",
     "crates/reimer-lsp",
     "crates/reimer-parser",

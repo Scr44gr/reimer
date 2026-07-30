@@ -9,6 +9,40 @@ pub struct Program {
     pub items: Vec<Item>,
 }
 
+/// A compiler-recognized annotation attached to a declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribute {
+    /// Attribute name without the leading `@`.
+    pub name: Identifier,
+    /// Arguments written between parentheses.
+    pub arguments: Vec<AttributeArgument>,
+    /// Full attribute span.
+    pub span: Span,
+}
+
+/// One syntactic attribute argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeArgument {
+    /// An identifier such as `C` or `Copy`.
+    Identifier(Identifier),
+    /// A non-negative integer literal.
+    Integer(IntegerLiteral),
+    /// A decoded UTF-8 string literal.
+    String(StringLiteral),
+}
+
+impl AttributeArgument {
+    /// Returns the complete source range for this argument.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        match self {
+            Self::Identifier(identifier) => identifier.span,
+            Self::Integer(literal) => literal.span,
+            Self::String(literal) => literal.span,
+        }
+    }
+}
+
 /// A top-level declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
@@ -26,6 +60,10 @@ pub enum Item {
     Trait(TraitDeclaration),
     /// An inherent or trait implementation block.
     Impl(ImplDeclaration),
+    /// A named compile-time constant.
+    Constant(ConstantDeclaration),
+    /// A block executed by the compiler after type definitions are available.
+    Comptime(ComptimeBlock),
 }
 
 /// A top-level import or re-export.
@@ -91,6 +129,10 @@ pub struct ImportedName {
 /// A free function declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Function {
+    /// Compiler-recognized declaration attributes.
+    pub attributes: Vec<Attribute>,
+    /// Whether the function is evaluated only by the compiler.
+    pub is_comptime: bool,
     /// Whether the function is exported from the module.
     pub is_public: bool,
     /// Function name.
@@ -133,14 +175,14 @@ pub struct ExternFunction {
 /// A named product type declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructDeclaration {
+    /// Compiler-recognized declaration attributes.
+    pub attributes: Vec<Attribute>,
     /// Whether the type is exported from its module.
     pub is_public: bool,
     /// Type name.
     pub name: Identifier,
     /// Generic type and constant parameters.
     pub generic_parameters: Vec<GenericParameter>,
-    /// Whether the field layout is frozen to the target C ABI.
-    pub repr_c: bool,
     /// Fields in declaration order.
     pub fields: Vec<StructField>,
     /// Additional constraints on generic parameters.
@@ -182,6 +224,8 @@ pub struct ImplDeclaration {
 /// A tagged union declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumDeclaration {
+    /// Compiler-recognized declaration attributes.
+    pub attributes: Vec<Attribute>,
     /// Whether the type is exported from its module.
     pub is_public: bool,
     /// Type name.
@@ -192,6 +236,30 @@ pub struct EnumDeclaration {
     pub variants: Vec<EnumVariant>,
     /// Additional constraints on generic parameters.
     pub where_predicates: Vec<WherePredicate>,
+    /// Full declaration span.
+    pub span: Span,
+}
+
+/// A named value evaluated by the compiler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantDeclaration {
+    /// Whether the constant is exported from the module.
+    pub is_public: bool,
+    /// Constant name.
+    pub name: Identifier,
+    /// Declared value type.
+    pub ty: TypeName,
+    /// Compile-time initializer.
+    pub value: Expression,
+    /// Full declaration span.
+    pub span: Span,
+}
+
+/// An unnamed block executed during compilation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComptimeBlock {
+    /// Statements evaluated by the compiler.
+    pub body: Block,
     /// Full declaration span.
     pub span: Span,
 }
@@ -908,6 +976,8 @@ pub enum BinaryOperator {
 pub struct CallExpression {
     /// Expression producing the callee.
     pub callee: Expression,
+    /// Explicit type or constant arguments written before the call parentheses.
+    pub generic_arguments: Vec<GenericArgument>,
     /// Arguments in source order.
     pub arguments: Vec<Expression>,
     /// Full expression span.

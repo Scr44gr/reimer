@@ -847,6 +847,7 @@ dependencies = [
  "libloading",
  "reimer-diagnostics",
  "reimer-hir",
+ "reimer-layout",
  "reimer-lexer",
  "reimer-parser",
  "reimer-resolver",
@@ -863,6 +864,15 @@ name = "reimer-hir"
 version = "0.1.0"
 dependencies = [
  "reimer-diagnostics",
+ "reimer-types",
+]
+
+[[package]]
+name = "reimer-layout"
+version = "0.1.0"
+dependencies = [
+ "reimer-diagnostics",
+ "reimer-hir",
  "reimer-types",
 ]
 
@@ -945,6 +955,7 @@ dependencies = [
  "reimer-ast",
  "reimer-diagnostics",
  "reimer-hir",
+ "reimer-layout",
  "reimer-lexer",
  "reimer-parser",
  "reimer-types",

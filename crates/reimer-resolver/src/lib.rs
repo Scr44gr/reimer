@@ -1,6 +1,8 @@
 //! Name resolution and type checking from Reimer AST to typed HIR.
 
-use std::collections::HashMap;
+mod comptime;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use reimer_ast::{
     self as ast, AssignmentOperator as AstAssignmentOperator, BinaryOperator as AstBinaryOperator,
@@ -12,6 +14,7 @@ use reimer_hir::{
     self as hir, AssignmentOperator, BinaryOperator, Expression, ExpressionKind, FunctionId,
     LocalId, Place, PlaceKind, UnaryOperator,
 };
+use reimer_layout::Layouts;
 use reimer_types::{Type, TypeId};
 
 /// Resolves names and checks the types of one parsed compilation unit.
@@ -78,7 +81,7 @@ enum ParallelInputKind {
 }
 
 enum Declaration<'ast> {
-    Reimer {
+    Source {
         function: &'ast ast::Function,
         resolved_name: String,
         signature: Signature,
@@ -96,6 +99,7 @@ struct GenericFunctionTemplate {
     where_predicates: Vec<ast::WherePredicate>,
     resolved_name: String,
     module_identity: Option<String>,
+    explicit_parameter_start: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -239,9 +243,212 @@ struct TypeRegistry {
     generic_instance_data: HashMap<Type, GenericTypeInstance>,
     traits: HashMap<String, TraitDefinition>,
     trait_implementations: Vec<TraitImplementation>,
+    constants: HashMap<String, hir::Expression>,
+    constant_integers: HashMap<String, u64>,
 }
 
 impl TypeRegistry {
+    fn base_environment(&self) -> GenericEnvironment {
+        GenericEnvironment {
+            types: HashMap::new(),
+            constants: self.constant_integers.clone(),
+        }
+    }
+
+    fn remember_preliminary_constants(
+        &mut self,
+        constants: &HashMap<String, comptime::EvaluatedConstant>,
+    ) {
+        self.constant_integers = constants
+            .iter()
+            .filter_map(|(name, constant)| {
+                constant
+                    .value
+                    .as_non_negative_u128()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .map(|value| (name.clone(), value))
+            })
+            .collect();
+    }
+
+    fn lower_compiletime_value(
+        &self,
+        value: &comptime::Value,
+        ty: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Expression> {
+        let kind = match (value, ty) {
+            (comptime::Value::Integer(_), ty) if ty.is_integer() => {
+                return Self::lower_compiletime_integer(value, ty, span, diagnostics);
+            }
+            (comptime::Value::Float(bits), Type::F64) => ExpressionKind::Float64(*bits),
+            (comptime::Value::Float(bits), Type::F32) => {
+                let narrowed = narrow_f64_to_f32(f64::from_bits(*bits));
+                if !narrowed.is_finite() {
+                    report_compiletime_type_mismatch(
+                        ty,
+                        "a floating-point value outside the `f32` range",
+                        span,
+                        diagnostics,
+                    );
+                    return None;
+                }
+                ExpressionKind::Float32(narrowed.to_bits())
+            }
+            (comptime::Value::Boolean(value), Type::Bool) => ExpressionKind::Boolean(*value),
+            (comptime::Value::Character(value), Type::Char) => ExpressionKind::Character(*value),
+            (comptime::Value::String(value), Type::Str) => ExpressionKind::String(value.clone()),
+            (comptime::Value::String(value), Type::CStr) if !value.contains('\0') => {
+                ExpressionKind::CString(value.clone())
+            }
+            (comptime::Value::Unit, Type::Unit) => ExpressionKind::Unit,
+            (comptime::Value::Tuple(values), Type::Tuple(_)) => {
+                self.lower_compiletime_tuple(values, ty, span, diagnostics)?
+            }
+            (comptime::Value::Array(values), Type::Array(_)) => {
+                self.lower_compiletime_array(values, ty, span, diagnostics)?
+            }
+            (comptime::Value::Record(values), Type::Struct(_)) => {
+                self.lower_compiletime_record(values, ty, span, diagnostics)?
+            }
+            _ => {
+                report_compiletime_type_mismatch(
+                    ty,
+                    compiletime_value_kind(value),
+                    span,
+                    diagnostics,
+                );
+                return None;
+            }
+        };
+        Some(Expression { kind, ty, span })
+    }
+
+    fn lower_compiletime_tuple(
+        &self,
+        values: &[comptime::Value],
+        ty: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<ExpressionKind> {
+        let hir::TypeDefinitionKind::Tuple { elements } = self.definition(ty)?.kind.clone() else {
+            return None;
+        };
+        if values.len() != elements.len() {
+            report_compiletime_type_mismatch(
+                ty,
+                "a tuple with a different arity",
+                span,
+                diagnostics,
+            );
+            return None;
+        }
+        values
+            .iter()
+            .zip(elements)
+            .map(|(value, field_type)| {
+                self.lower_compiletime_value(value, field_type, span, diagnostics)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(ExpressionKind::Tuple)
+    }
+
+    fn lower_compiletime_array(
+        &self,
+        values: &[comptime::Value],
+        ty: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<ExpressionKind> {
+        let hir::TypeDefinitionKind::Array { element, length } = self.definition(ty)?.kind else {
+            return None;
+        };
+        if u64::try_from(values.len()).ok() != Some(length) {
+            report_compiletime_type_mismatch(
+                ty,
+                "an array with a different length",
+                span,
+                diagnostics,
+            );
+            return None;
+        }
+        values
+            .iter()
+            .map(|value| self.lower_compiletime_value(value, element, span, diagnostics))
+            .collect::<Option<Vec<_>>>()
+            .map(ExpressionKind::Array)
+    }
+
+    fn lower_compiletime_record(
+        &self,
+        values: &BTreeMap<String, comptime::Value>,
+        ty: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<ExpressionKind> {
+        let hir::TypeDefinitionKind::Struct { fields } = self.definition(ty)?.kind.clone() else {
+            return None;
+        };
+        if values.len() != fields.len()
+            || fields.iter().any(|field| !values.contains_key(&field.name))
+        {
+            report_compiletime_type_mismatch(
+                ty,
+                "a record with different fields",
+                span,
+                diagnostics,
+            );
+            return None;
+        }
+        fields
+            .iter()
+            .map(|field| {
+                self.lower_compiletime_value(values.get(&field.name)?, field.ty, span, diagnostics)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(ExpressionKind::Struct)
+    }
+
+    fn lower_compiletime_integer(
+        value: &comptime::Value,
+        ty: Type,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Expression> {
+        let (negative, magnitude) = value.as_integer()?;
+        let maximum = if negative {
+            if !ty.is_signed_integer() {
+                report_compiletime_type_mismatch(ty, "a negative integer", span, diagnostics);
+                return None;
+            }
+            integer_minimum_magnitude(ty)
+        } else {
+            integer_positive_maximum(ty)
+        };
+        if magnitude > maximum {
+            report_compiletime_type_mismatch(ty, "an out-of-range integer", span, diagnostics);
+            return None;
+        }
+        let literal = Expression {
+            kind: ExpressionKind::Integer(magnitude),
+            ty,
+            span,
+        };
+        if !negative || magnitude == integer_minimum_magnitude(ty) {
+            Some(literal)
+        } else {
+            Some(Expression {
+                kind: ExpressionKind::Unary {
+                    operator: UnaryOperator::Negate,
+                    operand: Box::new(literal),
+                },
+                ty,
+                span,
+            })
+        }
+    }
+
     fn push_definition(
         &mut self,
         name: Option<String>,
@@ -254,6 +461,9 @@ impl TypeRegistry {
             name,
             kind,
             representation: hir::TypeRepresentation::Native,
+            alignment: None,
+            derives: Vec::new(),
+            must_use: false,
             span,
         });
         Some(id)
@@ -489,7 +699,8 @@ impl TypeRegistry {
         type_name: &ast::TypeName,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Option<Type> {
-        self.resolve_type_name_in(type_name, &GenericEnvironment::default(), diagnostics)
+        let environment = self.base_environment();
+        self.resolve_type_name_in(type_name, &environment, diagnostics)
     }
 
     fn resolve_type_name_in(
@@ -683,12 +894,59 @@ impl TypeRegistry {
             return Some(*ty);
         }
 
-        let display_name = self.generic_type_display_name(name, &values);
-        let (placeholder, constructor, representation) = match &template {
+        let (ty, id, representation) =
+            self.reserve_generic_type(name, &template, &values, key, span, diagnostics)?;
+        let attributes = match &template {
+            GenericTypeTemplate::Struct(declaration) => &declaration.attributes,
+            GenericTypeTemplate::Enum(declaration) => &declaration.attributes,
+        };
+        let alignment = requested_alignment(attributes);
+        let derives = derived_traits(attributes);
+        let must_use = has_marker_attribute(attributes, "must_use");
+        let kind = match template {
+            GenericTypeTemplate::Struct(declaration) => hir::TypeDefinitionKind::Struct {
+                fields: self.resolve_fields_in(&declaration.fields, &environment, diagnostics),
+            },
+            GenericTypeTemplate::Enum(declaration) => hir::TypeDefinitionKind::Enum {
+                variants: self.resolve_variants_in(
+                    &declaration.variants,
+                    &environment,
+                    diagnostics,
+                ),
+            },
+        };
+        if let Some(definition) = self
+            .definitions
+            .get_mut(usize::try_from(id.0).unwrap_or(usize::MAX))
+        {
+            definition.representation = representation;
+            definition.alignment = alignment;
+            definition.derives = derives;
+            definition.must_use = must_use;
+            definition.kind = kind;
+        }
+        self.validate_type_derives(ty, diagnostics);
+        if self.reject_hidden_scoped_storage(&values, ty, span, diagnostics) {
+            return None;
+        }
+        Some(ty)
+    }
+
+    fn reserve_generic_type(
+        &mut self,
+        name: &str,
+        template: &GenericTypeTemplate,
+        values: &[GenericValue],
+        key: GenericTypeKey,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<(Type, TypeId, hir::TypeRepresentation)> {
+        let display_name = self.generic_type_display_name(name, values);
+        let (placeholder, constructor, representation) = match template {
             GenericTypeTemplate::Struct(declaration) => (
                 hir::TypeDefinitionKind::Struct { fields: Vec::new() },
                 Type::Struct as fn(TypeId) -> Type,
-                if declaration.repr_c {
+                if has_identifier_attribute(&declaration.attributes, "repr", "C") {
                     hir::TypeRepresentation::C
                 } else {
                     hir::TypeRepresentation::Native
@@ -717,32 +975,10 @@ impl TypeRegistry {
             ty,
             GenericTypeInstance {
                 base_name: name.to_owned(),
-                arguments: values.clone(),
+                arguments: values.to_vec(),
             },
         );
-        let kind = match template {
-            GenericTypeTemplate::Struct(declaration) => hir::TypeDefinitionKind::Struct {
-                fields: self.resolve_fields_in(&declaration.fields, &environment, diagnostics),
-            },
-            GenericTypeTemplate::Enum(declaration) => hir::TypeDefinitionKind::Enum {
-                variants: self.resolve_variants_in(
-                    &declaration.variants,
-                    &environment,
-                    diagnostics,
-                ),
-            },
-        };
-        if let Some(definition) = self
-            .definitions
-            .get_mut(usize::try_from(id.0).unwrap_or(usize::MAX))
-        {
-            definition.representation = representation;
-            definition.kind = kind;
-        }
-        if self.reject_hidden_scoped_storage(&values, ty, span, diagnostics) {
-            return None;
-        }
-        Some(ty)
+        Some((ty, id, representation))
     }
 
     fn reject_hidden_scoped_storage(
@@ -1277,7 +1513,9 @@ impl TypeRegistry {
     }
 
     fn is_copy(&self, ty: Type) -> bool {
-        self.is_intrinsically_copy(ty) || self.has_trait_implementation(ty, "Copy", 0)
+        self.is_intrinsically_copy(ty)
+            || self.has_derived_trait(ty, hir::DerivedTrait::Copy)
+            || self.has_trait_implementation(ty, "Copy", 0)
     }
 
     fn is_intrinsically_copy(&self, ty: Type) -> bool {
@@ -1342,10 +1580,19 @@ impl TypeRegistry {
             return false;
         }
         let builtin_satisfied = match trait_name {
-            "Copy" | "Clone" => Some(self.is_intrinsically_copy(ty)),
+            "Copy" => Some(
+                self.is_intrinsically_copy(ty)
+                    || self.has_derived_trait(ty, hir::DerivedTrait::Copy),
+            ),
+            "Clone" => Some(
+                self.is_intrinsically_copy(ty)
+                    || self.has_derived_trait(ty, hir::DerivedTrait::Clone),
+            ),
+            "Debug" => Some(self.is_debug_capable(ty)),
             "Eq" => Some(self.is_equality_capable(ty)),
             "Ord" | "Ordered" => Some(is_ordered_type(ty)),
             "Hash" => Some(self.is_hash_capable(ty)),
+            "Default" => Some(self.is_default_capable(ty)),
             "Send" => {
                 return self.satisfies_thread_safety_at_depth(ty, ThreadSafety::Send, depth);
             }
@@ -1458,7 +1705,7 @@ impl TypeRegistry {
             if implementation.trait_name != trait_name {
                 return false;
             }
-            let mut environment = GenericEnvironment::default();
+            let mut environment = self.base_environment();
             if !self.infer_type_pattern(
                 &implementation.target,
                 ty,
@@ -1580,6 +1827,9 @@ impl TypeRegistry {
         if is_equality_type(ty) {
             return true;
         }
+        if self.has_derived_trait(ty, hir::DerivedTrait::Eq) {
+            return true;
+        }
         let Some(definition) = self.definition(ty) else {
             return false;
         };
@@ -1598,7 +1848,283 @@ impl TypeRegistry {
     }
 
     fn is_hash_capable(&self, ty: Type) -> bool {
-        self.is_equality_capable(ty)
+        self.has_derived_trait(ty, hir::DerivedTrait::Hash)
+            || (is_equality_type(ty) && !ty.is_float())
+    }
+
+    fn is_debug_capable(&self, ty: Type) -> bool {
+        matches!(
+            ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::I64
+                | Type::I128
+                | Type::Isize
+                | Type::U8
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::U128
+                | Type::Usize
+                | Type::F32
+                | Type::F64
+                | Type::Bool
+                | Type::Char
+                | Type::Str
+                | Type::CStr
+                | Type::Unit
+                | Type::RawPointer(_)
+                | Type::Reference(_)
+                | Type::Function(_)
+        ) || self.has_derived_trait(ty, hir::DerivedTrait::Debug)
+            || self
+                .definition(ty)
+                .is_some_and(|definition| match &definition.kind {
+                    hir::TypeDefinitionKind::Tuple { elements } => elements
+                        .iter()
+                        .all(|element| self.is_debug_capable(*element)),
+                    hir::TypeDefinitionKind::Array { element, .. }
+                    | hir::TypeDefinitionKind::Slice { element, .. } => {
+                        self.is_debug_capable(*element)
+                    }
+                    hir::TypeDefinitionKind::Struct { .. }
+                    | hir::TypeDefinitionKind::Enum { .. }
+                    | hir::TypeDefinitionKind::Reference { .. }
+                    | hir::TypeDefinitionKind::RawPointer { .. }
+                    | hir::TypeDefinitionKind::Function { .. } => false,
+                })
+    }
+
+    fn is_default_capable(&self, ty: Type) -> bool {
+        matches!(
+            ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::I64
+                | Type::I128
+                | Type::Isize
+                | Type::U8
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::U128
+                | Type::Usize
+                | Type::F32
+                | Type::F64
+                | Type::Bool
+                | Type::Char
+                | Type::Str
+                | Type::CStr
+                | Type::Unit
+        ) || self.has_derived_trait(ty, hir::DerivedTrait::Default)
+            || self
+                .definition(ty)
+                .is_some_and(|definition| match &definition.kind {
+                    hir::TypeDefinitionKind::Tuple { elements } => elements
+                        .iter()
+                        .all(|element| self.is_default_capable(*element)),
+                    hir::TypeDefinitionKind::Array { element, .. } => {
+                        self.is_default_capable(*element)
+                    }
+                    hir::TypeDefinitionKind::Struct { .. }
+                    | hir::TypeDefinitionKind::Enum { .. }
+                    | hir::TypeDefinitionKind::Reference { .. }
+                    | hir::TypeDefinitionKind::RawPointer { .. }
+                    | hir::TypeDefinitionKind::Slice { .. }
+                    | hir::TypeDefinitionKind::Function { .. } => false,
+                })
+    }
+
+    fn has_derived_trait(&self, ty: Type, derived: hir::DerivedTrait) -> bool {
+        self.definition(ty)
+            .is_some_and(|definition| definition.derives.contains(&derived))
+    }
+
+    fn default_expression(&self, ty: Type, span: Span) -> Option<Expression> {
+        self.default_expression_at_depth(ty, span, 0)
+    }
+
+    fn default_expression_at_depth(
+        &self,
+        ty: Type,
+        span: Span,
+        depth: usize,
+    ) -> Option<Expression> {
+        if depth > 64 {
+            return None;
+        }
+        let kind = match ty {
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::I128
+            | Type::Isize
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::U128
+            | Type::Usize => ExpressionKind::Integer(0),
+            Type::F32 => ExpressionKind::Float32(0_f32.to_bits()),
+            Type::F64 => ExpressionKind::Float64(0_f64.to_bits()),
+            Type::Bool => ExpressionKind::Boolean(false),
+            Type::Char => ExpressionKind::Character('\0'),
+            Type::Str => ExpressionKind::String(String::new()),
+            Type::CStr => ExpressionKind::CString(String::new()),
+            Type::Unit => ExpressionKind::Unit,
+            Type::Never
+            | Type::Reference(_)
+            | Type::RawPointer(_)
+            | Type::Slice(_)
+            | Type::Function(_) => return None,
+            Type::Struct(_) => {
+                let definition = self.definition(ty)?;
+                let hir::TypeDefinitionKind::Struct { fields } = &definition.kind else {
+                    return None;
+                };
+                ExpressionKind::Struct(
+                    fields
+                        .iter()
+                        .map(|field| self.default_expression_at_depth(field.ty, span, depth + 1))
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            }
+            Type::Tuple(_) => {
+                let definition = self.definition(ty)?;
+                let hir::TypeDefinitionKind::Tuple { elements } = &definition.kind else {
+                    return None;
+                };
+                ExpressionKind::Tuple(
+                    elements
+                        .iter()
+                        .map(|element| self.default_expression_at_depth(*element, span, depth + 1))
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            }
+            Type::Array(_) => {
+                let definition = self.definition(ty)?;
+                let hir::TypeDefinitionKind::Array { element, length } = definition.kind else {
+                    return None;
+                };
+                let length = usize::try_from(length).ok()?;
+                let value = self.default_expression_at_depth(element, span, depth + 1)?;
+                ExpressionKind::Array(vec![value; length])
+            }
+            Type::Enum(_) => {
+                let definition = self.definition(ty)?;
+                let hir::TypeDefinitionKind::Enum { variants } = &definition.kind else {
+                    return None;
+                };
+                let variant = variants.first()?;
+                let field_types = match &variant.fields {
+                    hir::EnumVariantFields::Unit => Vec::new(),
+                    hir::EnumVariantFields::Tuple(fields) => fields.clone(),
+                    hir::EnumVariantFields::Struct(fields) => {
+                        fields.iter().map(|field| field.ty).collect()
+                    }
+                };
+                let fields = field_types
+                    .into_iter()
+                    .map(|field| self.default_expression_at_depth(field, span, depth + 1))
+                    .collect::<Option<Vec<_>>>()?;
+                ExpressionKind::Enum { variant: 0, fields }
+            }
+        };
+        Some(Expression { kind, ty, span })
+    }
+
+    fn validate_type_derives(&self, ty: Type, diagnostics: &mut Vec<Diagnostic>) {
+        let Some(definition) = self.definition(ty) else {
+            return;
+        };
+        for derived in &definition.derives {
+            if self.derived_requirements_hold(ty, *derived) {
+                continue;
+            }
+            let requirement = match derived {
+                hir::DerivedTrait::Copy => "every stored field must satisfy `Copy`",
+                hir::DerivedTrait::Clone => {
+                    "every stored field must be allocation-free and satisfy `Copy`"
+                }
+                hir::DerivedTrait::Debug => "every stored field must satisfy `Debug`",
+                hir::DerivedTrait::Eq => "every stored field must satisfy `Eq`",
+                hir::DerivedTrait::Hash => "every stored field must satisfy `Hash`",
+                hir::DerivedTrait::Default => {
+                    "every struct field, or every field of the first enum variant, must satisfy `Default`"
+                }
+            };
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7006",
+                    format!(
+                        "cannot derive `{}` for `{}`",
+                        derived.name(),
+                        definition.name.as_deref().unwrap_or("this type")
+                    ),
+                    definition.span,
+                )
+                .with_help(requirement),
+            );
+        }
+    }
+
+    fn derived_requirements_hold(&self, ty: Type, derived: hir::DerivedTrait) -> bool {
+        let Some(definition) = self.definition(ty) else {
+            return false;
+        };
+        if derived == hir::DerivedTrait::Default {
+            return match &definition.kind {
+                hir::TypeDefinitionKind::Struct { fields } => {
+                    fields.iter().all(|field| self.is_default_capable(field.ty))
+                }
+                hir::TypeDefinitionKind::Enum { variants } => {
+                    variants.first().is_some_and(|variant| {
+                        Self::variant_fields_satisfy(variant, |field| {
+                            self.is_default_capable(field)
+                        })
+                    })
+                }
+                _ => false,
+            };
+        }
+        Self::stored_fields_satisfy(definition, |field| match derived {
+            hir::DerivedTrait::Copy | hir::DerivedTrait::Clone => self.is_copy(field),
+            hir::DerivedTrait::Debug => self.is_debug_capable(field),
+            hir::DerivedTrait::Eq => self.is_equality_capable(field),
+            hir::DerivedTrait::Hash => self.is_hash_capable(field),
+            hir::DerivedTrait::Default => false,
+        })
+    }
+
+    fn stored_fields_satisfy(
+        definition: &hir::TypeDefinition,
+        mut predicate: impl FnMut(Type) -> bool,
+    ) -> bool {
+        match &definition.kind {
+            hir::TypeDefinitionKind::Struct { fields } => {
+                fields.iter().all(|field| predicate(field.ty))
+            }
+            hir::TypeDefinitionKind::Enum { variants } => variants
+                .iter()
+                .all(|variant| Self::variant_fields_satisfy(variant, &mut predicate)),
+            _ => false,
+        }
+    }
+
+    fn variant_fields_satisfy(
+        variant: &hir::EnumVariant,
+        mut predicate: impl FnMut(Type) -> bool,
+    ) -> bool {
+        match &variant.fields {
+            hir::EnumVariantFields::Unit => true,
+            hir::EnumVariantFields::Tuple(fields) => fields.iter().all(|field| predicate(*field)),
+            hir::EnumVariantFields::Struct(fields) => {
+                fields.iter().all(|field| predicate(field.ty))
+            }
+        }
     }
 
     fn intrinsic_fields_are_copy(&self, ty: Type) -> bool {
@@ -1801,6 +2327,210 @@ impl TypeRegistry {
         }
         self.definition(ty)?.name.as_deref()
     }
+
+    fn reflection_type_name(&self, ty: Type) -> String {
+        let Some(definition) = self.definition(ty) else {
+            return ty.to_string();
+        };
+        if let Some(name) = &definition.name {
+            return name.clone();
+        }
+        match &definition.kind {
+            hir::TypeDefinitionKind::Tuple { elements } => format!(
+                "({})",
+                elements
+                    .iter()
+                    .map(|element| self.reflection_type_name(*element))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            hir::TypeDefinitionKind::Array { element, length } => {
+                format!("[{}; {length}]", self.reflection_type_name(*element))
+            }
+            hir::TypeDefinitionKind::Reference { target, mutable } => {
+                let modifier = if *mutable { "mut " } else { "" };
+                format!("&{modifier}{}", self.reflection_type_name(*target))
+            }
+            hir::TypeDefinitionKind::RawPointer { target, mutable } => {
+                let modifier = if *mutable { "mut" } else { "const" };
+                format!("*{modifier} {}", self.reflection_type_name(*target))
+            }
+            hir::TypeDefinitionKind::Slice { element, mutable } => {
+                let modifier = if *mutable { "mut " } else { "" };
+                format!("&{modifier}[{}]", self.reflection_type_name(*element))
+            }
+            hir::TypeDefinitionKind::Function {
+                parameters,
+                return_type,
+            } => format!(
+                "fn({}) -> {}",
+                parameters
+                    .iter()
+                    .map(|parameter| self.reflection_type_name(*parameter))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.reflection_type_name(*return_type)
+            ),
+            hir::TypeDefinitionKind::Struct { .. } => "struct".to_owned(),
+            hir::TypeDefinitionKind::Enum { .. } => "enum".to_owned(),
+        }
+    }
+}
+
+struct ReflectionMetadata<'types> {
+    types: &'types mut TypeRegistry,
+}
+
+impl comptime::Metadata for ReflectionMetadata<'_> {
+    fn evaluate(
+        &mut self,
+        path: &ast::Path,
+        arguments: &[ast::GenericArgument],
+        type_bindings: &HashMap<String, ast::TypeName>,
+    ) -> comptime::IntrinsicResult {
+        let name = path.display();
+        let intrinsic = match name.as_str() {
+            "size_of" | "align_of" | "fields" | "variants" => name.as_str(),
+            "meta::name" => "name",
+            "meta::fields" => "fields",
+            "meta::variants" => "variants",
+            "meta::traits" => "traits",
+            _ => return comptime::IntrinsicResult::NotFound,
+        };
+        let [ast::GenericArgument::Type(requested)] = arguments else {
+            return comptime::IntrinsicResult::Error {
+                message: format!("`{name}` expects exactly one type argument"),
+                help: "write the reflection call as `name<Type>()`",
+            };
+        };
+        let mut environment = self.types.base_environment();
+        let mut diagnostics = Vec::new();
+        for (binding, type_name) in type_bindings {
+            if let Some(ty) =
+                self.types
+                    .resolve_type_name_in(type_name, &environment, &mut diagnostics)
+            {
+                environment.types.insert(binding.clone(), ty);
+            }
+        }
+        let Some(ty) = self
+            .types
+            .resolve_type_name_in(requested, &environment, &mut diagnostics)
+        else {
+            let message = diagnostics.into_iter().next().map_or_else(
+                || "reflection type could not be resolved".to_owned(),
+                |error| error.message,
+            );
+            return comptime::IntrinsicResult::Error {
+                message,
+                help: "use a concrete type known at this compile-time call site",
+            };
+        };
+        match intrinsic {
+            "size_of" | "align_of" => {
+                let layout = match Layouts::build(&self.types.definitions)
+                    .and_then(|layouts| layouts.value_layout(ty))
+                {
+                    Ok(layout) => layout,
+                    Err(message) => {
+                        return comptime::IntrinsicResult::Error {
+                            message,
+                            help: "use a finite type with a valid native layout",
+                        };
+                    }
+                };
+                let value = if intrinsic == "size_of" {
+                    layout.size
+                } else {
+                    layout.align
+                };
+                comptime::IntrinsicResult::Value(comptime::Value::Integer(comptime::Integer::from(
+                    u128::from(value),
+                )))
+            }
+            "name" => comptime::IntrinsicResult::Value(comptime::Value::String(
+                self.types.reflection_type_name(ty),
+            )),
+            "fields" => self.reflect_fields(ty),
+            "variants" => self.reflect_variants(ty),
+            "traits" => {
+                let mut candidates = [
+                    "Copy", "Clone", "Debug", "Eq", "Ordered", "Hash", "Default", "Send", "Sync",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+                candidates.extend(self.types.traits.keys().cloned());
+                let traits = candidates
+                    .into_iter()
+                    .filter(|name| self.types.satisfies_trait(ty, name))
+                    .map(comptime::Value::String)
+                    .collect();
+                comptime::IntrinsicResult::Value(comptime::Value::Array(traits))
+            }
+            _ => comptime::IntrinsicResult::NotFound,
+        }
+    }
+}
+
+impl ReflectionMetadata<'_> {
+    fn reflect_fields(&self, ty: Type) -> comptime::IntrinsicResult {
+        let fields = match self.types.definition(ty).map(|definition| &definition.kind) {
+            Some(hir::TypeDefinitionKind::Struct { fields }) => fields
+                .iter()
+                .map(|field| {
+                    reflection_entry(&field.name, &self.types.reflection_type_name(field.ty))
+                })
+                .collect(),
+            Some(hir::TypeDefinitionKind::Tuple { elements }) => elements
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| {
+                    reflection_entry(&index.to_string(), &self.types.reflection_type_name(*ty))
+                })
+                .collect(),
+            _ => {
+                return comptime::IntrinsicResult::Error {
+                    message: format!(
+                        "type `{}` does not have fields",
+                        self.types.reflection_type_name(ty)
+                    ),
+                    help: "use `meta::fields` with a struct or tuple type",
+                };
+            }
+        };
+        comptime::IntrinsicResult::Value(comptime::Value::Array(fields))
+    }
+
+    fn reflect_variants(&self, ty: Type) -> comptime::IntrinsicResult {
+        let Some(hir::TypeDefinitionKind::Enum { variants }) =
+            self.types.definition(ty).map(|definition| &definition.kind)
+        else {
+            return comptime::IntrinsicResult::Error {
+                message: format!(
+                    "type `{}` does not have enum variants",
+                    self.types.reflection_type_name(ty)
+                ),
+                help: "use `meta::variants` with an enum type",
+            };
+        };
+        let variants = variants
+            .iter()
+            .map(|variant| comptime::Value::String(variant.name.clone()))
+            .collect();
+        comptime::IntrinsicResult::Value(comptime::Value::Array(variants))
+    }
+}
+
+fn reflection_entry(name: &str, ty: &str) -> comptime::Value {
+    comptime::Value::Record(
+        [
+            ("name".to_owned(), comptime::Value::String(name.to_owned())),
+            ("type".to_owned(), comptime::Value::String(ty.to_owned())),
+        ]
+        .into_iter()
+        .collect(),
+    )
 }
 
 struct Resolver {
@@ -1808,6 +2538,7 @@ struct Resolver {
     generic_functions: GenericFunctionRegistry,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
+    preliminary_constants: HashMap<String, comptime::EvaluatedConstant>,
 }
 
 impl Resolver {
@@ -1817,6 +2548,7 @@ impl Resolver {
             generic_functions: GenericFunctionRegistry::default(),
             types: TypeRegistry::default(),
             diagnostics: Vec::new(),
+            preliminary_constants: HashMap::new(),
         }
     }
 
@@ -1825,30 +2557,82 @@ impl Resolver {
         program: &ast::Program,
         require_entry: bool,
     ) -> Result<hir::Program, Vec<Diagnostic>> {
+        self.validate_attributes(program);
+        let mut unavailable_metadata = comptime::UnavailableMetadata;
+        let preliminary = comptime::evaluate(
+            program,
+            &mut unavailable_metadata,
+            HashMap::new(),
+            false,
+            false,
+        );
+        self.types
+            .remember_preliminary_constants(&preliminary.constants);
+        self.preliminary_constants = preliminary.constants;
         self.collect_type_headers(program);
         self.collect_trait_headers(program);
         self.resolve_type_definitions(program);
+        self.validate_type_cycles();
+        self.validate_derived_traits();
         self.collect_trait_implementations(program);
+        self.evaluate_compiletime(program);
         let declarations = self.collect_declarations(program);
         self.generic_functions.next_id = u32::try_from(declarations.len()).unwrap_or(u32::MAX);
         let entry = require_entry.then(|| self.validate_entry()).flatten();
+        let (mut functions, mut extern_functions) = self.analyze_declarations(declarations);
+        functions.sort_by_key(|function| function.id.0);
+        extern_functions.sort_by_key(|function| function.id.0);
+        let tests = functions
+            .iter()
+            .filter(|function| function.attributes.test)
+            .map(|function| function.id)
+            .collect();
+        self.diagnostics.sort_by(|left, right| {
+            left.span
+                .start
+                .cmp(&right.span.start)
+                .then_with(|| left.span.end.cmp(&right.span.end))
+                .then_with(|| left.code.cmp(right.code))
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        self.diagnostics.dedup_by(|left, right| {
+            left.span == right.span && left.code == right.code && left.message == right.message
+        });
+
+        if self.diagnostics.is_empty() {
+            Ok(hir::Program {
+                types: self.types.definitions,
+                functions,
+                extern_functions,
+                entry,
+                tests,
+            })
+        } else {
+            Err(self.diagnostics)
+        }
+    }
+
+    fn analyze_declarations(
+        &mut self,
+        declarations: Vec<Declaration<'_>>,
+    ) -> (Vec<hir::Function>, Vec<hir::ExternFunction>) {
         let mut functions = Vec::with_capacity(declarations.len());
         let mut extern_functions = Vec::new();
-
         for declaration in declarations {
             match declaration {
-                Declaration::Reimer {
+                Declaration::Source {
                     function,
                     resolved_name,
                     signature,
                 } => {
+                    let environment = self.types.base_environment();
                     let mut analyzer = FunctionAnalyzer::new(
                         &mut self.signatures,
                         &mut self.generic_functions,
                         &mut self.types,
                         &mut self.diagnostics,
                         signature,
-                        GenericEnvironment::default(),
+                        environment,
                         symbol_module_identity(&resolved_name).map(str::to_owned),
                     );
                     functions.push(analyzer.analyze(function, resolved_name));
@@ -1885,7 +2669,6 @@ impl Resolver {
                 }
             }
         }
-
         let mut pending_index = 0;
         while let Some(pending) = self.generic_functions.pending.get(pending_index).cloned() {
             pending_index += 1;
@@ -1900,19 +2683,103 @@ impl Resolver {
             );
             functions.push(analyzer.analyze(&pending.function, pending.resolved_name));
         }
-        self.validate_type_cycles();
-        functions.sort_by_key(|function| function.id.0);
-        extern_functions.sort_by_key(|function| function.id.0);
+        (functions, extern_functions)
+    }
 
-        if self.diagnostics.is_empty() {
-            Ok(hir::Program {
-                types: self.types.definitions,
-                functions,
-                extern_functions,
-                entry,
+    fn validate_attributes(&mut self, program: &ast::Program) {
+        let comptime_functions = program
+            .items
+            .iter()
+            .filter_map(|item| {
+                let Item::Function(function) = item else {
+                    return None;
+                };
+                function.is_comptime.then_some(function.name.name.as_str())
             })
-        } else {
-            Err(self.diagnostics)
+            .collect::<BTreeSet<_>>();
+        for item in &program.items {
+            match item {
+                Item::Function(function) => {
+                    validate_function_attributes(function, &mut self.diagnostics);
+                    if function.is_comptime {
+                        validate_comptime_function(
+                            function,
+                            &comptime_functions,
+                            &mut self.diagnostics,
+                        );
+                    }
+                }
+                Item::Struct(declaration) => {
+                    validate_type_attributes(&declaration.attributes, false, &mut self.diagnostics);
+                }
+                Item::Enum(declaration) => {
+                    validate_type_attributes(&declaration.attributes, true, &mut self.diagnostics);
+                }
+                Item::Impl(implementation) => {
+                    for method in &implementation.methods {
+                        validate_function_attributes(method, &mut self.diagnostics);
+                    }
+                }
+                Item::Import(_)
+                | Item::ExternFunction(_)
+                | Item::Trait(_)
+                | Item::Constant(_)
+                | Item::Comptime(_) => {}
+            }
+        }
+    }
+
+    fn evaluate_compiletime(&mut self, program: &ast::Program) {
+        let seed = std::mem::take(&mut self.preliminary_constants);
+        let evaluation = {
+            let mut metadata = ReflectionMetadata {
+                types: &mut self.types,
+            };
+            comptime::evaluate(program, &mut metadata, seed, true, true)
+        };
+        self.diagnostics.extend(evaluation.diagnostics);
+
+        let mut names = HashMap::new();
+        for item in &program.items {
+            let Item::Constant(declaration) = item else {
+                continue;
+            };
+            if names
+                .insert(declaration.name.name.as_str(), declaration.name.span)
+                .is_some()
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E7007",
+                        format!(
+                            "constant `{}` is declared more than once",
+                            declaration.name.name
+                        ),
+                        declaration.name.span,
+                    )
+                    .with_help("give each compile-time constant a unique name"),
+                );
+                continue;
+            }
+            let Some(evaluated) = evaluation.constants.get(&declaration.name.name) else {
+                continue;
+            };
+            let Some(ty) = self
+                .types
+                .resolve_type_name(&declaration.ty, &mut self.diagnostics)
+            else {
+                continue;
+            };
+            if let Some(value) = self.types.lower_compiletime_value(
+                &evaluated.value,
+                ty,
+                evaluated.span,
+                &mut self.diagnostics,
+            ) {
+                self.types
+                    .constants
+                    .insert(declaration.name.name.clone(), value);
+            }
         }
     }
 
@@ -1920,15 +2787,15 @@ impl Resolver {
         for item in &program.items {
             let (name, span, is_struct, repr_c, generic_template) = match item {
                 Item::Struct(declaration) => (
-                    &declaration.name.name,
+                    declaration.name.name.as_str(),
                     declaration.span,
                     true,
-                    declaration.repr_c,
+                    has_identifier_attribute(&declaration.attributes, "repr", "C"),
                     (!declaration.generic_parameters.is_empty())
                         .then(|| GenericTypeTemplate::Struct(declaration.clone())),
                 ),
                 Item::Enum(declaration) => (
-                    &declaration.name.name,
+                    declaration.name.name.as_str(),
                     declaration.span,
                     false,
                     false,
@@ -1953,7 +2820,9 @@ impl Resolver {
             }
             if let Some(template) = generic_template {
                 validate_generic_parameter_names(template.parameters(), &mut self.diagnostics);
-                self.types.generic_templates.insert(name.clone(), template);
+                self.types
+                    .generic_templates
+                    .insert(name.to_owned(), template);
                 continue;
             }
             let kind = if is_struct {
@@ -1963,7 +2832,10 @@ impl Resolver {
                     variants: Vec::new(),
                 }
             };
-            let Some(id) = self.types.push_definition(Some(name.clone()), kind, span) else {
+            let Some(id) = self
+                .types
+                .push_definition(Some(name.to_owned()), kind, span)
+            else {
                 self.diagnostics.push(Diagnostic::error(
                     "E3999",
                     "this compilation unit contains too many types",
@@ -1979,12 +2851,27 @@ impl Resolver {
             {
                 definition.representation = hir::TypeRepresentation::C;
             }
+            if let Some(definition) = self
+                .types
+                .definitions
+                .get_mut(usize::try_from(id.0).unwrap_or(usize::MAX))
+            {
+                if let Item::Struct(declaration) = item {
+                    definition.alignment = requested_alignment(&declaration.attributes);
+                    definition.derives = derived_traits(&declaration.attributes);
+                    definition.must_use = has_marker_attribute(&declaration.attributes, "must_use");
+                } else if let Item::Enum(declaration) = item {
+                    definition.alignment = requested_alignment(&declaration.attributes);
+                    definition.derives = derived_traits(&declaration.attributes);
+                    definition.must_use = has_marker_attribute(&declaration.attributes, "must_use");
+                }
+            }
             let ty = if is_struct {
                 Type::Struct(id)
             } else {
                 Type::Enum(id)
             };
-            self.types.names.insert(name.clone(), ty);
+            self.types.names.insert(name.to_owned(), ty);
         }
     }
 
@@ -2231,7 +3118,7 @@ impl Resolver {
         let target = self
             .types
             .resolve_type_name(&implementation.target, &mut self.diagnostics)?;
-        let mut environment = GenericEnvironment::default();
+        let mut environment = self.types.base_environment();
         environment.types.insert("Self".to_owned(), target);
         let trait_type = implementation.trait_type.as_ref()?;
         let arguments = match &trait_type.kind {
@@ -2400,6 +3287,22 @@ impl Resolver {
         }
     }
 
+    fn validate_derived_traits(&mut self) {
+        let types = self
+            .types
+            .definitions
+            .iter()
+            .filter_map(|definition| match definition.kind {
+                hir::TypeDefinitionKind::Struct { .. } => Some(Type::Struct(definition.id)),
+                hir::TypeDefinitionKind::Enum { .. } => Some(Type::Enum(definition.id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for ty in types {
+            self.types.validate_type_derives(ty, &mut self.diagnostics);
+        }
+    }
+
     fn resolve_fields(&mut self, fields: &[ast::StructField]) -> Vec<hir::TypeField> {
         let mut names = HashMap::new();
         let mut resolved = Vec::with_capacity(fields.len());
@@ -2468,7 +3371,10 @@ impl Resolver {
         for item in &program.items {
             match item {
                 Item::Function(function) => {
-                    self.collect_reimer_declaration(
+                    if function.is_comptime {
+                        continue;
+                    }
+                    self.collect_source_declaration(
                         &mut declarations,
                         function,
                         function.name.name.clone(),
@@ -2480,14 +3386,19 @@ impl Resolver {
                 Item::Impl(implementation) => {
                     self.collect_impl_declarations(&mut declarations, implementation);
                 }
-                Item::Import(_) | Item::Struct(_) | Item::Enum(_) | Item::Trait(_) => {}
+                Item::Import(_)
+                | Item::Struct(_)
+                | Item::Enum(_)
+                | Item::Trait(_)
+                | Item::Constant(_)
+                | Item::Comptime(_) => {}
             }
         }
 
         declarations
     }
 
-    fn collect_reimer_declaration<'ast>(
+    fn collect_source_declaration<'ast>(
         &mut self,
         declarations: &mut Vec<Declaration<'ast>>,
         function: &'ast ast::Function,
@@ -2499,6 +3410,7 @@ impl Resolver {
                 function.generic_parameters.clone(),
                 function.where_predicates.clone(),
                 resolved_name,
+                0,
             );
             return;
         }
@@ -2516,7 +3428,7 @@ impl Resolver {
         };
         self.signatures
             .insert(resolved_name.clone(), signature.clone());
-        declarations.push(Declaration::Reimer {
+        declarations.push(Declaration::Source {
             function,
             resolved_name,
             signature,
@@ -2529,6 +3441,7 @@ impl Resolver {
         parameters: Vec<ast::GenericParameter>,
         where_predicates: Vec<ast::WherePredicate>,
         resolved_name: String,
+        explicit_parameter_start: usize,
     ) {
         validate_generic_parameter_names(&parameters, &mut self.diagnostics);
         if self.signatures.contains_key(&resolved_name)
@@ -2555,6 +3468,7 @@ impl Resolver {
                 where_predicates,
                 module_identity: symbol_module_identity(&resolved_name).map(str::to_owned),
                 resolved_name,
+                explicit_parameter_start,
             },
         );
     }
@@ -2619,6 +3533,9 @@ impl Resolver {
                 &mut self.diagnostics,
             );
             for method in &implementation.methods {
+                if method.is_comptime {
+                    continue;
+                }
                 let mut parameters = implementation.generic_parameters.clone();
                 parameters.extend(method.generic_parameters.iter().cloned());
                 let mut where_predicates = implementation.where_predicates.clone();
@@ -2629,6 +3546,7 @@ impl Resolver {
                     parameters,
                     where_predicates,
                     resolved_name,
+                    implementation.generic_parameters.len(),
                 );
             }
             return;
@@ -2655,8 +3573,11 @@ impl Resolver {
             return;
         };
         for method in &implementation.methods {
+            if method.is_comptime {
+                continue;
+            }
             let resolved_name = format!("{owner}::{}", method.name.name);
-            self.collect_reimer_declaration(declarations, method, resolved_name);
+            self.collect_source_declaration(declarations, method, resolved_name);
         }
     }
 
@@ -3026,6 +3947,7 @@ impl<'context> FunctionAnalyzer<'context> {
             id: self.signature.id,
             name: resolved_name,
             is_public: function.is_public,
+            attributes: function_attributes(function),
             parameters,
             return_type: self.signature.return_type,
             body: analyzed,
@@ -3981,6 +4903,7 @@ impl<'context> FunctionAnalyzer<'context> {
         }
         let call = ast::CallExpression {
             callee: AstExpression::Field(Box::new(field.clone())),
+            generic_arguments: Vec::new(),
             arguments,
             span: index.span,
         };
@@ -4124,16 +5047,22 @@ impl<'context> FunctionAnalyzer<'context> {
         path: &ast::Path,
         expected: Option<Type>,
     ) -> Option<Expression> {
-        let value = single_path_name(path)
-            .and_then(|name| self.generic_environment.constants.get(name))
-            .copied()?;
-        Some(self.analyze_integer_literal(
-            &ast::IntegerLiteral {
-                value: u128::from(value),
-                span: path.span,
-            },
-            expected.or(Some(Type::Usize)),
-        ))
+        let name = single_path_name(path)?;
+        if let Some(value) = self.generic_environment.constants.get(name).copied() {
+            return Some(self.analyze_integer_literal(
+                &ast::IntegerLiteral {
+                    value: u128::from(value),
+                    span: path.span,
+                },
+                expected.or(Some(Type::Usize)),
+            ));
+        }
+        let mut constant = self.types.constants.get(name)?.clone();
+        constant.span = path.span;
+        if let Some(expected) = expected {
+            self.require_type(expected, constant.ty, path.span, "constant value");
+        }
+        Some(constant)
     }
 
     fn require_local_available(&mut self, binding: Binding, span: Span) {
@@ -4466,12 +5395,14 @@ impl<'context> FunctionAnalyzer<'context> {
             AstBinaryOperator::ShiftRight => {
                 (BinaryOperator::ShiftRight, left.ty.is_integer(), left.ty)
             }
-            AstBinaryOperator::Equal => {
-                (BinaryOperator::Equal, is_equality_type(left.ty), Type::Bool)
-            }
+            AstBinaryOperator::Equal => (
+                BinaryOperator::Equal,
+                self.types.satisfies_trait(left.ty, "Eq"),
+                Type::Bool,
+            ),
             AstBinaryOperator::NotEqual => (
                 BinaryOperator::NotEqual,
-                is_equality_type(left.ty),
+                self.types.satisfies_trait(left.ty, "Eq"),
                 Type::Bool,
             ),
             AstBinaryOperator::Less => (BinaryOperator::Less, is_ordered_type(left.ty), Type::Bool),
@@ -4519,6 +5450,9 @@ impl<'context> FunctionAnalyzer<'context> {
         if single_path_name(path).is_some_and(|name| self.lookup(name).is_some()) {
             return self.analyze_indirect_call(call, expected);
         }
+        if let Some(expression) = self.analyze_default_call(call, path) {
+            return expression;
+        }
         if single_path_name(path) == Some("panic") {
             return self.analyze_panic_call(call, path);
         }
@@ -4542,6 +5476,16 @@ impl<'context> FunctionAnalyzer<'context> {
         call: &ast::CallExpression,
         _expected_return: Option<Type>,
     ) -> Expression {
+        if !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    "function values do not accept explicit generic arguments",
+                    call.span,
+                )
+                .with_help("remove the arguments between `<` and `>`"),
+            );
+        }
         let callee = self.analyze_expression(&call.callee);
         let Some((parameter_types, return_type)) = self
             .types
@@ -4631,6 +5575,27 @@ impl<'context> FunctionAnalyzer<'context> {
         {
             return expression;
         }
+        if signature.is_none()
+            && method.name == "clone"
+            && self.types.satisfies_trait(receiver_type, "Clone")
+        {
+            if !call.arguments.is_empty() || !call.generic_arguments.is_empty() {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E7007",
+                        "derived `clone` does not accept arguments",
+                        call.span,
+                    )
+                    .with_help("write `value.clone()`"),
+                );
+            }
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            let mut cloned = self.analyze_expression_non_consuming(&field.base);
+            cloned.span = call.span;
+            return cloned;
+        }
         let Some(signature) = signature else {
             self.diagnostics.push(Diagnostic::error(
                 "E6002",
@@ -4642,6 +5607,30 @@ impl<'context> FunctionAnalyzer<'context> {
             }
             return invalid_composite_expression(call.span);
         };
+        self.analyze_resolved_method_call(call, field, receiver_type, &resolved_name, &signature)
+    }
+
+    fn analyze_resolved_method_call(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        receiver_type: Type,
+        resolved_name: &str,
+        signature: &Signature,
+    ) -> Expression {
+        let ast::FieldName::Named(method) = &field.field else {
+            return invalid_composite_expression(call.span);
+        };
+        if !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    format!("method `{}` is not generic", method.name),
+                    call.span,
+                )
+                .with_help("remove the arguments between `<` and `>`"),
+            );
+        }
         if !signature.is_public && self.type_is_external(receiver_type) {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -4676,7 +5665,7 @@ impl<'context> FunctionAnalyzer<'context> {
             arguments.push(self.analyze_expression_expected(argument, expected));
         }
         self.persistent_borrow = previous_persistence;
-        self.validate_call_arguments(&resolved_name, call.span, &signature, &arguments);
+        self.validate_call_arguments(resolved_name, call.span, signature, &arguments);
         Expression {
             kind: ExpressionKind::Call {
                 function: signature.id,
@@ -4685,6 +5674,47 @@ impl<'context> FunctionAnalyzer<'context> {
             ty: signature.return_type,
             span: call.span,
         }
+    }
+
+    fn analyze_default_call(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+    ) -> Option<Expression> {
+        let [owner, method] = path.segments.as_slice() else {
+            return None;
+        };
+        if method.name != "default" {
+            return None;
+        }
+        let ty = self.types.names.get(&owner.name).copied()?;
+        if !self.types.satisfies_trait(ty, "Default") {
+            return None;
+        }
+        if !call.arguments.is_empty() || !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E7007",
+                    "derived `default` does not accept arguments",
+                    call.span,
+                )
+                .with_help(format!("write `{}::default()`", owner.name)),
+            );
+        }
+        for argument in &call.arguments {
+            self.analyze_expression(argument);
+        }
+        self.types.default_expression(ty, call.span).or_else(|| {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E7007",
+                    format!("cannot construct the derived default for `{}`", owner.name),
+                    call.span,
+                )
+                .with_help("ensure every stored field has a deterministic default"),
+            );
+            Some(invalid_composite_expression(call.span))
+        })
     }
 
     fn try_analyze_generic_method_call(
@@ -4745,6 +5775,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 segments: vec![method.clone()],
                 span: method.span,
             }),
+            generic_arguments: call.generic_arguments.clone(),
             arguments,
             span: call.span,
         };
@@ -6611,6 +7642,16 @@ impl<'context> FunctionAnalyzer<'context> {
                 span: call.span,
             };
         };
+        if !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    format!("function `{resolved_name}` is not generic"),
+                    call.span,
+                )
+                .with_help("remove the arguments between `<` and `>`"),
+            );
+        }
         self.validate_function_access(path, call.span, &resolved_name, &signature);
         let previous_persistence = self.persistent_borrow;
         self.persistent_borrow |= self.types.is_scoped(signature.return_type);
@@ -6707,7 +7748,11 @@ impl<'context> FunctionAnalyzer<'context> {
         expected_return: Option<Type>,
     ) -> Expression {
         let parameters = &template.parameters;
-        let mut environment = GenericEnvironment::default();
+        let mut environment = self.types.base_environment();
+        let explicit_parameters = parameters
+            .get(template.explicit_parameter_start..)
+            .unwrap_or_default();
+        self.bind_explicit_generic_arguments(call, explicit_parameters, &mut environment);
         if let (Some(return_type), Some(expected)) =
             (&template.function.return_type, expected_return)
         {
@@ -6757,6 +7802,91 @@ impl<'context> FunctionAnalyzer<'context> {
             },
             ty: signature.return_type,
             span: call.span,
+        }
+    }
+
+    fn bind_explicit_generic_arguments(
+        &mut self,
+        call: &ast::CallExpression,
+        parameters: &[ast::GenericParameter],
+        environment: &mut GenericEnvironment,
+    ) {
+        if call.generic_arguments.len() > parameters.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    format!(
+                        "generic call provides {} argument(s), but at most {} are accepted",
+                        call.generic_arguments.len(),
+                        parameters.len()
+                    ),
+                    call.span,
+                )
+                .with_help("remove the extra generic arguments"),
+            );
+        }
+        for (parameter, argument) in parameters.iter().zip(&call.generic_arguments) {
+            match (parameter, argument) {
+                (ast::GenericParameter::Type { name, .. }, ast::GenericArgument::Type(ty)) => {
+                    if let Some(resolved) = self.types.resolve_type_name_in(
+                        ty,
+                        &self.generic_environment,
+                        self.diagnostics,
+                    ) {
+                        environment.types.insert(name.name.clone(), resolved);
+                    }
+                }
+                (ast::GenericParameter::Const { name, .. }, ast::GenericArgument::Const(value)) => {
+                    if let Some(resolved) =
+                        evaluate_array_length_in(value, &self.generic_environment, self.diagnostics)
+                    {
+                        environment.constants.insert(name.name.clone(), resolved);
+                    }
+                }
+                (
+                    ast::GenericParameter::Const { name, .. },
+                    ast::GenericArgument::Type(ast::TypeName {
+                        kind: TypeNameKind::Path(path),
+                        ..
+                    }),
+                ) => {
+                    let value = single_path_name(path)
+                        .and_then(|name| self.generic_environment.constants.get(name))
+                        .copied();
+                    if let Some(value) = value {
+                        environment.constants.insert(name.name.clone(), value);
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "E6004",
+                                "const generic argument is not a known constant",
+                                argument.span(),
+                            )
+                            .with_help("use an integer expression or a bound const parameter"),
+                        );
+                    }
+                }
+                (ast::GenericParameter::Type { .. }, ast::GenericArgument::Const(_)) => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "E6004",
+                            "expected a type generic argument",
+                            argument.span(),
+                        )
+                        .with_help("provide a type name at this position"),
+                    );
+                }
+                (ast::GenericParameter::Const { .. }, ast::GenericArgument::Type(_)) => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "E6004",
+                            "expected a const generic argument",
+                            argument.span(),
+                        )
+                        .with_help("provide an integer expression at this position"),
+                    );
+                }
+            }
         }
     }
 
@@ -8200,6 +9330,36 @@ fn evaluate_array_length_in(
     value
 }
 
+fn compiletime_value_kind(value: &comptime::Value) -> &'static str {
+    match value {
+        comptime::Value::Integer(_) => "an integer",
+        comptime::Value::Float(_) => "a floating-point value",
+        comptime::Value::Boolean(_) => "a boolean",
+        comptime::Value::Character(_) => "a character",
+        comptime::Value::String(_) => "a string",
+        comptime::Value::Unit => "the unit value",
+        comptime::Value::Tuple(_) => "a tuple",
+        comptime::Value::Array(_) => "an array",
+        comptime::Value::Record(_) => "a record",
+    }
+}
+
+fn report_compiletime_type_mismatch(
+    expected: Type,
+    actual: &str,
+    span: Span,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(
+        Diagnostic::error(
+            "E7011",
+            format!("constant declared as `{expected}` produced {actual}"),
+            span,
+        )
+        .with_help("change the declared type or return a compatible compile-time value"),
+    );
+}
+
 fn invalid_composite_expression(span: Span) -> Expression {
     Expression {
         kind: ExpressionKind::Unit,
@@ -8334,8 +9494,594 @@ fn is_valid_cast(source: Type, target: Type) -> bool {
 fn is_builtin_trait(name: &str) -> bool {
     matches!(
         name,
-        "Copy" | "Clone" | "Eq" | "Ord" | "Ordered" | "Hash" | "Send" | "Sync"
+        "Copy"
+            | "Clone"
+            | "Debug"
+            | "Eq"
+            | "Ord"
+            | "Ordered"
+            | "Hash"
+            | "Default"
+            | "Send"
+            | "Sync"
     )
+}
+
+fn validate_comptime_function(
+    function: &ast::Function,
+    comptime_functions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for parameter in &function.parameters {
+        validate_comptime_type(&parameter.ty, diagnostics);
+    }
+    if let Some(return_type) = &function.return_type {
+        validate_comptime_type(return_type, diagnostics);
+    }
+    validate_comptime_block(&function.body, comptime_functions, diagnostics);
+}
+
+fn validate_comptime_type(type_name: &ast::TypeName, diagnostics: &mut Vec<Diagnostic>) {
+    match &type_name.kind {
+        TypeNameKind::Reference { .. }
+        | TypeNameKind::RawPointer { .. }
+        | TypeNameKind::Slice(_)
+        | TypeNameKind::Function { .. } => diagnostics.push(
+            Diagnostic::error(
+                "E7012",
+                "references, pointers, slices, and function values are forbidden in `comptime fn` signatures",
+                type_name.span,
+            )
+            .with_help("pass deterministic owned scalar or aggregate values"),
+        ),
+        TypeNameKind::Generic { arguments, .. } => {
+            for argument in arguments {
+                if let ast::GenericArgument::Type(type_name) = argument {
+                    validate_comptime_type(type_name, diagnostics);
+                }
+            }
+        }
+        TypeNameKind::Tuple(elements) => {
+            for element in elements {
+                validate_comptime_type(element, diagnostics);
+            }
+        }
+        TypeNameKind::Array { element, .. } => validate_comptime_type(element, diagnostics),
+        TypeNameKind::Path(_) | TypeNameKind::Unit => {}
+    }
+}
+
+fn validate_comptime_block(
+    block: &ast::Block,
+    comptime_functions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in &block.statements {
+        match statement {
+            AstStatement::Let(statement) => validate_comptime_expression(
+                &statement.initializer,
+                comptime_functions,
+                diagnostics,
+            ),
+            AstStatement::Expression(statement) => {
+                validate_comptime_expression(
+                    &statement.expression,
+                    comptime_functions,
+                    diagnostics,
+                );
+            }
+            AstStatement::Return(statement) => {
+                if let Some(value) = &statement.value {
+                    validate_comptime_expression(value, comptime_functions, diagnostics);
+                }
+            }
+            AstStatement::While(statement) => {
+                validate_comptime_expression(&statement.condition, comptime_functions, diagnostics);
+                validate_comptime_block(&statement.body, comptime_functions, diagnostics);
+            }
+            AstStatement::For(statement) => {
+                validate_comptime_expression(&statement.iterable, comptime_functions, diagnostics);
+                validate_comptime_block(&statement.body, comptime_functions, diagnostics);
+            }
+            AstStatement::Break(statement) => {
+                if let Some(value) = &statement.value {
+                    validate_comptime_expression(value, comptime_functions, diagnostics);
+                }
+            }
+            AstStatement::Defer(statement) => {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "E7012",
+                        "`defer` is not available during compile-time evaluation",
+                        statement.span,
+                    )
+                    .with_help("keep compile-time cleanup explicit and pure"),
+                );
+                validate_comptime_expression(&statement.action, comptime_functions, diagnostics);
+            }
+            AstStatement::Continue(_) => {}
+        }
+    }
+    if let Some(tail) = &block.tail {
+        validate_comptime_expression(tail, comptime_functions, diagnostics);
+    }
+}
+
+fn validate_comptime_expression(
+    expression: &AstExpression,
+    comptime_functions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match expression {
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Character(_)
+        | AstExpression::String(_)
+        | AstExpression::CString(_)
+        | AstExpression::Boolean(_)
+        | AstExpression::Unit(_)
+        | AstExpression::Path(_) => {}
+        AstExpression::Tuple(tuple) => {
+            for element in &tuple.elements {
+                validate_comptime_expression(element, comptime_functions, diagnostics);
+            }
+        }
+        AstExpression::Array(array) => {
+            for element in &array.elements {
+                validate_comptime_expression(element, comptime_functions, diagnostics);
+            }
+        }
+        AstExpression::Struct(structure) => {
+            for field in &structure.fields {
+                validate_comptime_expression(&field.value, comptime_functions, diagnostics);
+            }
+        }
+        AstExpression::Unary(unary) => {
+            validate_comptime_unary(unary, comptime_functions, diagnostics);
+        }
+        AstExpression::Binary(binary) => {
+            validate_comptime_expression(&binary.left, comptime_functions, diagnostics);
+            validate_comptime_expression(&binary.right, comptime_functions, diagnostics);
+        }
+        AstExpression::Call(call) => {
+            validate_comptime_call(call, comptime_functions, diagnostics);
+        }
+        AstExpression::If(conditional) => {
+            validate_comptime_expression(&conditional.condition, comptime_functions, diagnostics);
+            validate_comptime_block(&conditional.then_branch, comptime_functions, diagnostics);
+            if let Some(alternative) = &conditional.else_branch {
+                validate_comptime_expression(alternative, comptime_functions, diagnostics);
+            }
+        }
+        AstExpression::Match(matching) => {
+            validate_comptime_expression(&matching.scrutinee, comptime_functions, diagnostics);
+            for arm in &matching.arms {
+                if let Some(guard) = &arm.guard {
+                    validate_comptime_expression(guard, comptime_functions, diagnostics);
+                }
+                validate_comptime_expression(&arm.body, comptime_functions, diagnostics);
+            }
+        }
+        AstExpression::Loop(looping) => {
+            validate_comptime_block(&looping.body, comptime_functions, diagnostics);
+        }
+        AstExpression::Unsafe(block) => {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7012",
+                    "`unsafe` is forbidden during compile-time evaluation",
+                    block.span,
+                )
+                .with_help("move native or raw-pointer work to runtime code"),
+            );
+            validate_comptime_block(block, comptime_functions, diagnostics);
+        }
+        AstExpression::Block(block) => {
+            validate_comptime_block(block, comptime_functions, diagnostics);
+        }
+        AstExpression::Assignment(assignment) => {
+            validate_comptime_expression(&assignment.target, comptime_functions, diagnostics);
+            validate_comptime_expression(&assignment.value, comptime_functions, diagnostics);
+        }
+        AstExpression::Cast(cast) => {
+            validate_comptime_expression(&cast.value, comptime_functions, diagnostics);
+            validate_comptime_type(&cast.target, diagnostics);
+        }
+        AstExpression::Field(field) => {
+            validate_comptime_expression(&field.base, comptime_functions, diagnostics);
+        }
+        AstExpression::Index(index) => {
+            validate_comptime_expression(&index.base, comptime_functions, diagnostics);
+            for value in &index.indices {
+                validate_comptime_expression(value, comptime_functions, diagnostics);
+            }
+        }
+        AstExpression::Try { value, span } => {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7012",
+                    "`?` is not available during compile-time evaluation",
+                    *span,
+                )
+                .with_help("match the value explicitly before entering `comptime`"),
+            );
+            validate_comptime_expression(value, comptime_functions, diagnostics);
+        }
+    }
+}
+
+fn validate_comptime_unary(
+    unary: &ast::UnaryExpression,
+    comptime_functions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if matches!(
+        unary.operator,
+        AstUnaryOperator::Borrow | AstUnaryOperator::BorrowMut | AstUnaryOperator::Dereference
+    ) {
+        diagnostics.push(
+            Diagnostic::error(
+                "E7012",
+                "references and pointer dereferences are forbidden during compile-time evaluation",
+                unary.span,
+            )
+            .with_help("use owned compile-time values"),
+        );
+    }
+    validate_comptime_expression(&unary.operand, comptime_functions, diagnostics);
+}
+
+fn validate_comptime_call(
+    call: &ast::CallExpression,
+    comptime_functions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let allowed = match &call.callee {
+        AstExpression::Path(path) => {
+            single_path_name(path).is_some_and(|name| {
+                comptime_functions.contains(name)
+                    || matches!(
+                        name,
+                        "assert" | "panic" | "size_of" | "align_of" | "fields" | "variants"
+                    )
+            }) || matches!(
+                path.segments.as_slice(),
+                [namespace, name]
+                    if namespace.name == "meta"
+                        && matches!(
+                            name.name.as_str(),
+                            "name" | "fields" | "variants" | "traits"
+                        )
+            )
+        }
+        _ => false,
+    };
+    if !allowed {
+        diagnostics.push(
+            Diagnostic::error(
+                "E7012",
+                "only `comptime fn` and compile-time metadata intrinsics may be called here",
+                call.span,
+            )
+            .with_help(
+                "move I/O, allocation, FFI, clocks, randomness, and threads to runtime code",
+            ),
+        );
+    }
+    for argument in &call.generic_arguments {
+        if let ast::GenericArgument::Const(value) = argument {
+            validate_comptime_expression(value, comptime_functions, diagnostics);
+        }
+    }
+    for argument in &call.arguments {
+        validate_comptime_expression(argument, comptime_functions, diagnostics);
+    }
+}
+
+fn has_identifier_attribute(attributes: &[ast::Attribute], name: &str, argument: &str) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.name.name == name
+            && matches!(
+                attribute.arguments.as_slice(),
+                [ast::AttributeArgument::Identifier(value)] if value.name == argument
+            )
+    })
+}
+
+fn has_marker_attribute(attributes: &[ast::Attribute], name: &str) -> bool {
+    attributes
+        .iter()
+        .any(|attribute| attribute.name.name == name && attribute.arguments.is_empty())
+}
+
+fn requested_alignment(attributes: &[ast::Attribute]) -> Option<u32> {
+    attributes.iter().find_map(|attribute| {
+        if attribute.name.name != "align" {
+            return None;
+        }
+        let [ast::AttributeArgument::Integer(value)] = attribute.arguments.as_slice() else {
+            return None;
+        };
+        u32::try_from(value.value).ok()
+    })
+}
+
+fn derived_traits(attributes: &[ast::Attribute]) -> Vec<hir::DerivedTrait> {
+    let mut requested = Vec::new();
+    for attribute in attributes {
+        if attribute.name.name != "derive" {
+            continue;
+        }
+        for argument in &attribute.arguments {
+            let ast::AttributeArgument::Identifier(name) = argument else {
+                continue;
+            };
+            if let Some(derived) = derived_trait(&name.name)
+                && !requested.contains(&derived)
+            {
+                requested.push(derived);
+            }
+        }
+    }
+    if requested.contains(&hir::DerivedTrait::Copy)
+        && !requested.contains(&hir::DerivedTrait::Clone)
+    {
+        requested.push(hir::DerivedTrait::Clone);
+    }
+    requested
+}
+
+fn derived_trait(name: &str) -> Option<hir::DerivedTrait> {
+    match name {
+        "Copy" => Some(hir::DerivedTrait::Copy),
+        "Clone" => Some(hir::DerivedTrait::Clone),
+        "Debug" => Some(hir::DerivedTrait::Debug),
+        "Eq" => Some(hir::DerivedTrait::Eq),
+        "Hash" => Some(hir::DerivedTrait::Hash),
+        "Default" => Some(hir::DerivedTrait::Default),
+        _ => None,
+    }
+}
+
+fn function_attributes(function: &ast::Function) -> hir::FunctionAttributes {
+    hir::FunctionAttributes {
+        inline: has_marker_attribute(&function.attributes, "inline"),
+        must_use: has_marker_attribute(&function.attributes, "must_use"),
+        test: has_marker_attribute(&function.attributes, "test"),
+    }
+}
+
+fn validate_function_attributes(function: &ast::Function, diagnostics: &mut Vec<Diagnostic>) {
+    validate_attribute_names(
+        &function.attributes,
+        &["inline", "test", "must_use"],
+        diagnostics,
+    );
+    for attribute in &function.attributes {
+        if matches!(attribute.name.name.as_str(), "inline" | "test" | "must_use")
+            && !attribute.arguments.is_empty()
+        {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7001",
+                    format!("`@{}` does not accept arguments", attribute.name.name),
+                    attribute.span,
+                )
+                .with_help(format!("write `@{}`", attribute.name.name)),
+            );
+        }
+    }
+    if has_marker_attribute(&function.attributes, "test") {
+        if function.is_comptime {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7002",
+                    "`@test` cannot be combined with `comptime fn`",
+                    function.span,
+                )
+                .with_help("make the function a runtime test or remove `@test`"),
+            );
+        }
+        if !function.generic_parameters.is_empty() || !function.parameters.is_empty() {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7002",
+                    "`@test` functions cannot have generic or value parameters",
+                    function.span,
+                )
+                .with_help("move test data into the function body"),
+            );
+        }
+        if function
+            .return_type
+            .as_ref()
+            .is_some_and(|ty| !matches!(ty.kind, TypeNameKind::Unit))
+        {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7002",
+                    "`@test` functions must return `()`",
+                    function
+                        .return_type
+                        .as_ref()
+                        .map_or(function.span, |ty| ty.span),
+                )
+                .with_help("remove the return annotation or write `-> ()`"),
+            );
+        }
+    }
+    if function.is_comptime && has_marker_attribute(&function.attributes, "inline") {
+        diagnostics.push(
+            Diagnostic::error(
+                "E7002",
+                "`@inline` has no meaning on a `comptime fn`",
+                function.span,
+            )
+            .with_help("remove `@inline` from the compile-time function"),
+        );
+    }
+}
+
+fn validate_type_attributes(
+    attributes: &[ast::Attribute],
+    is_enum: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    validate_attribute_names(
+        attributes,
+        &["repr", "derive", "align", "must_use"],
+        diagnostics,
+    );
+    for attribute in attributes {
+        match attribute.name.name.as_str() {
+            "repr" => {
+                if is_enum {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "E7003",
+                            "`@repr(C)` is currently valid only on structs",
+                            attribute.span,
+                        )
+                        .with_help(
+                            "wrap the enum in a C-representation struct at the FFI boundary",
+                        ),
+                    );
+                }
+                if !matches!(
+                    attribute.arguments.as_slice(),
+                    [ast::AttributeArgument::Identifier(value)] if value.name == "C"
+                ) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "E7003",
+                            "`@repr` expects the single representation `C`",
+                            attribute.span,
+                        )
+                        .with_help("write `@repr(C)`"),
+                    );
+                }
+            }
+            "derive" => validate_derive_attribute(attribute, diagnostics),
+            "align" => validate_align_attribute(attribute, diagnostics),
+            "must_use" if !attribute.arguments.is_empty() => diagnostics.push(
+                Diagnostic::error(
+                    "E7001",
+                    "`@must_use` does not accept arguments",
+                    attribute.span,
+                )
+                .with_help("write `@must_use`"),
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn validate_attribute_names(
+    attributes: &[ast::Attribute],
+    allowed: &[&str],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut seen = HashMap::new();
+    for attribute in attributes {
+        if !allowed.contains(&attribute.name.name.as_str()) {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7001",
+                    format!("unknown attribute `@{}`", attribute.name.name),
+                    attribute.span,
+                )
+                .with_help(format!("supported attributes here: {}", allowed.join(", "))),
+            );
+        }
+        if seen
+            .insert(attribute.name.name.as_str(), attribute.span)
+            .is_some()
+        {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7001",
+                    format!("attribute `@{}` is repeated", attribute.name.name),
+                    attribute.span,
+                )
+                .with_help("keep one occurrence of each attribute"),
+            );
+        }
+    }
+}
+
+fn validate_derive_attribute(attribute: &ast::Attribute, diagnostics: &mut Vec<Diagnostic>) {
+    if attribute.arguments.is_empty() {
+        diagnostics.push(
+            Diagnostic::error(
+                "E7004",
+                "`@derive` needs at least one trait",
+                attribute.span,
+            )
+            .with_help("choose from Copy, Clone, Debug, Eq, Hash, and Default"),
+        );
+        return;
+    }
+    let mut seen = HashMap::new();
+    for argument in &attribute.arguments {
+        let ast::AttributeArgument::Identifier(name) = argument else {
+            diagnostics.push(
+                Diagnostic::error("E7004", "derive names must be identifiers", argument.span())
+                    .with_help("choose from Copy, Clone, Debug, Eq, Hash, and Default"),
+            );
+            continue;
+        };
+        if derived_trait(&name.name).is_none() {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7004",
+                    format!("unsupported derive `{}`", name.name),
+                    name.span,
+                )
+                .with_help("choose from Copy, Clone, Debug, Eq, Hash, and Default"),
+            );
+        }
+        if seen.insert(name.name.as_str(), name.span).is_some() {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E7004",
+                    format!("derive `{}` is repeated", name.name),
+                    name.span,
+                )
+                .with_help("list each derive once"),
+            );
+        }
+    }
+}
+
+fn validate_align_attribute(attribute: &ast::Attribute, diagnostics: &mut Vec<Diagnostic>) {
+    let [ast::AttributeArgument::Integer(value)] = attribute.arguments.as_slice() else {
+        diagnostics.push(
+            Diagnostic::error(
+                "E7005",
+                "`@align` expects exactly one integer",
+                attribute.span,
+            )
+            .with_help("write a power of two such as `@align(16)`"),
+        );
+        return;
+    };
+    let Ok(alignment) = u32::try_from(value.value) else {
+        diagnostics.push(
+            Diagnostic::error("E7005", "requested alignment is too large", value.span)
+                .with_help("use a power of two no larger than 536870912"),
+        );
+        return;
+    };
+    if !alignment.is_power_of_two() || alignment > 536_870_912 {
+        diagnostics.push(
+            Diagnostic::error(
+                "E7005",
+                "alignment must be a power of two no larger than 536870912",
+                value.span,
+            )
+            .with_help("use 1, 2, 4, 8, 16, or another supported power of two"),
+        );
+    }
 }
 
 fn receiver_shapes_match(required: Option<&TypeNameKind>, provided: Option<&TypeNameKind>) -> bool {
@@ -9588,6 +11334,83 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("Send"))
+        );
+    }
+
+    #[test]
+    fn resolve_should_evaluate_m10_constants_attributes_and_reflection() {
+        let source = include_str!("../../../examples/m10_comptime.reim");
+
+        let program = resolve_fixture(source).expect("M10 fixture should resolve");
+        let header = program
+            .types
+            .iter()
+            .find(|definition| definition.name.as_deref() == Some("Header"))
+            .expect("fixture should define Header");
+
+        assert_eq!(header.alignment, Some(16));
+        assert_eq!(header.derives.len(), 6);
+        assert_eq!(program.tests.len(), 1);
+    }
+
+    #[test]
+    fn resolve_should_use_comptime_results_in_const_generics_and_runtime_code() {
+        let source = "
+            comptime fn doubled(value: usize) -> usize { value * 2 }
+            const LENGTH: usize = doubled(2);
+            fn identity<T>(value: T) -> T { value }
+            fn main() -> i32 {
+                let values: [i32; LENGTH] = [10, 10, 10, 12];
+                identity<i32>(values[0] + values[1] + values[2] + values[3])
+            }";
+
+        resolve_fixture(source).expect("compile-time and explicit generic fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_bind_explicit_method_generics_after_impl_generics() {
+        let source = "
+            struct Holder<T> { value: T }
+            impl<T> Holder<T> {
+                fn replace<U>(&self, replacement: U) -> U { replacement }
+            }
+            fn main() -> i32 {
+                let holder: Holder<bool> = Holder { value: true };
+                holder.replace<i32>(42)
+            }";
+
+        resolve_fixture(source).expect("explicit method generic fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_reject_runtime_calls_during_comptime_evaluation() {
+        let source = "
+            fn runtime_value() -> usize { 42 }
+            comptime fn invalid() -> usize { runtime_value() }
+            const VALUE: usize = invalid();
+            fn main() -> i32 { 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E7012")
+        );
+    }
+
+    #[test]
+    fn resolve_should_report_a_failing_top_level_comptime_assertion() {
+        let source = "
+            comptime { assert(size_of<i32>() == 8); }
+            fn main() -> i32 { 0 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E7013")
         );
     }
 }

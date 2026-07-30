@@ -19,10 +19,11 @@ use cranelift_object::object::{BinaryFormat, SectionKind};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_hir::{
-    AssignmentOperator, BinaryOperator, Block, EnumVariantFields, Expression, ExpressionKind,
-    Function, FunctionId, LocalId, MatchExpression, Pattern, PatternKind, Place, PlaceKind,
-    Program, Statement, SynchronizationKind, TypeDefinition, TypeDefinitionKind, UnaryOperator,
+    AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, Function, FunctionId,
+    LocalId, MatchExpression, Pattern, PatternKind, Place, PlaceKind, Program, Statement,
+    SynchronizationKind, TypeDefinitionKind, UnaryOperator,
 };
+use reimer_layout::{AggregateLayoutKind, Layouts};
 use reimer_runtime::Failure;
 use reimer_types::{Type, TypeId};
 
@@ -101,392 +102,6 @@ fn load_native_library(name: &str) -> Result<libloading::Library, String> {
         }
         Err(error) => Err(format!("failed to load native library `{name}`: {error}")),
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ValueLayout {
-    size: u32,
-    align: u32,
-}
-
-#[derive(Debug, Clone)]
-struct AggregateLayout {
-    value: ValueLayout,
-    kind: AggregateLayoutKind,
-}
-
-#[derive(Debug, Clone)]
-enum AggregateLayoutKind {
-    Scalar,
-    Product {
-        offsets: Vec<u32>,
-    },
-    Array {
-        stride: u32,
-        length: u64,
-    },
-    Enum {
-        variants: Vec<Vec<u32>>,
-    },
-    Slice {
-        data_offset: u32,
-        length_offset: u32,
-    },
-}
-
-struct Layouts {
-    aggregates: Vec<AggregateLayout>,
-    str_layout: AggregateLayout,
-    metadata: Vec<TypeMetadata>,
-}
-
-#[derive(Debug, Clone)]
-enum TypeMetadata {
-    Other,
-    Pointer {
-        target: Type,
-    },
-    Slice {
-        stride: u32,
-    },
-    Function {
-        parameters: Vec<Type>,
-        return_type: Type,
-    },
-}
-
-impl Layouts {
-    fn build(definitions: &[TypeDefinition]) -> Result<Self, String> {
-        let mut cache = vec![None; definitions.len()];
-        let mut visiting = vec![false; definitions.len()];
-        for definition in definitions {
-            build_aggregate_layout(definitions, &mut cache, &mut visiting, definition.id)?;
-        }
-        let aggregates: Vec<AggregateLayout> = cache
-            .into_iter()
-            .enumerate()
-            .map(|(index, layout)| {
-                layout.ok_or_else(|| format!("type definition {index} has no native layout"))
-            })
-            .collect::<Result<_, _>>()?;
-        let metadata = definitions
-            .iter()
-            .map(|definition| match &definition.kind {
-                TypeDefinitionKind::Reference { target, .. }
-                | TypeDefinitionKind::RawPointer { target, .. } => {
-                    Ok(TypeMetadata::Pointer { target: *target })
-                }
-                TypeDefinitionKind::Slice { element, .. } => {
-                    let element_layout = if let Some(id) = composite_type_id(*element) {
-                        aggregates
-                            .get(type_index(id)?)
-                            .ok_or_else(|| "slice element layout is missing".to_owned())?
-                            .value
-                    } else {
-                        scalar_layout(*element)?
-                    };
-                    Ok(TypeMetadata::Slice {
-                        stride: align_up(element_layout.size, element_layout.align)?,
-                    })
-                }
-                TypeDefinitionKind::Function {
-                    parameters,
-                    return_type,
-                } => Ok(TypeMetadata::Function {
-                    parameters: parameters.clone(),
-                    return_type: *return_type,
-                }),
-                _ => Ok(TypeMetadata::Other),
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(Self {
-            aggregates,
-            str_layout: fat_view_layout()?,
-            metadata,
-        })
-    }
-
-    fn aggregate(&self, ty: Type) -> Result<&AggregateLayout, String> {
-        if ty == Type::Str {
-            return Ok(&self.str_layout);
-        }
-        let id =
-            composite_type_id(ty).ok_or_else(|| format!("type `{ty}` is not a composite type"))?;
-        self.aggregates
-            .get(type_index(id)?)
-            .ok_or_else(|| format!("composite type {} has no native layout", id.0))
-    }
-
-    fn pointer_target(&self, ty: Type) -> Option<Type> {
-        let id = composite_type_id(ty)?;
-        match self.metadata.get(type_index(id).ok()?)? {
-            TypeMetadata::Pointer { target } => Some(*target),
-            _ => None,
-        }
-    }
-
-    fn slice_stride(&self, ty: Type) -> Option<u32> {
-        let id = composite_type_id(ty)?;
-        match self.metadata.get(type_index(id).ok()?)? {
-            TypeMetadata::Slice { stride, .. } => Some(*stride),
-            _ => None,
-        }
-    }
-
-    fn function_shape(&self, ty: Type) -> Option<(&[Type], Type)> {
-        let id = composite_type_id(ty)?;
-        match self.metadata.get(type_index(id).ok()?)? {
-            TypeMetadata::Function {
-                parameters,
-                return_type,
-            } => Some((parameters, *return_type)),
-            _ => None,
-        }
-    }
-
-    fn value_layout(&self, ty: Type) -> Result<ValueLayout, String> {
-        if ty.is_composite() {
-            Ok(self.aggregate(ty)?.value)
-        } else {
-            scalar_layout(ty)
-        }
-    }
-}
-
-fn build_aggregate_layout(
-    definitions: &[TypeDefinition],
-    cache: &mut [Option<AggregateLayout>],
-    visiting: &mut [bool],
-    id: TypeId,
-) -> Result<AggregateLayout, String> {
-    let index = type_index(id)?;
-    if let Some(layout) = cache.get(index).and_then(Clone::clone) {
-        return Ok(layout);
-    }
-    let is_visiting = visiting
-        .get_mut(index)
-        .ok_or_else(|| format!("type definition {} is missing", id.0))?;
-    if *is_visiting {
-        return Err(format!("composite type {} contains itself by value", id.0));
-    }
-    *is_visiting = true;
-    let definition = definitions
-        .get(index)
-        .ok_or_else(|| format!("type definition {} is missing", id.0))?;
-    let layout = match &definition.kind {
-        TypeDefinitionKind::Struct { fields } => {
-            let types: Vec<_> = fields.iter().map(|field| field.ty).collect();
-            let (value, offsets) = layout_product(definitions, cache, visiting, &types)?;
-            AggregateLayout {
-                value,
-                kind: AggregateLayoutKind::Product { offsets },
-            }
-        }
-        TypeDefinitionKind::Tuple { elements } => {
-            let (value, offsets) = layout_product(definitions, cache, visiting, elements)?;
-            AggregateLayout {
-                value,
-                kind: AggregateLayoutKind::Product { offsets },
-            }
-        }
-        TypeDefinitionKind::Array { element, length } => {
-            let element_layout = build_value_layout(definitions, cache, visiting, *element)?;
-            let stride = align_up(element_layout.size, element_layout.align)?;
-            let size = u64::from(stride)
-                .checked_mul(*length)
-                .and_then(|size| u32::try_from(size).ok())
-                .ok_or_else(|| "array layout exceeds the native stack-slot limit".to_owned())?;
-            AggregateLayout {
-                value: ValueLayout {
-                    size,
-                    align: element_layout.align,
-                },
-                kind: AggregateLayoutKind::Array {
-                    stride,
-                    length: *length,
-                },
-            }
-        }
-        TypeDefinitionKind::Enum { variants } => {
-            layout_enum(definitions, cache, visiting, variants)?
-        }
-        TypeDefinitionKind::Reference { .. } | TypeDefinitionKind::RawPointer { .. } => {
-            AggregateLayout {
-                value: ValueLayout {
-                    size: usize::BITS / 8,
-                    align: usize::BITS / 8,
-                },
-                kind: AggregateLayoutKind::Scalar,
-            }
-        }
-        TypeDefinitionKind::Function { .. } => AggregateLayout {
-            value: ValueLayout {
-                size: usize::BITS / 8,
-                align: usize::BITS / 8,
-            },
-            kind: AggregateLayoutKind::Scalar,
-        },
-        TypeDefinitionKind::Slice { .. } => fat_view_layout()?,
-    };
-    if layout.value.size > 2_147_483_647_u32 {
-        return Err(format!(
-            "composite type {} exceeds the native addressing limit",
-            id.0
-        ));
-    }
-    visiting[index] = false;
-    cache[index] = Some(layout.clone());
-    Ok(layout)
-}
-
-fn fat_view_layout() -> Result<AggregateLayout, String> {
-    let pointer_size = usize::BITS / 8;
-    let length_offset = align_up(pointer_size, pointer_size)?;
-    let size = length_offset
-        .checked_add(pointer_size)
-        .ok_or_else(|| "fat view layout size overflowed".to_owned())?;
-    Ok(AggregateLayout {
-        value: ValueLayout {
-            size,
-            align: pointer_size,
-        },
-        kind: AggregateLayoutKind::Slice {
-            data_offset: 0,
-            length_offset,
-        },
-    })
-}
-
-fn layout_enum(
-    definitions: &[TypeDefinition],
-    cache: &mut [Option<AggregateLayout>],
-    visiting: &mut [bool],
-    variants: &[reimer_hir::EnumVariant],
-) -> Result<AggregateLayout, String> {
-    let mut payload_align = 1;
-    let mut payload_size = 0;
-    let mut relative_offsets = Vec::with_capacity(variants.len());
-    for variant in variants {
-        let types: Vec<_> = match &variant.fields {
-            EnumVariantFields::Unit => Vec::new(),
-            EnumVariantFields::Tuple(types) => types.clone(),
-            EnumVariantFields::Struct(fields) => fields.iter().map(|field| field.ty).collect(),
-        };
-        let (layout, offsets) = layout_product(definitions, cache, visiting, &types)?;
-        payload_align = payload_align.max(layout.align);
-        payload_size = payload_size.max(layout.size);
-        relative_offsets.push(offsets);
-    }
-    let payload_offset = align_up(4, payload_align)?;
-    let align = payload_align.max(4);
-    let size = align_up(
-        payload_offset
-            .checked_add(payload_size)
-            .ok_or_else(|| "enum layout size overflowed".to_owned())?,
-        align,
-    )?;
-    let variants = relative_offsets
-        .into_iter()
-        .map(|offsets| {
-            offsets
-                .into_iter()
-                .map(|offset| {
-                    payload_offset
-                        .checked_add(offset)
-                        .ok_or_else(|| "enum field offset overflowed".to_owned())
-                })
-                .collect()
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(AggregateLayout {
-        value: ValueLayout { size, align },
-        kind: AggregateLayoutKind::Enum { variants },
-    })
-}
-
-fn layout_product(
-    definitions: &[TypeDefinition],
-    cache: &mut [Option<AggregateLayout>],
-    visiting: &mut [bool],
-    fields: &[Type],
-) -> Result<(ValueLayout, Vec<u32>), String> {
-    let mut offsets = Vec::with_capacity(fields.len());
-    let mut offset = 0;
-    let mut align = 1;
-    for field in fields {
-        let field_layout = build_value_layout(definitions, cache, visiting, *field)?;
-        offset = align_up(offset, field_layout.align)?;
-        offsets.push(offset);
-        offset = offset
-            .checked_add(field_layout.size)
-            .ok_or_else(|| "aggregate layout size overflowed".to_owned())?;
-        align = align.max(field_layout.align);
-    }
-    let size = align_up(offset, align)?;
-    Ok((ValueLayout { size, align }, offsets))
-}
-
-fn build_value_layout(
-    definitions: &[TypeDefinition],
-    cache: &mut [Option<AggregateLayout>],
-    visiting: &mut [bool],
-    ty: Type,
-) -> Result<ValueLayout, String> {
-    if let Some(id) = composite_type_id(ty) {
-        Ok(build_aggregate_layout(definitions, cache, visiting, id)?.value)
-    } else {
-        scalar_layout(ty)
-    }
-}
-
-fn scalar_layout(ty: Type) -> Result<ValueLayout, String> {
-    let (size, align) = match ty {
-        Type::I8 | Type::U8 | Type::Bool => (1, 1),
-        Type::I16 | Type::U16 => (2, 2),
-        Type::I32 | Type::U32 | Type::F32 | Type::Char => (4, 4),
-        Type::I64 | Type::U64 | Type::F64 => (8, 8),
-        Type::I128 | Type::U128 => (16, 16),
-        Type::Isize
-        | Type::Usize
-        | Type::Reference(_)
-        | Type::RawPointer(_)
-        | Type::Function(_)
-        | Type::CStr => (usize::BITS / 8, usize::BITS / 8),
-        Type::Str => (2 * (usize::BITS / 8), usize::BITS / 8),
-        Type::Unit | Type::Never => (0, 1),
-        Type::Struct(_) | Type::Enum(_) | Type::Tuple(_) | Type::Array(_) | Type::Slice(_) => {
-            return Err(format!("composite type `{ty}` requires its definition"));
-        }
-    };
-    Ok(ValueLayout { size, align })
-}
-
-fn composite_type_id(ty: Type) -> Option<TypeId> {
-    match ty {
-        Type::Struct(id)
-        | Type::Enum(id)
-        | Type::Tuple(id)
-        | Type::Array(id)
-        | Type::Reference(id)
-        | Type::RawPointer(id)
-        | Type::Slice(id)
-        | Type::Function(id) => Some(id),
-        _ => None,
-    }
-}
-
-fn type_index(id: TypeId) -> Result<usize, String> {
-    usize::try_from(id.0).map_err(|_| format!("type id {} does not fit this host", id.0))
-}
-
-fn align_up(value: u32, align: u32) -> Result<u32, String> {
-    let mask = align
-        .checked_sub(1)
-        .ok_or_else(|| "type alignment cannot be zero".to_owned())?;
-    value
-        .checked_add(mask)
-        .map(|value| value & !mask)
-        .ok_or_else(|| "native layout size overflowed".to_owned())
 }
 
 /// Emits a native object for the current host.
@@ -595,6 +210,74 @@ pub fn execute_with_options(
     let pointer = module.get_finalized_function(entry);
     let session = reimer_runtime::ExecutionSession::begin();
     let result = call_jit_entry(pointer);
+    reimer_runtime::shutdown_job_pools(session.id());
+    reimer_runtime::join_session_threads(session.id());
+    result
+}
+
+/// Compiles and executes one `@test` function by discovery index.
+///
+/// This entry point is intended to run in an isolated child process because a
+/// checked runtime panic terminates the current process.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when the test index is invalid or native code
+/// generation fails.
+pub fn execute_test(program: &Program, test_index: usize) -> Result<(), Vec<Diagnostic>> {
+    execute_test_with_options(program, test_index, OptimizationLevel::None)
+}
+
+/// Compiles and executes one `@test` function with the selected optimization.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when the test index is invalid or native code
+/// generation fails.
+pub fn execute_test_with_options(
+    program: &Program,
+    test_index: usize,
+    optimization: OptimizationLevel,
+) -> Result<(), Vec<Diagnostic>> {
+    let test = program
+        .tests
+        .get(test_index)
+        .copied()
+        .ok_or_else(|| backend_error(format!("unit test index {test_index} does not exist")))?;
+    let declaration = program
+        .functions
+        .iter()
+        .find(|function| function.id == test)
+        .ok_or_else(|| backend_error("typed HIR unit test function is missing"))?;
+    if !declaration.parameters.is_empty() || declaration.return_type != Type::Unit {
+        return Err(backend_error(
+            "typed HIR unit test must take no parameters and return `()`",
+        ));
+    }
+
+    let flags = [
+        ("enable_llvm_abi_extensions", "true"),
+        ("opt_level", optimization.setting()),
+    ];
+    let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
+        .map_err(|error| backend_error(error.to_string()))?;
+    register_runtime_symbols(&mut builder);
+    let libraries = NativeLibraries::load(program).map_err(backend_error)?;
+    if !libraries.is_empty() {
+        builder.symbol_lookup_fn(Box::new(move |name| libraries.lookup(name)));
+    }
+    let mut module = JITModule::new(builder);
+    let functions = compile_program(&mut module, program).map_err(backend_error)?;
+    module
+        .finalize_definitions()
+        .map_err(|error| backend_error(error.to_string()))?;
+    let function = functions
+        .get(&test)
+        .copied()
+        .ok_or_else(|| backend_error("compiled unit test function is missing"))?;
+    let pointer = module.get_finalized_function(function);
+    let session = reimer_runtime::ExecutionSession::begin();
+    let result = call_jit_unit(pointer);
     reimer_runtime::shutdown_job_pools(session.id());
     reimer_runtime::join_session_threads(session.id());
     result
@@ -1181,6 +864,28 @@ fn runtime_deallocate_bytes_reference<M: Module>(
     let function = module
         .declare_function(
             reimer_runtime::DEALLOCATE_BYTES_SYMBOL,
+            Linkage::Import,
+            &signature,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(module.declare_func_in_func(function, builder.func))
+}
+
+fn runtime_buffer_equals_reference<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+) -> Result<ir::FuncRef, String> {
+    let mut signature = module.make_signature();
+    signature.params.extend([
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+    ]);
+    signature.returns.push(AbiParam::new(types::I8));
+    let function = module
+        .declare_function(
+            reimer_runtime::BUFFER_EQUALS_SYMBOL,
             Linkage::Import,
             &signature,
         )
@@ -3065,14 +2770,14 @@ fn emit_type_stride(
     layouts: &Layouts,
     target: Type,
 ) -> Result<Emitted, String> {
-    let size = if target.is_composite() {
-        layouts.aggregate(target)?.value.size
-    } else {
-        scalar_layout(target)?.size
-    };
+    let size = layouts.value_layout(target)?.size;
     Ok(Emitted::value(
         builder.ins().iconst(pointer_type(), i64::from(size.max(1))),
     ))
+}
+
+fn type_index(id: TypeId) -> Result<usize, String> {
+    usize::try_from(id.0).map_err(|_| format!("type id {} does not fit this host", id.0))
 }
 
 fn emit_string_from_parts<M: Module>(
@@ -4954,6 +4659,17 @@ fn emit_binary<M: Module>(
     }
     let left = require_value(emitted_left, "left binary operand")?;
     let right = require_value(emitted_right, "right binary operand")?;
+    if operand_type.is_composite()
+        && matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
+    {
+        let equal = emit_value_equality(builder, module, state, operand_type, left, right)?;
+        let value = if operator == BinaryOperator::Equal {
+            equal
+        } else {
+            builder.ins().icmp_imm_s(IntCC::Equal, equal, 0)
+        };
+        return Ok(Emitted::value(value));
+    }
     let value = if operand_type.is_float() {
         match operator {
             BinaryOperator::Add => builder.ins().fadd(left, right),
@@ -5012,6 +4728,267 @@ fn emit_binary<M: Module>(
         }
     };
     Ok(Emitted::value(value))
+}
+
+fn emit_value_equality<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    ty: Type,
+    left: Value,
+    right: Value,
+) -> Result<Value, String> {
+    if ty == Type::Unit {
+        return Ok(builder.ins().iconst(types::I8, 1));
+    }
+    if ty == Type::Str {
+        return emit_string_equality(builder, module, state.layouts, left, right);
+    }
+    if !ty.is_composite() {
+        return Ok(if ty.is_float() {
+            builder.ins().fcmp(FloatCC::Equal, left, right)
+        } else {
+            builder.ins().icmp(IntCC::Equal, left, right)
+        });
+    }
+    if let Some(fields) = state.layouts.product_fields(ty) {
+        let fields = fields.to_vec();
+        let layout = state.layouts.aggregate(ty)?;
+        let AggregateLayoutKind::Product { offsets } = &layout.kind else {
+            return Err("product metadata does not match its native layout".to_owned());
+        };
+        return emit_product_equality(builder, module, state, &fields, offsets, left, right);
+    }
+    if let Some((element, length, stride)) = state.layouts.array_shape(ty) {
+        return emit_array_equality(builder, module, state, element, length, stride, left, right);
+    }
+    if let Some(variants) = state.layouts.enum_variants(ty) {
+        let variants = variants.to_vec();
+        let layout = state.layouts.aggregate(ty)?;
+        let AggregateLayoutKind::Enum { variants: offsets } = &layout.kind else {
+            return Err("enum metadata does not match its native layout".to_owned());
+        };
+        return emit_enum_equality(builder, module, state, &variants, offsets, left, right);
+    }
+    Err(format!("type `{ty}` has no structural equality layout"))
+}
+
+fn emit_product_equality<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    fields: &[Type],
+    offsets: &[u32],
+    left: Value,
+    right: Value,
+) -> Result<Value, String> {
+    if fields.len() != offsets.len() {
+        return Err("product equality metadata has inconsistent field counts".to_owned());
+    }
+    let mut equal = builder.ins().iconst(types::I8, 1);
+    for (field, offset) in fields.iter().zip(offsets) {
+        let left_address = address_at_offset(builder, left, *offset);
+        let right_address = address_at_offset(builder, right, *offset);
+        let left_field = load_at_address(builder, *field, left_address)?;
+        let right_field = load_at_address(builder, *field, right_address)?;
+        if field.has_runtime_value() {
+            let field_equal = emit_value_equality(
+                builder,
+                module,
+                state,
+                *field,
+                require_value(left_field, "left equality field")?,
+                require_value(right_field, "right equality field")?,
+            )?;
+            equal = builder.ins().band(equal, field_equal);
+        }
+    }
+    Ok(equal)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "array equality lowering needs the complete checked layout tuple"
+)]
+fn emit_array_equality<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    element: Type,
+    length: u64,
+    stride: u32,
+    left: Value,
+    right: Value,
+) -> Result<Value, String> {
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(header, pointer_type());
+    builder.append_block_param(header, types::I8);
+    builder.append_block_param(done, types::I8);
+    let zero = builder.ins().iconst(pointer_type(), 0);
+    let initially_equal = builder.ins().iconst(types::I8, 1);
+    builder.ins().jump(
+        header,
+        &[BlockArg::from(zero), BlockArg::from(initially_equal)],
+    );
+
+    builder.switch_to_block(header);
+    let index = builder
+        .block_params(header)
+        .first()
+        .copied()
+        .ok_or_else(|| "array equality loop has no index".to_owned())?;
+    let equal = builder
+        .block_params(header)
+        .get(1)
+        .copied()
+        .ok_or_else(|| "array equality loop has no accumulator".to_owned())?;
+    let length = i64::try_from(length)
+        .map_err(|_| "array equality length exceeds native addressing".to_owned())?;
+    let length = builder.ins().iconst(pointer_type(), length);
+    let has_element = builder.ins().icmp(IntCC::UnsignedLessThan, index, length);
+    builder
+        .ins()
+        .brif(has_element, body, &[], done, &[BlockArg::from(equal)]);
+
+    builder.switch_to_block(body);
+    let offset = builder.ins().imul_imm_u(index, i64::from(stride));
+    let left_address = builder.ins().iadd(left, offset);
+    let right_address = builder.ins().iadd(right, offset);
+    let left_element = load_at_address(builder, element, left_address)?;
+    let right_element = load_at_address(builder, element, right_address)?;
+    let element_equal = if element.has_runtime_value() {
+        emit_value_equality(
+            builder,
+            module,
+            state,
+            element,
+            require_value(left_element, "left array element")?,
+            require_value(right_element, "right array element")?,
+        )?
+    } else {
+        builder.ins().iconst(types::I8, 1)
+    };
+    let equal = builder.ins().band(equal, element_equal);
+    let next = builder.ins().iadd_imm_u(index, 1);
+    builder
+        .ins()
+        .jump(header, &[BlockArg::from(next), BlockArg::from(equal)]);
+
+    builder.switch_to_block(done);
+    builder
+        .block_params(done)
+        .first()
+        .copied()
+        .ok_or_else(|| "array equality result is missing".to_owned())
+}
+
+fn emit_enum_equality<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    variants: &[Vec<Type>],
+    offsets: &[Vec<u32>],
+    left: Value,
+    right: Value,
+) -> Result<Value, String> {
+    if variants.len() != offsets.len() {
+        return Err("enum equality metadata has inconsistent variant counts".to_owned());
+    }
+    let dispatch = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I8);
+    let left_discriminant = builder.ins().load(types::I32, MemFlagsData::new(), left, 0);
+    let right_discriminant = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), right, 0);
+    let same_variant = builder
+        .ins()
+        .icmp(IntCC::Equal, left_discriminant, right_discriminant);
+    let not_equal = builder.ins().iconst(types::I8, 0);
+    builder.ins().brif(
+        same_variant,
+        dispatch,
+        &[],
+        merge,
+        &[BlockArg::from(not_equal)],
+    );
+
+    builder.switch_to_block(dispatch);
+    for (index, (fields, field_offsets)) in variants.iter().zip(offsets).enumerate() {
+        let variant_block = builder.create_block();
+        let next = builder.create_block();
+        let discriminant = i64::try_from(index)
+            .map_err(|_| "enum variant index exceeds native discriminant".to_owned())?;
+        let selected = builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, left_discriminant, discriminant);
+        builder.ins().brif(selected, variant_block, &[], next, &[]);
+        builder.switch_to_block(variant_block);
+        let equal =
+            emit_product_equality(builder, module, state, fields, field_offsets, left, right)?;
+        builder.ins().jump(merge, &[BlockArg::from(equal)]);
+        builder.switch_to_block(next);
+    }
+    builder.ins().jump(merge, &[BlockArg::from(not_equal)]);
+    builder.switch_to_block(merge);
+    builder
+        .block_params(merge)
+        .first()
+        .copied()
+        .ok_or_else(|| "enum equality result is missing".to_owned())
+}
+
+fn emit_string_equality<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    layouts: &Layouts,
+    left: Value,
+    right: Value,
+) -> Result<Value, String> {
+    let layout = layouts.aggregate(Type::Str)?;
+    let AggregateLayoutKind::Slice {
+        data_offset,
+        length_offset,
+    } = layout.kind
+    else {
+        return Err("string equality requires a string view layout".to_owned());
+    };
+    let left_data = builder.ins().load(
+        pointer_type(),
+        MemFlagsData::new(),
+        left,
+        i32::try_from(data_offset).map_err(|_| "string data offset exceeds i32".to_owned())?,
+    );
+    let left_length = builder.ins().load(
+        pointer_type(),
+        MemFlagsData::new(),
+        left,
+        i32::try_from(length_offset).map_err(|_| "string length offset exceeds i32".to_owned())?,
+    );
+    let right_data = builder.ins().load(
+        pointer_type(),
+        MemFlagsData::new(),
+        right,
+        i32::try_from(data_offset).map_err(|_| "string data offset exceeds i32".to_owned())?,
+    );
+    let right_length = builder.ins().load(
+        pointer_type(),
+        MemFlagsData::new(),
+        right,
+        i32::try_from(length_offset).map_err(|_| "string length offset exceeds i32".to_owned())?,
+    );
+    let function = runtime_buffer_equals_reference(builder, module)?;
+    let call = builder.ins().call(
+        function,
+        &[left_data, left_length, right_data, right_length],
+    );
+    builder
+        .inst_results(call)
+        .first()
+        .copied()
+        .ok_or_else(|| "string equality call has no result".to_owned())
 }
 
 fn emit_checked_arithmetic<M: Module>(
@@ -6022,6 +5999,22 @@ fn call_jit_entry(pointer: *const u8) -> Result<i32, Vec<Diagnostic>> {
     Ok(function())
 }
 
+#[expect(
+    unsafe_code,
+    reason = "Cranelift exposes finalized JIT functions as raw instruction pointers"
+)]
+fn call_jit_unit(pointer: *const u8) -> Result<(), Vec<Diagnostic>> {
+    if pointer.is_null() {
+        return Err(backend_error("Cranelift returned a null unit-test pointer"));
+    }
+
+    // SAFETY: The resolver only records zero-argument, unit-returning functions
+    // as tests, and the live JIT module finalized this pointer for that ABI.
+    let function = unsafe { std::mem::transmute::<*const u8, extern "C" fn()>(pointer) };
+    function();
+    Ok(())
+}
+
 fn backend_error(message: impl Into<String>) -> Vec<Diagnostic> {
     vec![
         Diagnostic::error(
@@ -6041,7 +6034,8 @@ mod tests {
     use reimer_resolver::resolve;
 
     use super::{
-        OptimizationLevel, emit_object, emit_object_with_options, execute, execute_with_options,
+        OptimizationLevel, emit_object, emit_object_with_options, execute, execute_test,
+        execute_with_options,
     };
 
     fn compile_fixture(source: &str) -> reimer_hir::Program {
@@ -6083,6 +6077,19 @@ mod tests {
             .expect("optimized fixture should execute");
 
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_test_should_run_a_discovered_unit_test() {
+        let program = compile_fixture(
+            "@test
+             fn arithmetic_should_work() {
+                 if 20 + 22 != 42 { panic(\"unexpected arithmetic result\"); }
+             }
+             fn main() -> i32 { 0 }",
+        );
+
+        execute_test(&program, 0).expect("annotated test should execute");
     }
 
     #[test]
@@ -6288,6 +6295,34 @@ mod tests {
         );
 
         let result = execute(&program).expect("fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_compare_derived_aggregate_values_structurally() {
+        let program = compile_fixture(
+            "@derive(Copy, Eq)
+             struct Pair { left: i32, right: i32 }
+             @derive(Copy, Eq)
+             enum Value {
+                 Empty,
+                 Pair(Pair),
+                 Numbers([i32; 2]),
+             }
+             fn main() -> i32 {
+                 let left = Value::Pair(Pair { left: 20, right: 22 });
+                 let same = Value::Pair(Pair { left: 20, right: 22 });
+                 let different = Value::Numbers([20, 22]);
+                 if left == same && left != different && [20, 22] == [20, 22] {
+                     42
+                 } else {
+                     0
+                 }
+             }",
+        );
+
+        let result = execute(&program).expect("derived equality fixture should execute");
 
         assert_eq!(result, 42);
     }

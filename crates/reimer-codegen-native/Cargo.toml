@@ -16,6 +16,7 @@ cranelift-object = { version = "0.134.2", default-features = false }
 libloading = "0.9.0"
 reimer-diagnostics = { path = "../reimer-diagnostics" }
 reimer-hir = { path = "../reimer-hir" }
+reimer-layout = { path = "../reimer-layout" }
 reimer-runtime = { path = "../reimer-runtime" }
 reimer-types = { path = "../reimer-types" }
 

@@ -858,6 +858,18 @@ impl Loader {
                         &mut self.diagnostics,
                     );
                 }
+                Item::Constant(declaration) if declaration.is_public => {
+                    insert_symbol(
+                        api,
+                        declaration.name.name.clone(),
+                        Symbol {
+                            canonical: canonical_name(module_name, &declaration.name.name),
+                        },
+                        declaration.name.span,
+                        &self.sources,
+                        &mut self.diagnostics,
+                    );
+                }
                 _ => {}
             }
         }
@@ -1014,7 +1026,10 @@ impl Loader {
                 Item::Trait(declaration) => {
                     Some((declaration.name.name.clone(), declaration.name.span))
                 }
-                Item::Import(_) | Item::Impl(_) => None,
+                Item::Constant(declaration) => {
+                    Some((declaration.name.name.clone(), declaration.name.span))
+                }
+                Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => None,
             };
             if let Some((name, span)) = declaration {
                 insert_symbol(
@@ -1269,6 +1284,11 @@ fn collect_qualified_paths(program: &ast::Program) -> Vec<&ast::Path> {
                     visit_block_paths(&method.body, &mut paths);
                 }
             }
+            Item::Constant(declaration) => {
+                visit_type_paths(&declaration.ty, &mut paths);
+                visit_expression_paths(&declaration.value, &mut paths);
+            }
+            Item::Comptime(block) => visit_block_paths(&block.body, &mut paths),
         }
     }
     paths
@@ -1419,6 +1439,12 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
         }
         Expression::Call(call) => {
             visit_expression_paths(&call.callee, paths);
+            for argument in &call.generic_arguments {
+                match argument {
+                    ast::GenericArgument::Type(ty) => visit_type_paths(ty, paths),
+                    ast::GenericArgument::Const(value) => visit_expression_paths(value, paths),
+                }
+            }
             for argument in &call.arguments {
                 visit_expression_paths(argument, paths);
             }
@@ -1525,6 +1551,19 @@ impl ItemRewriteContext<'_> {
             Item::Enum(declaration) => self.rewrite_enum(declaration),
             Item::Trait(declaration) => self.rewrite_trait(declaration),
             Item::Impl(declaration) => self.rewrite_impl(declaration),
+            Item::Constant(declaration) => {
+                rewrite_identifier(&mut declaration.name, self.module);
+                rewrite_type(&mut declaration.ty, self.scope, self.apis, self.diagnostics);
+                rewrite_expression(
+                    &mut declaration.value,
+                    self.scope,
+                    self.apis,
+                    self.diagnostics,
+                );
+            }
+            Item::Comptime(block) => {
+                rewrite_block(&mut block.body, self.scope, self.apis, self.diagnostics);
+            }
         }
     }
 
@@ -1808,6 +1847,16 @@ fn rewrite_expression(
         }
         Expression::Call(call) => {
             rewrite_expression(&mut call.callee, scope, apis, diagnostics);
+            for argument in &mut call.generic_arguments {
+                match argument {
+                    ast::GenericArgument::Type(ty) => {
+                        rewrite_type(ty, scope, apis, diagnostics);
+                    }
+                    ast::GenericArgument::Const(value) => {
+                        rewrite_expression(value, scope, apis, diagnostics);
+                    }
+                }
+            }
             for argument in &mut call.arguments {
                 rewrite_expression(argument, scope, apis, diagnostics);
             }

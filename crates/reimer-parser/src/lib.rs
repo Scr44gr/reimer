@@ -3,14 +3,15 @@
 use std::mem::discriminant;
 
 use reimer_ast::{
-    ArrayExpression, AssignmentExpression, AssignmentOperator, BinaryExpression, BinaryOperator,
-    Block, BooleanLiteral, BreakStatement, CallExpression, CastExpression, CharacterLiteral,
-    DeferStatement, EnumDeclaration, EnumVariant, EnumVariantPayload, Expression,
-    ExpressionStatement, ExternFunction, FieldExpression, FieldInitializer, FieldName,
-    FloatLiteral, ForStatement, Function, GenericArgument, GenericParameter, Identifier,
-    IfExpression, ImplDeclaration, ImportDeclaration, ImportKind, ImportedName, IndexExpression,
-    IntegerLiteral, Item, LetStatement, LoopExpression, MatchArm, MatchExpression, Parameter, Path,
-    Pattern, PatternField, Program, ReturnStatement, Statement, StringLiteral, StructDeclaration,
+    ArrayExpression, AssignmentExpression, AssignmentOperator, Attribute, AttributeArgument,
+    BinaryExpression, BinaryOperator, Block, BooleanLiteral, BreakStatement, CallExpression,
+    CastExpression, CharacterLiteral, ComptimeBlock, ConstantDeclaration, DeferStatement,
+    EnumDeclaration, EnumVariant, EnumVariantPayload, Expression, ExpressionStatement,
+    ExternFunction, FieldExpression, FieldInitializer, FieldName, FloatLiteral, ForStatement,
+    Function, GenericArgument, GenericParameter, Identifier, IfExpression, ImplDeclaration,
+    ImportDeclaration, ImportKind, ImportedName, IndexExpression, IntegerLiteral, Item,
+    LetStatement, LoopExpression, MatchArm, MatchExpression, Parameter, Path, Pattern,
+    PatternField, Program, ReturnStatement, Statement, StringLiteral, StructDeclaration,
     StructExpression, StructField, TraitDeclaration, TraitMethod, TupleExpression, TypeName,
     TypeNameKind, UnaryExpression, UnaryOperator, WherePredicate, WhileStatement,
 };
@@ -64,39 +65,54 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_item(&mut self) -> Option<Vec<Item>> {
-        if self.at(&TokenKind::At) {
-            let attribute = self.token_at(1);
-            return match &attribute.kind {
-                TokenKind::Identifier(name) if name == "repr" => self
-                    .parse_repr_c_struct_declaration()
-                    .map(|declaration| vec![Item::Struct(declaration)]),
-                TokenKind::Identifier(name) if name == "link" => self.parse_extern_declarations(),
-                _ => {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            "E1005",
-                            "unsupported top-level attribute",
-                            Span::new(self.current().span.start, attribute.span.end),
-                        )
-                        .with_help("M5 supports `@repr(C)` and `@link(\"library\")`"),
-                    );
-                    None
-                }
-            };
+        let attributes = self.parse_attributes()?;
+        let has_visibility = self.at(&TokenKind::Pub);
+        let declaration_offset = usize::from(has_visibility);
+        let declaration = &self.token_at(declaration_offset).kind;
+
+        if matches!(declaration, TokenKind::Comptime)
+            && self.at_offset(declaration_offset + 1, &TokenKind::LeftBrace)
+        {
+            return self.parse_comptime_item(&attributes, has_visibility);
         }
         if self.at(&TokenKind::Extern)
             || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Extern))
         {
-            return self.parse_extern_declarations();
+            return self.parse_extern_declarations(&attributes);
         }
         if self.at(&TokenKind::Fn)
             || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Fn))
+            || (self.at(&TokenKind::Comptime) && self.at_offset(1, &TokenKind::Fn))
+            || (self.at(&TokenKind::Pub)
+                && self.at_offset(1, &TokenKind::Comptime)
+                && self.at_offset(2, &TokenKind::Fn))
         {
             return self
-                .parse_function()
+                .parse_function(attributes)
                 .map(|function| vec![Item::Function(function)]);
         }
+        if self.at(&TokenKind::Const)
+            || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Const))
+        {
+            if !attributes.is_empty() {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E1020",
+                        "M10 attributes do not apply to constants",
+                        attributes[0].span,
+                    )
+                    .with_help("remove the attribute from the constant declaration"),
+                );
+                return None;
+            }
+            return self
+                .parse_constant_declaration()
+                .map(|constant| vec![Item::Constant(constant)]);
+        }
         if self.at(&TokenKind::Impl) {
+            if !attributes.is_empty() {
+                return self.unsupported_attribute_target(&attributes, "implementation block");
+            }
             return self
                 .parse_impl_declaration()
                 .map(|declaration| vec![Item::Impl(declaration)]);
@@ -105,6 +121,9 @@ impl<'tokens> Parser<'tokens> {
         if self.at(&TokenKind::Trait)
             || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Trait))
         {
+            if !attributes.is_empty() {
+                return self.unsupported_attribute_target(&attributes, "trait declaration");
+            }
             return self
                 .parse_trait_declaration()
                 .map(|declaration| vec![Item::Trait(declaration)]);
@@ -114,7 +133,7 @@ impl<'tokens> Parser<'tokens> {
             || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Struct))
         {
             return self
-                .parse_struct_declaration()
+                .parse_struct_declaration(attributes)
                 .map(|declaration| vec![Item::Struct(declaration)]);
         }
 
@@ -122,7 +141,7 @@ impl<'tokens> Parser<'tokens> {
             || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Enum))
         {
             return self
-                .parse_enum_declaration()
+                .parse_enum_declaration(attributes)
                 .map(|declaration| vec![Item::Enum(declaration)]);
         }
 
@@ -131,6 +150,9 @@ impl<'tokens> Parser<'tokens> {
             || (self.at(&TokenKind::Pub)
                 && matches!(&self.token_at(1).kind, TokenKind::From | TokenKind::Import))
         {
+            if !attributes.is_empty() {
+                return self.unsupported_attribute_target(&attributes, "import declaration");
+            }
             return self
                 .parse_import()
                 .map(|declaration| vec![Item::Import(declaration)]);
@@ -138,49 +160,126 @@ impl<'tokens> Parser<'tokens> {
 
         let token = self.current();
         self.diagnostics.push(
-            Diagnostic::error(
-                "E1001",
-                "expected a function or import declaration",
-                token.span,
-            )
-            .with_help("start the declaration with `fn`, `struct`, `enum`, or an import"),
+            Diagnostic::error("E1001", "expected a declaration", token.span).with_help(
+                "start with `fn`, `const`, `comptime`, `struct`, `enum`, `trait`, or an import",
+            ),
         );
         None
     }
 
-    fn parse_struct_declaration(&mut self) -> Option<StructDeclaration> {
-        let start = self.current().span.start;
-        self.parse_struct_declaration_with_representation(start, false)
-    }
-
-    fn parse_repr_c_struct_declaration(&mut self) -> Option<StructDeclaration> {
-        let start = self.current().span.start;
-        self.expect_symbol(&TokenKind::At, "`@` before `repr`")?;
-        let attribute = self.expect_identifier("attribute name")?;
-        if attribute.name != "repr" {
-            return None;
-        }
-        self.expect_symbol(&TokenKind::LeftParen, "`(` after `repr`")?;
-        let representation = self.expect_identifier("representation name")?;
-        if representation.name != "C" {
+    fn parse_comptime_item(
+        &mut self,
+        attributes: &[Attribute],
+        has_visibility: bool,
+    ) -> Option<Vec<Item>> {
+        if has_visibility {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "E1005",
-                    format!("unsupported representation `{}`", representation.name),
-                    representation.span,
+                    "E1020",
+                    "an unnamed `comptime` block cannot be public",
+                    self.current().span,
                 )
-                .with_help("M5 supports only `@repr(C)`"),
+                .with_help("remove `pub` from the block"),
             );
+            return None;
         }
-        self.expect_symbol(&TokenKind::RightParen, "`)` after `repr(C`")?;
-        self.parse_struct_declaration_with_representation(start, true)
+        if !attributes.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E1020",
+                    "attributes cannot be attached to an unnamed `comptime` block",
+                    attributes[0].span,
+                )
+                .with_help("attach the attribute to a function or type declaration"),
+            );
+            return None;
+        }
+        self.parse_comptime_block()
+            .map(|block| vec![Item::Comptime(block)])
     }
 
-    fn parse_struct_declaration_with_representation(
+    fn parse_attributes(&mut self) -> Option<Vec<Attribute>> {
+        let mut attributes = Vec::new();
+        while let Some(at) = self.take(&TokenKind::At) {
+            let name = self.expect_identifier("attribute name")?;
+            let mut arguments = Vec::new();
+            let end = if self.take(&TokenKind::LeftParen).is_some() {
+                if !self.at(&TokenKind::RightParen) {
+                    loop {
+                        arguments.push(self.parse_attribute_argument()?);
+                        if self.take(&TokenKind::Comma).is_none() || self.at(&TokenKind::RightParen)
+                        {
+                            break;
+                        }
+                    }
+                }
+                self.expect_symbol(&TokenKind::RightParen, "`)` after attribute arguments")?
+                    .span
+                    .end
+            } else {
+                name.span.end
+            };
+            attributes.push(Attribute {
+                name,
+                arguments,
+                span: Span::new(at.span.start, end),
+            });
+        }
+        Some(attributes)
+    }
+
+    fn parse_attribute_argument(&mut self) -> Option<AttributeArgument> {
+        let token = self.advance();
+        match token.kind {
+            TokenKind::Identifier(name) => Some(AttributeArgument::Identifier(Identifier {
+                name,
+                span: token.span,
+            })),
+            TokenKind::Integer(spelling) => {
+                let Expression::Integer(literal) =
+                    self.parse_integer_literal(&spelling, token.span)?
+                else {
+                    return None;
+                };
+                Some(AttributeArgument::Integer(literal))
+            }
+            TokenKind::String(value) => Some(AttributeArgument::String(StringLiteral {
+                value,
+                span: token.span,
+            })),
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error("E1020", "invalid attribute argument", token.span)
+                        .with_help("use an identifier, integer, or string literal"),
+                );
+                None
+            }
+        }
+    }
+
+    fn unsupported_attribute_target(
         &mut self,
-        start: usize,
-        repr_c: bool,
+        attributes: &[Attribute],
+        target: &str,
+    ) -> Option<Vec<Item>> {
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E1020",
+                format!("attributes are not supported on this {target}"),
+                attributes[0].span,
+            )
+            .with_help("move the attribute to a function, struct, or enum"),
+        );
+        None
+    }
+
+    fn parse_struct_declaration(
+        &mut self,
+        attributes: Vec<Attribute>,
     ) -> Option<StructDeclaration> {
+        let start = attributes
+            .first()
+            .map_or(self.current().span.start, |attribute| attribute.span.start);
         let is_public = self.take(&TokenKind::Pub).is_some();
         self.expect_symbol(&TokenKind::Struct, "`struct`")?;
         let name = self.expect_identifier("struct name")?;
@@ -190,10 +289,10 @@ impl<'tokens> Parser<'tokens> {
         let fields = self.parse_struct_fields()?;
         let end = self.expect_symbol(&TokenKind::RightBrace, "`}` after struct fields")?;
         Some(StructDeclaration {
+            attributes,
             is_public,
             name,
             generic_parameters,
-            repr_c,
             fields,
             where_predicates,
             span: Span::new(start, end.span.end),
@@ -222,8 +321,10 @@ impl<'tokens> Parser<'tokens> {
         Some(fields)
     }
 
-    fn parse_enum_declaration(&mut self) -> Option<EnumDeclaration> {
-        let start = self.current().span.start;
+    fn parse_enum_declaration(&mut self, attributes: Vec<Attribute>) -> Option<EnumDeclaration> {
+        let start = attributes
+            .first()
+            .map_or(self.current().span.start, |attribute| attribute.span.start);
         let is_public = self.take(&TokenKind::Pub).is_some();
         self.expect_symbol(&TokenKind::Enum, "`enum`")?;
         let name = self.expect_identifier("enum name")?;
@@ -239,6 +340,7 @@ impl<'tokens> Parser<'tokens> {
         }
         let end = self.expect_symbol(&TokenKind::RightBrace, "`}` after enum variants")?;
         Some(EnumDeclaration {
+            attributes,
             is_public,
             name,
             generic_parameters,
@@ -283,13 +385,20 @@ impl<'tokens> Parser<'tokens> {
         Some(types)
     }
 
-    fn parse_function(&mut self) -> Option<Function> {
-        self.parse_function_with_receiver(None)
+    fn parse_function(&mut self, attributes: Vec<Attribute>) -> Option<Function> {
+        self.parse_function_with_receiver(None, attributes)
     }
 
-    fn parse_function_with_receiver(&mut self, receiver: Option<&TypeName>) -> Option<Function> {
-        let start = self.current().span.start;
+    fn parse_function_with_receiver(
+        &mut self,
+        receiver: Option<&TypeName>,
+        attributes: Vec<Attribute>,
+    ) -> Option<Function> {
+        let start = attributes
+            .first()
+            .map_or(self.current().span.start, |attribute| attribute.span.start);
         let is_public = self.take(&TokenKind::Pub).is_some();
+        let is_comptime = self.take(&TokenKind::Comptime).is_some();
         self.expect(
             &TokenKind::Fn,
             "E1001",
@@ -311,6 +420,8 @@ impl<'tokens> Parser<'tokens> {
         let span = Span::new(start, body.span.end);
 
         Some(Function {
+            attributes,
+            is_comptime,
             is_public,
             name,
             generic_parameters,
@@ -319,6 +430,34 @@ impl<'tokens> Parser<'tokens> {
             where_predicates,
             body,
             span,
+        })
+    }
+
+    fn parse_constant_declaration(&mut self) -> Option<ConstantDeclaration> {
+        let start = self.current().span.start;
+        let is_public = self.take(&TokenKind::Pub).is_some();
+        self.expect_symbol(&TokenKind::Const, "`const`")?;
+        let name = self.expect_identifier("constant name")?;
+        self.expect_symbol(&TokenKind::Colon, "`:` after the constant name")?;
+        let ty = self.parse_type_name()?;
+        self.expect_symbol(&TokenKind::Equal, "`=` before the constant value")?;
+        let value = self.parse_expression()?;
+        let end = self.expect_symbol(&TokenKind::Semicolon, "`;` after the constant")?;
+        Some(ConstantDeclaration {
+            is_public,
+            name,
+            ty,
+            value,
+            span: Span::new(start, end.span.end),
+        })
+    }
+
+    fn parse_comptime_block(&mut self) -> Option<ComptimeBlock> {
+        let start = self.expect_symbol(&TokenKind::Comptime, "`comptime`")?;
+        let body = self.parse_block()?;
+        Some(ComptimeBlock {
+            span: Span::new(start.span.start, body.span.end),
+            body,
         })
     }
 
@@ -335,8 +474,13 @@ impl<'tokens> Parser<'tokens> {
         self.expect_symbol(&TokenKind::LeftBrace, "`{` before implementation methods")?;
         let mut methods = Vec::new();
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
+            let attributes = self.parse_attributes()?;
             if !(self.at(&TokenKind::Fn)
-                || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Fn)))
+                || (self.at(&TokenKind::Pub) && self.at_offset(1, &TokenKind::Fn))
+                || (self.at(&TokenKind::Comptime) && self.at_offset(1, &TokenKind::Fn))
+                || (self.at(&TokenKind::Pub)
+                    && self.at_offset(1, &TokenKind::Comptime)
+                    && self.at_offset(2, &TokenKind::Fn)))
             {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -348,7 +492,7 @@ impl<'tokens> Parser<'tokens> {
                 );
                 return None;
             }
-            methods.push(self.parse_function_with_receiver(Some(&target))?);
+            methods.push(self.parse_function_with_receiver(Some(&target), attributes)?);
         }
         let end = self.expect_symbol(&TokenKind::RightBrace, "`}` after implementation methods")?;
         Some(ImplDeclaration {
@@ -424,13 +568,11 @@ impl<'tokens> Parser<'tokens> {
         })
     }
 
-    fn parse_extern_declarations(&mut self) -> Option<Vec<Item>> {
-        let start = self.current().span.start;
-        let link = if self.at(&TokenKind::At) {
-            Some(self.parse_link_attribute()?)
-        } else {
-            None
-        };
+    fn parse_extern_declarations(&mut self, attributes: &[Attribute]) -> Option<Vec<Item>> {
+        let start = attributes
+            .first()
+            .map_or(self.current().span.start, |attribute| attribute.span.start);
+        let link = self.parse_extern_link(attributes).ok()?;
         let is_public = self.take(&TokenKind::Pub).is_some();
         self.expect_symbol(&TokenKind::Extern, "`extern`")?;
         let abi_token = self.advance();
@@ -486,23 +628,33 @@ impl<'tokens> Parser<'tokens> {
         Some(vec![Item::ExternFunction(function)])
     }
 
-    fn parse_link_attribute(&mut self) -> Option<String> {
-        self.expect_symbol(&TokenKind::At, "`@` before `link`")?;
-        let attribute = self.expect_identifier("attribute name")?;
-        if attribute.name != "link" {
-            return None;
+    fn parse_extern_link(&mut self, attributes: &[Attribute]) -> Result<Option<String>, ()> {
+        if attributes.is_empty() {
+            return Ok(None);
         }
-        self.expect_symbol(&TokenKind::LeftParen, "`(` after `link`")?;
-        let library = self.advance();
-        let TokenKind::String(library) = library.kind else {
+        if attributes.len() != 1 || attributes[0].name.name != "link" {
             self.diagnostics.push(
-                Diagnostic::error("E1005", "expected a library string", library.span)
-                    .with_help("write `@link(\"library\")`"),
+                Diagnostic::error(
+                    "E1020",
+                    "native declarations accept only `@link(\"library\")`",
+                    attributes[0].span,
+                )
+                .with_help("remove other attributes from the native declaration"),
             );
-            return None;
+            return Err(());
+        }
+        let [AttributeArgument::String(library)] = attributes[0].arguments.as_slice() else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E1020",
+                    "`@link` expects exactly one string literal",
+                    attributes[0].span,
+                )
+                .with_help("write `@link(\"library\")`"),
+            );
+            return Err(());
         };
-        self.expect_symbol(&TokenKind::RightParen, "`)` after the link library")?;
-        Some(library)
+        Ok(Some(library.value.clone()))
     }
 
     fn parse_extern_function_signature(
@@ -901,33 +1053,7 @@ impl<'tokens> Parser<'tokens> {
         }
         let path = self.parse_path()?;
         if self.take(&TokenKind::Less).is_some() {
-            let mut arguments = Vec::new();
-            loop {
-                let argument = if matches!(
-                    self.current().kind,
-                    TokenKind::Integer(_)
-                        | TokenKind::True
-                        | TokenKind::False
-                        | TokenKind::Character(_)
-                        | TokenKind::Minus
-                        | TokenKind::Bang
-                        | TokenKind::LeftBrace
-                ) {
-                    GenericArgument::Const(self.parse_const_argument_expression()?)
-                } else {
-                    GenericArgument::Type(self.parse_type_name()?)
-                };
-                arguments.push(argument);
-                if self.at_type_greater() {
-                    break;
-                }
-                if self.take(&TokenKind::Comma).is_none() {
-                    break;
-                }
-                if self.at_type_greater() {
-                    break;
-                }
-            }
+            let arguments = self.parse_generic_argument_list()?;
             self.expect_type_greater()?;
             let end = self.previous_type_end(path.span.end);
             return Some(TypeName {
@@ -1380,12 +1506,24 @@ impl<'tokens> Parser<'tokens> {
         let mut expression = self.parse_primary()?;
 
         loop {
+            let generic_arguments =
+                if matches!(&expression, Expression::Path(_) | Expression::Field(_))
+                    && self.generic_call_arguments_follow()
+                {
+                    self.expect_symbol(&TokenKind::Less, "`<` before generic call arguments")?;
+                    let arguments = self.parse_generic_argument_list()?;
+                    self.expect_type_greater()?;
+                    arguments
+                } else {
+                    Vec::new()
+                };
             if self.take(&TokenKind::LeftParen).is_some() {
                 let start = expression.span().start;
                 let arguments = self.parse_arguments()?;
                 let end = self.expect_symbol(&TokenKind::RightParen, "`)` after call arguments")?;
                 expression = Expression::Call(Box::new(CallExpression {
                     callee: expression,
+                    generic_arguments,
                     arguments,
                     span: Span::new(start, end.span.end),
                 }));
@@ -1461,6 +1599,55 @@ impl<'tokens> Parser<'tokens> {
         }
 
         Some(expression)
+    }
+
+    fn parse_generic_argument_list(&mut self) -> Option<Vec<GenericArgument>> {
+        let mut arguments = Vec::new();
+        loop {
+            let argument = if matches!(
+                self.current().kind,
+                TokenKind::Integer(_)
+                    | TokenKind::True
+                    | TokenKind::False
+                    | TokenKind::Character(_)
+                    | TokenKind::Minus
+                    | TokenKind::Bang
+                    | TokenKind::LeftBrace
+            ) {
+                GenericArgument::Const(self.parse_const_argument_expression()?)
+            } else {
+                GenericArgument::Type(self.parse_type_name()?)
+            };
+            arguments.push(argument);
+            if self.at_type_greater() {
+                break;
+            }
+            if self.take(&TokenKind::Comma).is_none() || self.at_type_greater() {
+                break;
+            }
+        }
+        Some(arguments)
+    }
+
+    fn generic_call_arguments_follow(&self) -> bool {
+        if !self.at(&TokenKind::Less) {
+            return false;
+        }
+        let mut depth = 0_i32;
+        let mut offset = 0;
+        loop {
+            match self.token_at(offset).kind {
+                TokenKind::Less => depth += 1,
+                TokenKind::Greater => depth -= 1,
+                TokenKind::RightShift => depth -= 2,
+                TokenKind::Eof | TokenKind::Semicolon | TokenKind::LeftBrace => return false,
+                _ => {}
+            }
+            if depth <= 0 {
+                return offset > 0 && self.at_offset(offset + 1, &TokenKind::LeftParen);
+            }
+            offset += 1;
+        }
     }
 
     fn parse_arguments(&mut self) -> Option<Vec<Expression>> {
@@ -2392,7 +2579,55 @@ mod tests {
 
         assert!(matches!(
             program.items.as_slice(),
-            [Item::Struct(declaration)] if declaration.repr_c
+            [Item::Struct(declaration)]
+                if matches!(
+                    declaration.attributes.as_slice(),
+                    [reimer_ast::Attribute {
+                        name,
+                        arguments,
+                        ..
+                    }] if name.name == "repr"
+                        && matches!(
+                            arguments.as_slice(),
+                            [reimer_ast::AttributeArgument::Identifier(value)]
+                                if value.name == "C"
+                        )
+                )
+        ));
+    }
+
+    #[test]
+    fn parse_should_build_m10_attributes_constants_and_comptime_items() {
+        let source = "
+            @derive(Copy, Eq, Default)
+            @align(16)
+            struct Pair { left: i32, right: i32 }
+
+            comptime fn factorial(value: usize) -> usize {
+                if value <= 1 { 1 } else { value * factorial(value - 1) }
+            }
+
+            const TABLE_SIZE: usize = factorial(5);
+            comptime { assert(TABLE_SIZE == 120); }
+
+            fn main() -> i32 {
+                let pair = Pair::default();
+                size_of<Pair>() as i32
+            }
+        ";
+        let tokens = lex(source).expect("M10 fixture should lex");
+
+        let program = parse(&tokens).expect("M10 fixture should parse");
+
+        assert!(matches!(
+            program.items.as_slice(),
+            [
+                Item::Struct(_),
+                Item::Function(function),
+                Item::Constant(_),
+                Item::Comptime(_),
+                Item::Function(_)
+            ] if function.is_comptime
         ));
     }
 

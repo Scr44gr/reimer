@@ -22,6 +22,8 @@ pub struct Program {
     pub extern_functions: Vec<ExternFunction>,
     /// Validated executable entry point, absent for libraries.
     pub entry: Option<FunctionId>,
+    /// Zero-argument functions selected by `@test`.
+    pub tests: Vec<FunctionId>,
 }
 
 /// A canonical composite type definition.
@@ -35,8 +37,46 @@ pub struct TypeDefinition {
     pub kind: TypeDefinitionKind,
     /// Externally observable layout policy.
     pub representation: TypeRepresentation,
+    /// Requested minimum alignment in bytes.
+    pub alignment: Option<u32>,
+    /// Compiler-generated structural trait implementations.
+    pub derives: Vec<DerivedTrait>,
+    /// Whether discarding a value of this type should produce a diagnostic.
+    pub must_use: bool,
     /// Source range for named definitions.
     pub span: Span,
+}
+
+/// A closed compiler-supported derive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DerivedTrait {
+    /// Implicit, bitwise duplication.
+    Copy,
+    /// Explicit allocation-free duplication.
+    Clone,
+    /// Developer-facing structural formatting metadata.
+    Debug,
+    /// Structural equality.
+    Eq,
+    /// Structural hashing eligibility.
+    Hash,
+    /// Structural zero/default construction.
+    Default,
+}
+
+impl DerivedTrait {
+    /// Returns the source-level trait spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Copy => "Copy",
+            Self::Clone => "Clone",
+            Self::Debug => "Debug",
+            Self::Eq => "Eq",
+            Self::Hash => "Hash",
+            Self::Default => "Default",
+        }
+    }
 }
 
 /// Layout policy attached to a composite type definition.
@@ -147,6 +187,8 @@ pub struct Function {
     pub name: String,
     /// Whether the function is exported from its module.
     pub is_public: bool,
+    /// Compiler-recognized behavior attributes.
+    pub attributes: FunctionAttributes,
     /// Typed parameters.
     pub parameters: Vec<Parameter>,
     /// Declared return type.
@@ -155,6 +197,17 @@ pub struct Function {
     pub body: Block,
     /// Full source range.
     pub span: Span,
+}
+
+/// Validated function attributes used by diagnostics and backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FunctionAttributes {
+    /// Requests aggressive inlining where the backend can honor it.
+    pub inline: bool,
+    /// Diagnoses discarded call results.
+    pub must_use: bool,
+    /// Registers this zero-argument unit function as a test.
+    pub test: bool,
 }
 
 /// A validated native function declaration.

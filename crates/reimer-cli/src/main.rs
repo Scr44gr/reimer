@@ -3,11 +3,11 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use reimer_cli::{
     check_file, check_graph, compile_file_to_object, compile_graph_to_object, execute_file,
-    execute_graph,
+    execute_file_test, execute_graph, execute_graph_test, file_test_names, graph_test_names,
 };
 use reimer_codegen_native::OptimizationLevel;
 use reimer_project::{BuildProfile, LockMode, Project};
@@ -33,6 +33,10 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         Invocation::Build { options, output } => build(&options, output.as_deref()),
         Invocation::Run(options) => execute(&options),
         Invocation::Test(options) => test(&options),
+        Invocation::RunUnitTest {
+            options,
+            test_index,
+        } => run_unit_test(&options, test_index),
         Invocation::Format { path, check } => format_sources(&path, check),
         Invocation::Clean { path } => clean(&path),
         Invocation::Add(options) => add_dependency(&options),
@@ -123,22 +127,34 @@ fn execute(options: &ProjectOptions) -> Result<(), String> {
 }
 
 fn test(options: &ProjectOptions) -> Result<(), String> {
-    if is_source_file(&options.path) {
-        return Err(
-            "`test` expects a project directory or manifest, not one source file".to_owned(),
-        );
-    }
-
-    let project = open_project(options)?;
-    let entries = project.test_entries().map_err(|error| error.to_string())?;
-    let optimization = selected_optimization(&project, options.profile)?;
-    if entries.is_empty() {
-        println!("no integration tests found");
+    let project = if is_source_file(&options.path) {
+        None
+    } else {
+        Some(open_project(options)?)
+    };
+    let (entries, unit_tests, optimization) = if let Some(project) = &project {
+        let entries = project.test_entries().map_err(|error| error.to_string())?;
+        let entry = project.entry().map_err(|error| error.to_string())?;
+        let tests = graph_test_names(&project.source_graph(&entry))
+            .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+        let optimization = selected_optimization(project, options.profile)?;
+        (entries, tests, optimization)
+    } else {
+        validate_source_path(&options.path)?;
+        let tests = file_test_names(&options.path)
+            .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+        (Vec::new(), tests, profile_optimization(options.profile))
+    };
+    if entries.is_empty() && unit_tests.is_empty() {
+        println!("no tests found");
         return Ok(());
     }
 
     let mut failures = Vec::new();
     for entry in &entries {
+        let project = project
+            .as_ref()
+            .ok_or_else(|| "integration test has no containing project".to_owned())?;
         match execute_graph(&project.source_graph(entry), optimization) {
             Ok(0) => println!("pass {}", entry.display()),
             Ok(code) => {
@@ -151,8 +167,18 @@ fn test(options: &ProjectOptions) -> Result<(), String> {
             }
         }
     }
+    for (test_index, name) in unit_tests.iter().enumerate() {
+        let status = spawn_unit_test(options, test_index)?;
+        if status.success() {
+            println!("pass {name}");
+        } else {
+            println!("fail {name} ({status})");
+            failures.push(format!("{name} terminated with {status}"));
+        }
+    }
+    let total = entries.len() + unit_tests.len();
     if failures.is_empty() {
-        println!("{} integration test(s) passed", entries.len());
+        println!("{total} test(s) passed");
         Ok(())
     } else {
         Err(format!(
@@ -160,6 +186,58 @@ fn test(options: &ProjectOptions) -> Result<(), String> {
             failures.len(),
             failures.join("\n")
         ))
+    }
+}
+
+fn run_unit_test(options: &ProjectOptions, test_index: usize) -> Result<(), String> {
+    if is_source_file(&options.path) {
+        validate_source_path(&options.path)?;
+        return execute_file_test(
+            &options.path,
+            test_index,
+            profile_optimization(options.profile),
+        )
+        .map_err(|diagnostics| render_diagnostics(&diagnostics));
+    }
+    let project = open_project(options)?;
+    let entry = project.entry().map_err(|error| error.to_string())?;
+    let optimization = selected_optimization(&project, options.profile)?;
+    execute_graph_test(&project.source_graph(&entry), test_index, optimization)
+        .map_err(|diagnostics| render_diagnostics(&diagnostics))
+}
+
+fn spawn_unit_test(
+    options: &ProjectOptions,
+    test_index: usize,
+) -> Result<std::process::ExitStatus, String> {
+    let executable =
+        env::current_exe().map_err(|error| format!("failed to locate the test runner: {error}"))?;
+    let mut command = Command::new(executable);
+    command
+        .arg("__run-unit-test")
+        .arg(test_index.to_string())
+        .arg(&options.path);
+    if options.profile == BuildProfile::Release {
+        command.arg("--release");
+    }
+    match options.lock_mode {
+        LockMode::Use => {}
+        LockMode::Locked => {
+            command.arg("--locked");
+        }
+        LockMode::Refresh => {
+            command.arg("--refresh");
+        }
+    }
+    command
+        .status()
+        .map_err(|error| format!("failed to start isolated unit test: {error}"))
+}
+
+fn profile_optimization(profile: BuildProfile) -> OptimizationLevel {
+    match profile {
+        BuildProfile::Debug => OptimizationLevel::None,
+        BuildProfile::Release => OptimizationLevel::Speed,
     }
 }
 
@@ -667,6 +745,10 @@ enum Invocation {
     },
     Run(ProjectOptions),
     Test(ProjectOptions),
+    RunUnitTest {
+        options: ProjectOptions,
+        test_index: usize,
+    },
     Format {
         path: PathBuf,
         check: bool,
@@ -708,6 +790,7 @@ impl Invocation {
             }
             "run" => Ok(Self::Run(parse_project_options(arguments, false)?.0)),
             "test" => Ok(Self::Test(parse_project_options(arguments, false)?.0)),
+            "__run-unit-test" => parse_unit_test(arguments),
             "fmt" => parse_format(arguments),
             "clean" => Ok(Self::Clean {
                 path: parse_optional_path(arguments, Path::new("."))?,
@@ -717,6 +800,21 @@ impl Invocation {
             _ => Err(format!("unknown command `{command}`\n\n{}", usage())),
         }
     }
+}
+
+fn parse_unit_test(mut arguments: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
+    let index = arguments
+        .next()
+        .ok_or_else(|| "isolated unit-test index is missing".to_owned())?
+        .into_string()
+        .map_err(|_| "isolated unit-test index is not valid Unicode".to_owned())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid isolated unit-test index: {error}"))?;
+    let (options, _) = parse_project_options(arguments, false)?;
+    Ok(Invocation::RunUnitTest {
+        options,
+        test_index: index,
+    })
 }
 
 #[derive(Debug)]

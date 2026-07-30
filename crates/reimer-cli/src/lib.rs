@@ -103,6 +103,78 @@ pub fn execute_graph(
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
+/// Discovers compiler-recognized `@test` functions in one source package.
+///
+/// # Errors
+///
+/// Returns file-aware frontend diagnostics when the package cannot be loaded
+/// or checked.
+pub fn file_test_names(path: &Path) -> Result<Vec<String>, Vec<FileDiagnostic>> {
+    let (_, program) = analyze_test_file(path)?;
+    Ok(test_names(&program))
+}
+
+/// Executes one compiler-recognized `@test` function in the current process.
+///
+/// Callers should isolate this operation in a child process because a source
+/// panic deliberately aborts the process.
+///
+/// # Errors
+///
+/// Returns file-aware frontend or backend diagnostics.
+pub fn execute_file_test(
+    path: &Path,
+    test_index: usize,
+    optimization: OptimizationLevel,
+) -> Result<(), Vec<FileDiagnostic>> {
+    let (package, program) = analyze_test_file(path)?;
+    reimer_codegen_native::execute_test_with_options(&program, test_index, optimization)
+        .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
+/// Discovers compiler-recognized `@test` functions in a resolved source graph.
+///
+/// # Errors
+///
+/// Returns file-aware frontend diagnostics when the graph cannot be loaded or
+/// checked.
+pub fn graph_test_names(graph: &SourceGraph) -> Result<Vec<String>, Vec<FileDiagnostic>> {
+    let (_, program) = analyze_test_graph(graph)?;
+    Ok(test_names(&program))
+}
+
+/// Executes one graph-discovered `@test` function in the current process.
+///
+/// Callers should isolate this operation in a child process because a source
+/// panic deliberately aborts the process.
+///
+/// # Errors
+///
+/// Returns file-aware frontend or backend diagnostics.
+pub fn execute_graph_test(
+    graph: &SourceGraph,
+    test_index: usize,
+    optimization: OptimizationLevel,
+) -> Result<(), Vec<FileDiagnostic>> {
+    let (package, program) = analyze_test_graph(graph)?;
+    reimer_codegen_native::execute_test_with_options(&program, test_index, optimization)
+        .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
+fn test_names(program: &reimer_hir::Program) -> Vec<String> {
+    program
+        .tests
+        .iter()
+        .filter_map(|test| {
+            program
+                .functions
+                .iter()
+                .find(|function| function.id == *test)
+                .map(|function| function.name.clone())
+        })
+        .collect()
+}
+
 fn analyze(source: &str) -> Result<reimer_hir::Program, Vec<Diagnostic>> {
     let tokens = reimer_lexer::lex(source)?;
     let program = reimer_parser::parse(&tokens)?;
@@ -139,6 +211,26 @@ fn analyze_graph(
         reimer_resolver::resolve(&package.program)
     };
     match resolved {
+        Ok(program) => Ok((package, program)),
+        Err(diagnostics) => Err(package.map_diagnostics(diagnostics)),
+    }
+}
+
+fn analyze_test_file(
+    path: &Path,
+) -> Result<(reimer_package::Package, reimer_hir::Program), Vec<FileDiagnostic>> {
+    let package = reimer_package::load(path)?;
+    match reimer_resolver::resolve_library(&package.program) {
+        Ok(program) => Ok((package, program)),
+        Err(diagnostics) => Err(package.map_diagnostics(diagnostics)),
+    }
+}
+
+fn analyze_test_graph(
+    graph: &SourceGraph,
+) -> Result<(reimer_package::Package, reimer_hir::Program), Vec<FileDiagnostic>> {
+    let package = reimer_package::load_graph(graph)?;
+    match reimer_resolver::resolve_library(&package.program) {
         Ok(program) => Ok((package, program)),
         Err(diagnostics) => Err(package.map_diagnostics(diagnostics)),
     }

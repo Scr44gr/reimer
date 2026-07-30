@@ -56,6 +56,8 @@ pub enum TokenKind {
     Defer,
     /// `const`
     Const,
+    /// `comptime`
+    Comptime,
     /// `unsafe`
     Unsafe,
     /// `extern`
@@ -373,6 +375,7 @@ impl<'source> Lexer<'source> {
             "continue" => TokenKind::Continue,
             "defer" => TokenKind::Defer,
             "const" => TokenKind::Const,
+            "comptime" => TokenKind::Comptime,
             "unsafe" => TokenKind::Unsafe,
             "extern" => TokenKind::Extern,
             "impl" => TokenKind::Impl,
@@ -738,6 +741,14 @@ mod tests {
                 |token| matches!(&token.kind, TokenKind::String(value) if value == "Reimer\n")
             )
         );
+    }
+
+    #[test]
+    fn lex_should_recognize_comptime_as_a_keyword() {
+        let tokens =
+            lex("comptime fn answer() -> usize { 42 }").expect("compile-time function should lex");
+
+        assert_eq!(tokens[0].kind, TokenKind::Comptime);
     }
 
     #[test]
