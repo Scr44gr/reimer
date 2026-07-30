@@ -70,7 +70,11 @@ fn server_should_serve_editor_intelligence_over_stdio() {
     assert!(
         hover["result"]["contents"]["value"]
             .as_str()
-            .is_some_and(|value| value.contains("i32"))
+            .is_some_and(|value| {
+                value.contains("i32")
+                    && value.contains("32-bit signed integer")
+                    && !value.to_lowercase().contains("inferred")
+            })
     );
 
     let completion = server.request(

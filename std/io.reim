@@ -43,30 +43,37 @@ extern "C" {
     ) -> bool;
 }
 
+/// Returns a handle to standard input.
 pub fn stdin() -> Stdin {
     Stdin {}
 }
 
+/// Returns a handle to standard output.
 pub fn stdout() -> Stdout {
     Stdout {}
 }
 
+/// Returns a handle to standard error.
 pub fn stderr() -> Stderr {
     Stderr {}
 }
 
+/// Writes all UTF-8 bytes to standard output without appending a newline.
 pub fn print(value: str) -> Result<(), IoError> {
     write_text_all(1, value, false)
 }
 
+/// Writes all UTF-8 bytes to standard output and appends a newline.
 pub fn println(value: str) -> Result<(), IoError> {
     write_text_all(1, value, true)
 }
 
+/// Writes all UTF-8 bytes to standard error without appending a newline.
 pub fn eprint(value: str) -> Result<(), IoError> {
     write_text_all(2, value, false)
 }
 
+/// Writes all UTF-8 bytes to standard error and appends a newline.
 pub fn eprintln(value: str) -> Result<(), IoError> {
     write_text_all(2, value, true)
 }
@@ -213,6 +220,7 @@ fn read_input_to_end(
 }
 
 impl Stdin {
+    /// Reads at most `capacity` bytes into allocator-owned storage.
     pub fn read(
         &self,
         allocator: &Allocator,
@@ -221,6 +229,7 @@ impl Stdin {
         read_input_once(allocator, capacity)
     }
 
+    /// Reads exactly `len` bytes or returns `IoError::UnexpectedEndOfInput`.
     pub fn read_exact(
         &self,
         allocator: &Allocator,
@@ -229,6 +238,7 @@ impl Stdin {
         read_input_exact(allocator, len)
     }
 
+    /// Reads one line using at most `capacity` bytes of allocator-owned storage.
     pub fn read_line(
         &self,
         allocator: &Allocator,
@@ -237,6 +247,7 @@ impl Stdin {
         read_input_line(allocator, capacity)
     }
 
+    /// Reads until end-of-input using at most `capacity` bytes.
     pub fn read_to_end(
         &self,
         allocator: &Allocator,
@@ -245,6 +256,7 @@ impl Stdin {
         read_input_to_end(allocator, capacity)
     }
 
+    /// Reads one UTF-8 line into an owned `String`.
     pub fn read_line_string(
         &self,
         allocator: &Allocator,
@@ -254,6 +266,7 @@ impl Stdin {
         buffer.into_string()
     }
 
+    /// Reads UTF-8 input until end-of-input into an owned `String`.
     pub fn read_to_string(
         &self,
         allocator: &Allocator,
@@ -263,24 +276,29 @@ impl Stdin {
         buffer.into_string()
     }
 
+    /// Reports whether standard input is attached to a terminal.
     pub fn is_terminal(&self) -> bool {
         unsafe { input_is_terminal() }
     }
 }
 
 impl Stdout {
+    /// Attempts one write and returns the number of bytes written.
     pub fn write(&self, value: str) -> Result<usize, IoError> {
         write_text(1, value)
     }
 
+    /// Writes all UTF-8 bytes without appending a newline.
     pub fn write_all(&self, value: str) -> Result<(), IoError> {
         write_text_all(1, value, false)
     }
 
+    /// Writes all UTF-8 bytes and appends a newline.
     pub fn write_line(&self, value: str) -> Result<(), IoError> {
         write_text_all(1, value, true)
     }
 
+    /// Attempts one write from an initialized input buffer.
     pub fn write_buffer(
         &self,
         buffer: &InputBuffer,
@@ -288,6 +306,7 @@ impl Stdout {
         write_input_buffer(1, buffer)
     }
 
+    /// Writes every initialized byte from an input buffer.
     pub fn write_buffer_all(
         &self,
         buffer: &InputBuffer,
@@ -295,28 +314,34 @@ impl Stdout {
         write_input_buffer_all(1, buffer)
     }
 
+    /// Flushes buffered standard output.
     pub fn flush(&self) -> Result<(), IoError> {
         flush_output(1)
     }
 
+    /// Reports whether standard output is attached to a terminal.
     pub fn is_terminal(&self) -> bool {
         unsafe { output_is_terminal(1) }
     }
 }
 
 impl Stderr {
+    /// Attempts one write and returns the number of bytes written.
     pub fn write(&self, value: str) -> Result<usize, IoError> {
         write_text(2, value)
     }
 
+    /// Writes all UTF-8 bytes without appending a newline.
     pub fn write_all(&self, value: str) -> Result<(), IoError> {
         write_text_all(2, value, false)
     }
 
+    /// Writes all UTF-8 bytes and appends a newline.
     pub fn write_line(&self, value: str) -> Result<(), IoError> {
         write_text_all(2, value, true)
     }
 
+    /// Attempts one write from an initialized input buffer.
     pub fn write_buffer(
         &self,
         buffer: &InputBuffer,
@@ -324,6 +349,7 @@ impl Stderr {
         write_input_buffer(2, buffer)
     }
 
+    /// Writes every initialized byte from an input buffer.
     pub fn write_buffer_all(
         &self,
         buffer: &InputBuffer,
@@ -331,28 +357,34 @@ impl Stderr {
         write_input_buffer_all(2, buffer)
     }
 
+    /// Flushes buffered standard error.
     pub fn flush(&self) -> Result<(), IoError> {
         flush_output(2)
     }
 
+    /// Reports whether standard error is attached to a terminal.
     pub fn is_terminal(&self) -> bool {
         unsafe { output_is_terminal(2) }
     }
 }
 
 impl InputBuffer {
+    /// Returns the number of initialized bytes.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns the number of allocated bytes.
     pub fn capacity(&self) -> usize {
         self.bytes.len()
     }
 
+    /// Returns whether the buffer contains no initialized bytes.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Compares the initialized bytes with a UTF-8 string view.
     pub fn matches(&self, value: str) -> bool {
         unsafe {
             buffer_equals(
@@ -364,6 +396,7 @@ impl InputBuffer {
         }
     }
 
+    /// Validates UTF-8 and transfers the allocation into an owned `String`.
     pub fn into_string(self) -> Result<String, IoError> {
         let len = self.len;
         let bytes = self.bytes;
@@ -373,6 +406,7 @@ impl InputBuffer {
         }
     }
 
+    /// Releases the buffer through its original allocator.
     pub fn deinit(self) {
         self.bytes.deinit();
     }

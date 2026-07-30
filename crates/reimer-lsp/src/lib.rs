@@ -7,7 +7,7 @@ use std::sync::Arc;
 use reimer_ast::Item;
 use reimer_lint::{
     AllocationQuantity, AllocatorSummary, Analysis, Finding, Fix, Severity, analyze,
-    apply_spelling_fixes, index_typed, lint_typed, organize_imports,
+    apply_spelling_fixes, index_typed_with_documentation, lint_typed, organize_imports,
 };
 use reimer_project::{LockMode, Project, ProjectError};
 use tower_lsp::lsp_types::{
@@ -93,7 +93,7 @@ impl Document {
     #[must_use]
     pub fn hover(&self, position: Position) -> Option<Hover> {
         let byte = self.lines.byte(position)?;
-        let type_hint = narrowest_containing(&self.analysis.type_hints, byte, |hint| hint.span);
+        let type_hint = narrowest_type_hint(&self.analysis.type_hints, byte);
         let allocation =
             narrowest_containing(&self.analysis.allocations, byte, |estimate| estimate.span);
         if type_hint.is_none() && allocation.is_none() {
@@ -106,7 +106,7 @@ impl Document {
             markdown.push_str("```reimer\n");
             markdown.push_str(&hint.label);
             markdown.push_str("\n```\n\n");
-            markdown.push_str(&hint.detail);
+            markdown.push_str(&hint.documentation);
             span = Some(hint.span);
         }
         if let Some(estimate) = allocation {
@@ -164,37 +164,54 @@ impl Document {
         let mut seen: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
         if let Some(syntax) = &self.analysis.syntax {
             for item in &syntax.items {
-                let (name, kind, detail) = match item {
+                let (name, kind, detail, span) = match item {
                     Item::Function(function) => (
                         &function.name.name,
                         CompletionItemKind::FUNCTION,
                         "function",
+                        function.span,
                     ),
                     Item::ExternFunction(function) => (
                         &function.name.name,
                         CompletionItemKind::FUNCTION,
                         "native function",
+                        function.span,
                     ),
-                    Item::Struct(declaration) => {
-                        (&declaration.name.name, CompletionItemKind::STRUCT, "struct")
-                    }
-                    Item::Enum(declaration) => {
-                        (&declaration.name.name, CompletionItemKind::ENUM, "enum")
-                    }
+                    Item::Struct(declaration) => (
+                        &declaration.name.name,
+                        CompletionItemKind::STRUCT,
+                        "struct",
+                        declaration.span,
+                    ),
+                    Item::Enum(declaration) => (
+                        &declaration.name.name,
+                        CompletionItemKind::ENUM,
+                        "enum",
+                        declaration.span,
+                    ),
                     Item::Trait(declaration) => (
                         &declaration.name.name,
                         CompletionItemKind::INTERFACE,
                         "trait",
+                        declaration.span,
                     ),
                     Item::Constant(declaration) => (
                         &declaration.name.name,
                         CompletionItemKind::CONSTANT,
                         "compile-time constant",
+                        declaration.span,
                     ),
                     Item::Import(_) | Item::Impl(_) | Item::Comptime(_) => continue,
                 };
                 if seen.insert(name.clone()) {
-                    items.push(simple_completion(name, kind, detail));
+                    let documentation =
+                        reimer_package::documentation_before(&self.text, span.start);
+                    items.push(documented_completion(
+                        name,
+                        kind,
+                        detail,
+                        documentation.as_deref(),
+                    ));
                 }
             }
         }
@@ -250,7 +267,7 @@ impl Document {
     pub fn inlay_hints(&self, requested_range: Range) -> Vec<InlayHint> {
         let mut hints = Vec::new();
         for hint in &self.analysis.type_hints {
-            if hint.detail != "inferred local binding type"
+            if !hint.show_as_inlay()
                 || !ranges_overlap(self.lines.range(hint.span), requested_range)
                 || binding_has_annotation(&self.text, hint.span)
             {
@@ -264,7 +281,7 @@ impl Document {
                 tooltip: Some(tower_lsp::lsp_types::InlayHintTooltip::MarkupContent(
                     MarkupContent {
                         kind: MarkupKind::Markdown,
-                        value: "Type inferred by the compiler resolver.".to_owned(),
+                        value: hint.documentation.clone(),
                     },
                 )),
                 padding_left: None,
@@ -410,7 +427,24 @@ impl Document {
                     .retain(|finding| finding.severity != Severity::Error);
                 self.analysis.findings.extend(lint_typed(&typed));
                 if let Some(syntax) = &self.analysis.syntax {
-                    let (type_hints, definitions) = index_typed(syntax, &typed);
+                    let documentation: Vec<_> = typed
+                        .functions
+                        .iter()
+                        .map(|function| (function.id, function.span))
+                        .chain(
+                            typed
+                                .extern_functions
+                                .iter()
+                                .map(|function| (function.id, function.span)),
+                        )
+                        .filter_map(|(id, span)| {
+                            package
+                                .documentation(span)
+                                .map(|documentation| (id, documentation))
+                        })
+                        .collect();
+                    let (type_hints, definitions) =
+                        index_typed_with_documentation(syntax, &typed, &documentation);
                     self.analysis.type_hints = type_hints;
                     self.analysis.definitions = definitions;
                 }
@@ -682,6 +716,21 @@ fn narrowest_containing<T>(
         })
 }
 
+fn narrowest_type_hint(
+    hints: &[reimer_lint::TypeHint],
+    byte: usize,
+) -> Option<&reimer_lint::TypeHint> {
+    hints
+        .iter()
+        .filter(|hint| byte >= hint.span.start && byte <= hint.span.end)
+        .min_by_key(|hint| {
+            (
+                hint.span.end.saturating_sub(hint.span.start),
+                hint.hover_priority(),
+            )
+        })
+}
+
 fn quantity_label(quantity: AllocationQuantity) -> String {
     match quantity {
         AllocationQuantity::Exact(bytes) => format!("{bytes} B reserved"),
@@ -720,6 +769,22 @@ fn simple_completion(label: &str, kind: CompletionItemKind, detail: &str) -> Com
         detail: Some(detail.to_owned()),
         ..CompletionItem::default()
     }
+}
+
+fn documented_completion(
+    label: &str,
+    kind: CompletionItemKind,
+    detail: &str,
+    documentation: Option<&str>,
+) -> CompletionItem {
+    let mut item = simple_completion(label, kind, detail);
+    item.documentation = documentation.map(|value| {
+        Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: value.to_owned(),
+        })
+    });
+    item
 }
 
 const LANGUAGE_KEYWORDS: &[&str] = &[
@@ -1056,6 +1121,89 @@ mod tests {
         };
 
         assert!(contents.value.contains("i32"));
+        assert!(contents.value.contains("32-bit signed integer"));
+        assert!(
+            contents
+                .value
+                .contains("`-2,147,483,648` to `2,147,483,647`")
+        );
+        assert!(!contents.value.to_lowercase().contains("inferred"));
+    }
+
+    #[test]
+    fn document_should_show_function_documentation_at_calls_and_completions() {
+        let source = "/// Adds two signed integers.\n\
+                      ///\n\
+                      /// # Arguments\n\
+                      /// - `left`: first value\n\
+                      fn add(left: i32, right: i32) -> i32 { left + right }\n\
+                      fn main() -> i32 { add(20, 22) }\n"
+            .to_owned();
+        let call_offset = source.rfind("add(20").expect("function call should exist");
+        let position = LineIndex::new(Arc::from(source.as_str())).position(call_offset);
+        let document = Document::new(
+            Url::parse("untitled:documented.reim").expect("URL should parse"),
+            source,
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("documented function call should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+        assert!(contents.value.contains("fn add(left: i32, right: i32)"));
+        assert!(contents.value.contains("Adds two signed integers."));
+        assert!(contents.value.contains("# Arguments"));
+
+        let completion = document
+            .completions()
+            .into_iter()
+            .find(|item| item.label == "add")
+            .expect("documented function should be completed");
+        let Some(tower_lsp::lsp_types::Documentation::MarkupContent(documentation)) =
+            completion.documentation
+        else {
+            panic!("completion documentation should use markdown");
+        };
+        assert!(documentation.value.contains("Adds two signed integers."));
+    }
+
+    #[test]
+    fn document_should_hide_internal_module_names_in_generic_type_hovers() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join("m7_tensor.reim");
+        let source = fs::read_to_string(&path).expect("tensor example should be readable");
+        let use_offset = source
+            .find("output_view[0, 1]")
+            .expect("tensor view use should exist");
+        let position = LineIndex::new(Arc::from(source.as_str())).position(use_offset);
+        let document = Document::new(
+            Url::from_file_path(path).expect("example URL should be created"),
+            source,
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("tensor view use should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents
+                .value
+                .contains("std::tensor::TensorViewMut<f32, 2>")
+        );
+        assert!(
+            contents.value.contains("Mutable, non-owning tensor view"),
+            "unexpected hover contents: {}",
+            contents.value
+        );
+        assert!(!contents.value.contains("__module_"));
     }
 
     #[test]
@@ -1103,6 +1251,82 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR))
+        );
+    }
+
+    #[test]
+    fn document_should_show_documentation_for_imported_function_calls() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2026\"\n\n\
+             [dependencies]\nmath = { path = \"../math\" }\n",
+        );
+        let source = "from math import answer;\nfn main() -> i32 { answer() }\n";
+        let main = fixture.write("app/src/main.reim", source);
+        fixture.write(
+            "math/reimer.toml",
+            "[package]\nname = \"math\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+        );
+        fixture.write(
+            "math/src/package.reim",
+            "/// Returns the canonical demonstration value.\npub fn answer() -> i32 { 42 }\n",
+        );
+        let call_offset = source
+            .rfind("answer()")
+            .expect("function call should exist");
+        let position = LineIndex::new(Arc::from(source)).position(call_offset);
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("imported function call should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents.value.contains("fn answer() -> i32"),
+            "unexpected hover contents: {}",
+            contents.value
+        );
+        assert!(
+            contents
+                .value
+                .contains("Returns the canonical demonstration value.")
+        );
+        assert!(!contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_standard_library_documentation() {
+        let source = "from std::io import println;\nfn main() -> i32 { println(\"hello\"); 0 }\n";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let call_offset = source
+            .rfind("println(\"hello\")")
+            .expect("standard output call should exist");
+        let position = LineIndex::new(Arc::from(source)).position(call_offset);
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("standard output call should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(contents.value.contains("fn std::io::println"));
+        assert!(
+            contents
+                .value
+                .contains("Writes all UTF-8 bytes to standard output and appends a newline.")
         );
     }
 

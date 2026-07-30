@@ -122,7 +122,8 @@ const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
 const editorDefaults = manifest.contributes.configurationDefaults["[reimer]"];
 assert.equal(editorDefaults["editor.matchBrackets"], "always");
 assert.equal(editorDefaults["editor.inlayHints.enabled"], "on");
-assert.equal(editorDefaults["editor.guides.bracketPairs"], "active");
+assert.equal(editorDefaults["editor.guides.bracketPairs"], undefined);
+assert.equal(editorDefaults["editor.guides.bracketPairsHorizontal"], undefined);
 
 function assertScope(grammar, line, tokenText, expectedScope) {
   const scopes = scopesFor(grammar, line, tokenText);

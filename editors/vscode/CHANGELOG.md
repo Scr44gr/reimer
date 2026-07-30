@@ -11,3 +11,6 @@
   without external Node dependencies.
 - Unsaved package-aware type inference and explicit bracket-pair editor
   defaults.
+- Source-level type names, type-specific hover documentation, and `///`
+  documentation on declarations, calls, imports, and completion items.
+- Bracket matching without intrusive active-block guide lines.

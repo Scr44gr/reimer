@@ -64,6 +64,13 @@ impl Package {
             .collect()
     }
 
+    /// Returns the `///` documentation immediately preceding a package span.
+    #[must_use]
+    pub fn documentation(&self, span: Span) -> Option<String> {
+        let source = self.sources.iter().find(|source| source.contains(span))?;
+        documentation_before(&source.text, span.start.saturating_sub(source.base))
+    }
+
     fn map_diagnostic(&self, mut diagnostic: Diagnostic) -> FileDiagnostic {
         let source = self
             .sources
@@ -84,6 +91,29 @@ impl Package {
             diagnostic,
         }
     }
+}
+
+/// Collects consecutive `///` lines immediately before a declaration.
+///
+/// The returned text preserves Markdown and removes one optional space after
+/// each documentation marker.
+#[must_use]
+pub fn documentation_before(source: &str, declaration_start: usize) -> Option<String> {
+    let prefix = source
+        .get(..declaration_start)?
+        .trim_end_matches([' ', '\t']);
+    let mut lines = Vec::new();
+    for line in prefix.lines().rev() {
+        let Some(documentation) = line.trim_start().strip_prefix("///") else {
+            break;
+        };
+        lines.push(documentation.strip_prefix(' ').unwrap_or(documentation));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.reverse();
+    Some(lines.join("\n"))
 }
 
 /// A compiler diagnostic paired with the source file it describes.
@@ -2085,6 +2115,89 @@ fn canonical_name(module: &ModuleName, local: &str) -> String {
     format!("__module_{encoded}${local}")
 }
 
+/// Converts an internal package-qualified symbol into source-level `::` syntax.
+///
+/// Compiler stages retain length-prefixed module names so symbols cannot
+/// collide. Diagnostics and editor tooling should call this before presenting
+/// a symbol to a programmer.
+#[must_use]
+pub fn display_symbol_name(name: &str) -> String {
+    let mut rendered = String::with_capacity(name.len());
+    let mut remaining = name;
+    while let Some(index) = remaining.find("__module_") {
+        rendered.push_str(&remaining[..index]);
+        let encoded = &remaining[index..];
+        if let Some((display, consumed)) = decode_canonical_symbol(encoded) {
+            rendered.push_str(&display);
+            remaining = &encoded[consumed..];
+        } else {
+            rendered.push_str("__module_");
+            remaining = &encoded["__module_".len()..];
+        }
+    }
+    rendered.push_str(remaining);
+    rendered
+}
+
+fn decode_canonical_symbol(encoded: &str) -> Option<(String, usize)> {
+    const PREFIX: &str = "__module_";
+    const PACKAGE_PREFIX: &str = "$package$";
+
+    let bytes = encoded.as_bytes();
+    let mut cursor = PREFIX.len();
+    let mut module = Vec::new();
+    loop {
+        let length_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == length_start || bytes.get(cursor) != Some(&b'_') {
+            return None;
+        }
+        let length = encoded[length_start..cursor].parse::<usize>().ok()?;
+        let segment_start = cursor.checked_add(1)?;
+        let segment_end = segment_start.checked_add(length)?;
+        let segment = encoded.get(segment_start..segment_end)?;
+        if let Some(package) = segment.strip_prefix(PACKAGE_PREFIX) {
+            if !looks_like_internal_package_id(package) {
+                module.push(package.to_owned());
+            }
+        } else {
+            module.push(segment.to_owned());
+        }
+        cursor = segment_end;
+        match bytes.get(cursor) {
+            Some(b'_') => cursor += 1,
+            Some(b'$') => {
+                cursor += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+
+    let local_start = cursor;
+    let mut characters = encoded[local_start..].char_indices();
+    let (_, first) = characters.next()?;
+    if first != '_' && !first.is_alphabetic() {
+        return None;
+    }
+    cursor = local_start + first.len_utf8();
+    for (offset, character) in characters {
+        if character != '_' && !character.is_alphabetic() && !character.is_ascii_digit() {
+            break;
+        }
+        cursor = local_start + offset + character.len_utf8();
+    }
+    let local = encoded.get(local_start..cursor)?;
+    module.push(local.to_owned());
+    Some((module.join("::"), cursor))
+}
+
+fn looks_like_internal_package_id(segment: &str) -> bool {
+    segment.len() >= 16 && segment.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn last_segment(path: &ast::Path) -> String {
     path.segments
         .last()
@@ -2118,10 +2231,45 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        SourceDependency, SourceGraph, SourcePackage, load, load_graph, load_with_overlay,
+        SourceDependency, SourceGraph, SourcePackage, canonical_name, display_symbol_name,
+        documentation_before, load, load_graph, load_with_overlay,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn display_symbol_name_should_restore_source_level_paths() {
+        let tensor_module = vec!["std".to_owned(), "linear_algebra".to_owned()];
+        let tensor = canonical_name(&tensor_module, "TensorViewMut");
+        let vector_module = vec!["$package$math".to_owned(), "vectors".to_owned()];
+        let vector = canonical_name(&vector_module, "Vector");
+        let instantiated = format!("{tensor}<f32, {vector}>");
+
+        assert_eq!(
+            display_symbol_name(&instantiated),
+            "std::linear_algebra::TensorViewMut<f32, math::vectors::Vector>"
+        );
+    }
+
+    #[test]
+    fn display_symbol_name_should_hide_opaque_package_identifiers() {
+        let module = vec!["$package$6cafcf2e0e366365aae5eb95f905ef41646c4ef9".to_owned()];
+        let symbol = canonical_name(&module, "answer");
+
+        assert_eq!(display_symbol_name(&symbol), "answer");
+    }
+
+    #[test]
+    fn documentation_before_should_preserve_markdown_blocks() {
+        let source =
+            "/// Adds two values.\n///\n/// # Arguments\n/// - `left`: first value\nfn add() {}\n";
+        let declaration = source.find("fn add").expect("declaration should exist");
+
+        assert_eq!(
+            documentation_before(source, declaration).as_deref(),
+            Some("Adds two values.\n\n# Arguments\n- `left`: first value")
+        );
+    }
 
     struct Fixture {
         root: PathBuf,

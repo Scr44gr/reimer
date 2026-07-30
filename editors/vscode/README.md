@@ -10,7 +10,10 @@ similar quality of experience through an original TextMate grammar and LSP.
   declarations, generics, attributes, `::` paths, operators, and control flow;
 - diagnostics from the lexer, parser, manifest/lockfile, package loader, and
   resolver;
-- hover and inlay hints with inferred types;
+- hover and inlay hints with canonical source-level types, useful primitive and
+  standard-library descriptions, and no internal compiler symbol names;
+- Markdown documentation from `///` comments on declarations, direct calls,
+  imported functions, and local completion items;
 - local go-to-definition, document symbols, and completion;
 - quick fixes for close typos and antipatterns;
 - `source.organizeImports` to place `std` first and normalize selective imports
@@ -24,8 +27,9 @@ similar quality of experience through an original TextMate grammar and LSP.
 - HIR-backed `@must_use` warnings, including saved multi-file packages;
 - package-aware inference for the active in-memory document, including unsaved
   changes in files with imports;
-- reliable matching and active guides for `{}`, `[]`, and `()`. Angle brackets
-  remain operators so `->` and comparisons are not mistaken for bracket pairs.
+- reliable matching and colorization for `{}`, `[]`, and `()` without adding
+  active-block guide lines. Angle brackets remain operators so `->` and
+  comparisons are not mistaken for bracket pairs.
 
 ## Development installation
 
@@ -59,6 +63,20 @@ Displayed figures are static estimates, not memory profiles. Constant sizes in
 runtime values are reported as dynamic. Reservations inside loops are shown
 per iteration. The extension does not claim a total peak when control flow or
 lifetime cannot be proved.
+
+## Documentation comments
+
+Place consecutive `///` comments immediately before a declaration. Markdown is
+preserved in hover and completion details:
+
+```reimer
+/// Writes a greeting to standard output.
+///
+/// Returns `IoError` if the complete message cannot be written.
+fn greet() -> Result<(), IoError> {
+    println("hello")
+}
+```
 
 ## Current limitations
 

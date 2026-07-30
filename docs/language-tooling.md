@@ -8,7 +8,7 @@ decides whether a program is valid.
 ## Components
 
 - `crates/reimer-lint`: compiler diagnostics, antipattern lints, quick fixes,
-  import organization, inferred-type indexes, local definition links, and
+  import organization, resolved-type indexes, local definition links, and
   allocator estimates.
 - `crates/reimer-lsp`: stdin/stdout server with full synchronization, pushed
   diagnostics, hover, intradocument go-to-definition, symbols, completion,
@@ -51,11 +51,12 @@ cargo run -p reimer-lint -- examples/exit_42.reim
 cargo run -p reimer-lint -- --deny-warnings examples/exit_42.reim
 ```
 
-## Inference and allocators
+## Type information and allocators
 
 When the resolver produces HIR, the server indexes expression types and
-unannotated bindings. Hover and inlay hints display compiler inference, not a
-parallel heuristic.
+unannotated bindings. Hover and inlay hints display canonical source-level
+types from the compiler, not a parallel heuristic. Internal package symbols
+are never part of the editor presentation.
 
 Memory figures always say **static estimate**. The analyzer currently
 recognizes explicit byte reservations, bounded input buffers, fixed buffers,
@@ -69,6 +70,27 @@ It evaluates checked constant arithmetic and distinguishes:
 
 The sum does not claim to be peak memory: it does not invent iteration counts,
 branch exclusion, or lifetimes that analysis has not proved.
+
+## Documentation comments
+
+Consecutive `///` comments immediately before a declaration are Markdown
+documentation:
+
+```reimer
+/// Adds two signed integers.
+///
+/// # Arguments
+/// - `left`: first value
+/// - `right`: second value
+fn add(left: i32, right: i32) -> i32 {
+    left + right
+}
+```
+
+The language server shows this text with the resolved signature when hovering
+over the declaration or any direct call. It also attaches local declaration
+documentation to completion items. Documentation from imported source modules
+is retained during package resolution.
 
 ## Packages and snapshots
 

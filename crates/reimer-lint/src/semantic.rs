@@ -14,8 +14,36 @@ pub struct TypeHint {
     pub span: Span,
     /// Compact source-like type or signature.
     pub label: String,
-    /// Additional semantic context.
-    pub detail: String,
+    /// User-facing documentation for the resolved type or callable.
+    pub documentation: String,
+    kind: TypeHintKind,
+}
+
+impl TypeHint {
+    /// Returns whether this is the type of an unannotated local binding.
+    #[must_use]
+    pub const fn show_as_inlay(&self) -> bool {
+        matches!(self.kind, TypeHintKind::LocalBinding)
+    }
+
+    /// Ranks equally narrow hover candidates by source-level usefulness.
+    #[must_use]
+    pub const fn hover_priority(&self) -> u8 {
+        match self.kind {
+            TypeHintKind::Callable | TypeHintKind::Binding | TypeHintKind::LocalBinding => 0,
+            TypeHintKind::Place => 1,
+            TypeHintKind::Value => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeHintKind {
+    Callable,
+    Binding,
+    LocalBinding,
+    Value,
+    Place,
 }
 
 /// A source use and its declaration location in the same document.
@@ -28,13 +56,24 @@ pub struct DefinitionLink {
 }
 
 pub(crate) fn index(
+    source: &str,
     syntax: &ast::Program,
     typed: &hir::Program,
+) -> (Vec<TypeHint>, Vec<DefinitionLink>) {
+    let documentation = local_function_documentation(source, typed);
+    index_with_documentation(syntax, typed, &documentation)
+}
+
+pub(crate) fn index_with_documentation(
+    syntax: &ast::Program,
+    typed: &hir::Program,
+    documentation: &[(FunctionId, String)],
 ) -> (Vec<TypeHint>, Vec<DefinitionLink>) {
     let syntax_index = SyntaxIndex::build(syntax);
     let mut type_hints = Vec::new();
     let mut definitions = syntax_index.type_definition_links();
     let function_targets = function_targets(typed, &syntax_index);
+    let callable_hints = callable_hints(typed, documentation);
 
     for function in &typed.functions {
         let Some(ast_function) = syntax_index.function(function.span) else {
@@ -43,30 +82,39 @@ pub(crate) fn index(
         type_hints.push(TypeHint {
             span: ast_function.name.span,
             label: function_signature(function, typed),
-            detail: "function signature after type resolution".to_owned(),
+            documentation: function_documentation(documentation, function.id)
+                .unwrap_or("Callable Reimer function.")
+                .to_owned(),
+            kind: TypeHintKind::Callable,
         });
 
         let mut local_targets = HashMap::new();
+        let mut local_types = HashMap::new();
         for (parameter, ast_parameter) in function.parameters.iter().zip(&ast_function.parameters) {
             local_targets.insert(parameter.local, ast_parameter.name.span);
-            type_hints.push(TypeHint {
-                span: ast_parameter.name.span,
-                label: type_label(parameter.ty, typed),
-                detail: "parameter type".to_owned(),
-            });
+            local_types.insert(parameter.local, parameter.ty);
+            type_hints.push(resolved_type_hint(
+                ast_parameter.name.span,
+                parameter.ty,
+                typed,
+                TypeHintKind::Binding,
+            ));
         }
         collect_local_targets(
             &function.body,
             &syntax_index,
             typed,
             &mut local_targets,
+            &mut local_types,
             &mut type_hints,
         );
         let mut indexer = HirIndexer {
             typed,
             syntax_index: &syntax_index,
             local_targets: &local_targets,
+            local_types: &local_types,
             function_targets: &function_targets,
+            callable_hints: &callable_hints,
             type_hints: &mut type_hints,
             definitions: &mut definitions,
         };
@@ -78,7 +126,16 @@ pub(crate) fn index(
             type_hints.push(TypeHint {
                 span: name_span,
                 label: extern_signature(function, typed),
-                detail: format!("native function using the `{}` ABI", function.abi),
+                documentation: function_documentation(documentation, function.id).map_or_else(
+                    || {
+                        format!(
+                            "Native function using the `{}` application binary interface.",
+                            function.abi
+                        )
+                    },
+                    str::to_owned,
+                ),
+                kind: TypeHintKind::Callable,
             });
         }
     }
@@ -88,6 +145,75 @@ pub(crate) fn index(
 
 pub(crate) fn syntax_definitions(syntax: &ast::Program) -> Vec<DefinitionLink> {
     SyntaxIndex::build(syntax).type_definition_links()
+}
+
+fn local_function_documentation(source: &str, typed: &hir::Program) -> Vec<(FunctionId, String)> {
+    typed
+        .functions
+        .iter()
+        .map(|function| (function.id, function.span))
+        .chain(
+            typed
+                .extern_functions
+                .iter()
+                .map(|function| (function.id, function.span)),
+        )
+        .filter_map(|(id, span)| {
+            reimer_package::documentation_before(source, span.start)
+                .map(|documentation| (id, documentation))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct CallableHint {
+    label: String,
+    documentation: String,
+}
+
+fn callable_hints(
+    typed: &hir::Program,
+    documentation: &[(FunctionId, String)],
+) -> HashMap<FunctionId, CallableHint> {
+    let functions = typed.functions.iter().map(|function| {
+        (
+            function.id,
+            CallableHint {
+                label: function_signature(function, typed),
+                documentation: function_documentation(documentation, function.id)
+                    .unwrap_or("Callable Reimer function.")
+                    .to_owned(),
+            },
+        )
+    });
+    let extern_functions = typed.extern_functions.iter().map(|function| {
+        (
+            function.id,
+            CallableHint {
+                label: extern_signature(function, typed),
+                documentation: function_documentation(documentation, function.id).map_or_else(
+                    || {
+                        format!(
+                            "Native function using the `{}` application binary interface.",
+                            function.abi
+                        )
+                    },
+                    str::to_owned,
+                ),
+            },
+        )
+    });
+    functions.chain(extern_functions).collect()
+}
+
+fn function_documentation(
+    documentation: &[(FunctionId, String)],
+    function: FunctionId,
+) -> Option<&str> {
+    documentation
+        .iter()
+        .find(|(candidate, _)| *candidate == function)
+        .map(|(_, documentation)| documentation.as_str())
 }
 
 fn sort_and_deduplicate(type_hints: &mut Vec<TypeHint>, definitions: &mut Vec<DefinitionLink>) {
@@ -249,33 +375,102 @@ fn collect_local_targets(
     syntax: &SyntaxIndex<'_>,
     typed: &hir::Program,
     local_targets: &mut HashMap<LocalId, Span>,
+    local_types: &mut HashMap<LocalId, Type>,
     type_hints: &mut Vec<TypeHint>,
 ) {
     for statement in &block.statements {
         match statement {
             hir::Statement::Let {
-                local, ty, span, ..
+                local,
+                ty,
+                initializer,
+                span,
+                ..
             } => {
                 if let Some(name_span) = syntax.let_names.get(&span_key(*span)).copied() {
                     local_targets.insert(*local, name_span);
-                    type_hints.push(TypeHint {
-                        span: name_span,
-                        label: type_label(*ty, typed),
-                        detail: "inferred local binding type".to_owned(),
-                    });
+                    local_types.insert(*local, *ty);
+                    type_hints.push(resolved_type_hint(
+                        name_span,
+                        *ty,
+                        typed,
+                        TypeHintKind::LocalBinding,
+                    ));
+                }
+                collect_nested_pattern_targets(
+                    initializer,
+                    syntax,
+                    typed,
+                    local_targets,
+                    local_types,
+                    type_hints,
+                );
+            }
+            hir::Statement::Expression(expression)
+            | hir::Statement::Defer {
+                action: expression, ..
+            } => collect_nested_pattern_targets(
+                expression,
+                syntax,
+                typed,
+                local_targets,
+                local_types,
+                type_hints,
+            ),
+            hir::Statement::Return { value, .. } | hir::Statement::Break { value, .. } => {
+                if let Some(value) = value {
+                    collect_nested_pattern_targets(
+                        value,
+                        syntax,
+                        typed,
+                        local_targets,
+                        local_types,
+                        type_hints,
+                    );
                 }
             }
-            hir::Statement::While { body, .. } | hir::Statement::For { body, .. } => {
-                collect_local_targets(body, syntax, typed, local_targets, type_hints);
+            hir::Statement::While {
+                condition, body, ..
+            } => {
+                collect_nested_pattern_targets(
+                    condition,
+                    syntax,
+                    typed,
+                    local_targets,
+                    local_types,
+                    type_hints,
+                );
+                collect_local_targets(body, syntax, typed, local_targets, local_types, type_hints);
             }
-            _ => {}
-        }
-        if let hir::Statement::For { pattern, .. } = statement {
-            collect_pattern_targets(pattern, syntax, typed, local_targets, type_hints);
+            hir::Statement::For {
+                pattern,
+                iterable,
+                body,
+                ..
+            } => {
+                collect_pattern_targets(
+                    pattern,
+                    syntax,
+                    typed,
+                    local_targets,
+                    local_types,
+                    type_hints,
+                );
+                collect_nested_pattern_targets(
+                    iterable,
+                    syntax,
+                    typed,
+                    local_targets,
+                    local_types,
+                    type_hints,
+                );
+                collect_local_targets(body, syntax, typed, local_targets, local_types, type_hints);
+            }
+            hir::Statement::Continue(_) => {}
         }
     }
     if let Some(tail) = &block.tail {
-        collect_nested_pattern_targets(tail, syntax, typed, local_targets, type_hints);
+        collect_nested_pattern_targets(tail, syntax, typed, local_targets, local_types, type_hints);
     }
 }
 
@@ -284,31 +479,62 @@ fn collect_nested_pattern_targets(
     syntax: &SyntaxIndex<'_>,
     typed: &hir::Program,
     local_targets: &mut HashMap<LocalId, Span>,
+    local_types: &mut HashMap<LocalId, Type>,
     type_hints: &mut Vec<TypeHint>,
 ) {
     match &expression.kind {
         ExpressionKind::Match(matching) => {
             for arm in &matching.arms {
-                collect_pattern_targets(&arm.pattern, syntax, typed, local_targets, type_hints);
-                collect_nested_pattern_targets(&arm.body, syntax, typed, local_targets, type_hints);
+                collect_pattern_targets(
+                    &arm.pattern,
+                    syntax,
+                    typed,
+                    local_targets,
+                    local_types,
+                    type_hints,
+                );
+                collect_nested_pattern_targets(
+                    &arm.body,
+                    syntax,
+                    typed,
+                    local_targets,
+                    local_types,
+                    type_hints,
+                );
             }
         }
         ExpressionKind::If(conditional) => {
+            collect_local_targets(
+                &conditional.then_branch,
+                syntax,
+                typed,
+                local_targets,
+                local_types,
+                type_hints,
+            );
             if let Some(else_branch) = &conditional.else_branch {
                 collect_nested_pattern_targets(
                     else_branch,
                     syntax,
                     typed,
                     local_targets,
+                    local_types,
                     type_hints,
                 );
             }
         }
         ExpressionKind::Block(block) => {
-            collect_local_targets(block, syntax, typed, local_targets, type_hints);
+            collect_local_targets(block, syntax, typed, local_targets, local_types, type_hints);
         }
         ExpressionKind::Loop(looping) => {
-            collect_local_targets(&looping.body, syntax, typed, local_targets, type_hints);
+            collect_local_targets(
+                &looping.body,
+                syntax,
+                typed,
+                local_targets,
+                local_types,
+                type_hints,
+            );
         }
         _ => {}
     }
@@ -319,17 +545,20 @@ fn collect_pattern_targets(
     syntax: &SyntaxIndex<'_>,
     typed: &hir::Program,
     local_targets: &mut HashMap<LocalId, Span>,
+    local_types: &mut HashMap<LocalId, Type>,
     type_hints: &mut Vec<TypeHint>,
 ) {
     match &pattern.kind {
         hir::PatternKind::Binding { local, .. } => {
             if let Some(name_span) = syntax.pattern_names.get(&span_key(pattern.span)).copied() {
                 local_targets.insert(*local, name_span);
-                type_hints.push(TypeHint {
-                    span: name_span,
-                    label: type_label(pattern.ty, typed),
-                    detail: "pattern binding type".to_owned(),
-                });
+                local_types.insert(*local, pattern.ty);
+                type_hints.push(resolved_type_hint(
+                    name_span,
+                    pattern.ty,
+                    typed,
+                    TypeHintKind::Binding,
+                ));
             }
         }
         hir::PatternKind::Tuple(elements)
@@ -337,7 +566,14 @@ fn collect_pattern_targets(
             fields: elements, ..
         } => {
             for element in elements {
-                collect_pattern_targets(element, syntax, typed, local_targets, type_hints);
+                collect_pattern_targets(
+                    element,
+                    syntax,
+                    typed,
+                    local_targets,
+                    local_types,
+                    type_hints,
+                );
             }
         }
         hir::PatternKind::Wildcard
@@ -353,7 +589,9 @@ struct HirIndexer<'context> {
     typed: &'context hir::Program,
     syntax_index: &'context SyntaxIndex<'context>,
     local_targets: &'context HashMap<LocalId, Span>,
+    local_types: &'context HashMap<LocalId, Type>,
     function_targets: &'context HashMap<FunctionId, Span>,
+    callable_hints: &'context HashMap<FunctionId, CallableHint>,
     type_hints: &'context mut Vec<TypeHint>,
     definitions: &'context mut Vec<DefinitionLink>,
 }
@@ -392,11 +630,12 @@ impl HirIndexer<'_> {
     }
 
     fn expression(&mut self, expression: &hir::Expression) {
-        self.type_hints.push(TypeHint {
-            span: expression.span,
-            label: type_label(expression.ty, self.typed),
-            detail: "inferred expression type".to_owned(),
-        });
+        self.type_hints.push(resolved_type_hint(
+            expression.span,
+            expression.ty,
+            self.typed,
+            TypeHintKind::Value,
+        ));
         self.expression_kind(expression);
     }
 
@@ -406,30 +645,9 @@ impl HirIndexer<'_> {
             ExpressionKind::Call {
                 function,
                 arguments,
-            } => {
-                if let Some(target_span) = self.function_targets.get(function).copied()
-                    && let Some(use_span) = self
-                        .syntax_index
-                        .call_callees
-                        .get(&span_key(expression.span))
-                        .copied()
-                {
-                    self.definitions.push(DefinitionLink {
-                        use_span,
-                        target_span,
-                    });
-                }
-                for argument in arguments {
-                    self.expression(argument);
-                }
-            }
+            } => self.direct_call(*function, arguments, expression.span),
             ExpressionKind::Function(function) => {
-                if let Some(target_span) = self.function_targets.get(function).copied() {
-                    self.definitions.push(DefinitionLink {
-                        use_span: expression.span,
-                        target_span,
-                    });
-                }
+                self.function_value(*function, expression.span);
             }
             ExpressionKind::IndirectCall { callee, arguments } => {
                 self.expression(callee);
@@ -507,6 +725,14 @@ impl HirIndexer<'_> {
                 use_span,
                 target_span,
             });
+        }
+        if let Some(ty) = self.local_types.get(&local).copied() {
+            self.type_hints.push(resolved_type_hint(
+                use_span,
+                ty,
+                self.typed,
+                TypeHintKind::Binding,
+            ));
         }
     }
 
@@ -618,20 +844,14 @@ impl HirIndexer<'_> {
     }
 
     fn place(&mut self, place: &hir::Place) {
-        self.type_hints.push(TypeHint {
-            span: place.span,
-            label: type_label(place.ty, self.typed),
-            detail: "assignable place type".to_owned(),
-        });
+        self.type_hints.push(resolved_type_hint(
+            place.span,
+            place.ty,
+            self.typed,
+            TypeHintKind::Place,
+        ));
         match &place.kind {
-            PlaceKind::Local(local) => {
-                if let Some(target_span) = self.local_targets.get(local).copied() {
-                    self.definitions.push(DefinitionLink {
-                        use_span: place.span,
-                        target_span,
-                    });
-                }
-            }
+            PlaceKind::Local(local) => self.link_local(place.span, *local),
             PlaceKind::Field { base, .. } | PlaceKind::Index { base, .. } => {
                 self.expression(base);
                 if let PlaceKind::Index { index, .. } = &place.kind {
@@ -639,6 +859,43 @@ impl HirIndexer<'_> {
                 }
             }
             PlaceKind::Dereference { pointer } => self.expression(pointer),
+        }
+    }
+
+    fn add_callable_hint(&mut self, function: FunctionId, span: Span) {
+        let Some(hint) = self.callable_hints.get(&function) else {
+            return;
+        };
+        self.type_hints.push(TypeHint {
+            span,
+            label: hint.label.clone(),
+            documentation: hint.documentation.clone(),
+            kind: TypeHintKind::Callable,
+        });
+    }
+
+    fn direct_call(&mut self, function: FunctionId, arguments: &[hir::Expression], span: Span) {
+        if let Some(use_span) = self.syntax_index.call_callees.get(&span_key(span)).copied() {
+            self.add_callable_hint(function, use_span);
+            if let Some(target_span) = self.function_targets.get(&function).copied() {
+                self.definitions.push(DefinitionLink {
+                    use_span,
+                    target_span,
+                });
+            }
+        }
+        for argument in arguments {
+            self.expression(argument);
+        }
+    }
+
+    fn function_value(&mut self, function: FunctionId, span: Span) {
+        self.add_callable_hint(function, span);
+        if let Some(target_span) = self.function_targets.get(&function).copied() {
+            self.definitions.push(DefinitionLink {
+                use_span: span,
+                target_span,
+            });
         }
     }
 }
@@ -652,7 +909,7 @@ fn function_signature(function: &hir::Function, program: &hir::Program) -> Strin
         .join(", ");
     format!(
         "fn {}({parameters}) -> {}",
-        function.name,
+        reimer_package::display_symbol_name(&function.name),
         type_label(function.return_type, program)
     )
 }
@@ -667,9 +924,23 @@ fn extern_signature(function: &hir::ExternFunction, program: &hir::Program) -> S
     format!(
         "extern \"{}\" fn {}({parameters}) -> {}",
         function.abi,
-        function.name,
+        reimer_package::display_symbol_name(&function.name),
         type_label(function.return_type, program)
     )
+}
+
+fn resolved_type_hint(
+    span: Span,
+    ty: Type,
+    program: &hir::Program,
+    kind: TypeHintKind,
+) -> TypeHint {
+    TypeHint {
+        span,
+        label: type_label(ty, program),
+        documentation: type_documentation(ty, program),
+        kind,
+    }
 }
 
 fn type_label(ty: Type, program: &hir::Program) -> String {
@@ -685,7 +956,10 @@ fn type_label_at_depth(ty: Type, program: &hir::Program, depth: usize) -> String
     };
     match &definition.kind {
         TypeDefinitionKind::Struct { .. } | TypeDefinitionKind::Enum { .. } => {
-            definition.name.clone().unwrap_or_else(|| ty.to_string())
+            definition.name.as_ref().map_or_else(
+                || ty.to_string(),
+                |name| reimer_package::display_symbol_name(name),
+            )
         }
         TypeDefinitionKind::Tuple { elements } => format!(
             "({})",
@@ -732,6 +1006,145 @@ fn type_label_at_depth(ty: Type, program: &hir::Program, depth: usize) -> String
                 .join(", "),
             type_label_at_depth(*return_type, program, depth + 1)
         ),
+    }
+}
+
+fn type_documentation(ty: Type, program: &hir::Program) -> String {
+    if let Some(documentation) = primitive_documentation(ty) {
+        return documentation.to_owned();
+    }
+
+    let label = type_label(ty, program);
+    let Some(definition) = definition(ty, program) else {
+        return format!("Value of type `{label}`.");
+    };
+    match &definition.kind {
+        TypeDefinitionKind::Struct { fields } => named_struct_documentation(&label, fields.len()),
+        TypeDefinitionKind::Enum { variants } => {
+            let names = variants
+                .iter()
+                .take(8)
+                .map(|variant| format!("`{}`", variant.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Enumeration with variants: {names}.")
+        }
+        TypeDefinitionKind::Tuple { elements } => {
+            format!("Tuple containing {} ordered values.", elements.len())
+        }
+        TypeDefinitionKind::Array { element, length } => format!(
+            "Fixed-size array containing {length} values of type `{}`.",
+            type_label_at_depth(*element, program, 1)
+        ),
+        TypeDefinitionKind::Reference { target, mutable } => {
+            let access = if *mutable { "Mutable" } else { "Immutable" };
+            format!(
+                "{access} borrowed reference to `{}`. The reference does not own the value.",
+                type_label_at_depth(*target, program, 1)
+            )
+        }
+        TypeDefinitionKind::RawPointer { target, mutable } => {
+            let access = if *mutable { "mutable" } else { "const" };
+            format!(
+                "Unsafe raw {access} pointer to `{}`. Dereferencing requires an `unsafe` block.",
+                type_label_at_depth(*target, program, 1)
+            )
+        }
+        TypeDefinitionKind::Slice { element, mutable } => {
+            let access = if *mutable { "Mutable" } else { "Immutable" };
+            format!(
+                "{access} borrowed slice of `{}` values. Its length is known at runtime and indexing is bounds-checked.",
+                type_label_at_depth(*element, program, 1)
+            )
+        }
+        TypeDefinitionKind::Function {
+            parameters,
+            return_type,
+        } => format!(
+            "Function value accepting {} argument(s) and returning `{}`.",
+            parameters.len(),
+            type_label_at_depth(*return_type, program, 1)
+        ),
+    }
+}
+
+const fn primitive_documentation(ty: Type) -> Option<&'static str> {
+    match ty {
+        Type::I8 => Some("8-bit signed integer. Range: `-128` to `127`."),
+        Type::I16 => Some("16-bit signed integer. Range: `-32,768` to `32,767`."),
+        Type::I32 => Some("32-bit signed integer. Range: `-2,147,483,648` to `2,147,483,647`."),
+        Type::I64 => Some(
+            "64-bit signed integer. Range: `-9,223,372,036,854,775,808` to `9,223,372,036,854,775,807`.",
+        ),
+        Type::I128 => Some(
+            "128-bit signed integer. Range: `-170,141,183,460,469,231,731,687,303,715,884,105,728` to `170,141,183,460,469,231,731,687,303,715,884,105,727`.",
+        ),
+        Type::Isize => {
+            Some("Pointer-sized signed integer. Its range follows the active compilation target.")
+        }
+        Type::U8 => Some("8-bit unsigned integer. Range: `0` to `255`."),
+        Type::U16 => Some("16-bit unsigned integer. Range: `0` to `65,535`."),
+        Type::U32 => Some("32-bit unsigned integer. Range: `0` to `4,294,967,295`."),
+        Type::U64 => Some("64-bit unsigned integer. Range: `0` to `18,446,744,073,709,551,615`."),
+        Type::U128 => Some(
+            "128-bit unsigned integer. Range: `0` to `340,282,366,920,938,463,463,374,607,431,768,211,455`.",
+        ),
+        Type::Usize => Some(
+            "Pointer-sized unsigned integer used for sizes and indices. Its range follows the active compilation target.",
+        ),
+        Type::F32 => Some(
+            "32-bit IEEE 754 floating-point number with approximately 6 to 9 decimal digits of precision.",
+        ),
+        Type::F64 => Some(
+            "64-bit IEEE 754 floating-point number with approximately 15 to 17 decimal digits of precision.",
+        ),
+        Type::Bool => Some("Boolean value: `true` or `false`."),
+        Type::Char => Some("Unicode scalar value stored as a single character."),
+        Type::Str => Some(
+            "Immutable, non-owning UTF-8 string view represented by a pointer and a byte length.",
+        ),
+        Type::CStr => Some("Borrowed pointer to a NUL-terminated C byte string."),
+        Type::Unit => Some("Unit type with one value, `()`, used when no result is returned."),
+        Type::Never => Some("Never type for expressions that do not return to their caller."),
+        Type::Struct(_)
+        | Type::Enum(_)
+        | Type::Tuple(_)
+        | Type::Array(_)
+        | Type::Reference(_)
+        | Type::RawPointer(_)
+        | Type::Slice(_)
+        | Type::Function(_) => None,
+    }
+}
+
+fn named_struct_documentation(label: &str, field_count: usize) -> String {
+    let base = label.split('<').next().unwrap_or(label);
+    match base {
+        "std::tensor::TensorViewMut" => {
+            "Mutable, non-owning tensor view. Writes update the underlying tensor storage."
+                .to_owned()
+        }
+        "std::tensor::TensorView" => "Immutable, non-owning view over tensor storage.".to_owned(),
+        "std::tensor::tensor" => {
+            "Owned, row-major tensor with a fixed rank and allocator-backed storage.".to_owned()
+        }
+        "std::collections::Vec" => {
+            "Growable contiguous collection backed by an explicit allocator.".to_owned()
+        }
+        "std::collections::HashMap" => {
+            "Allocator-backed hash table that associates unique keys with values.".to_owned()
+        }
+        "std::collections::HashSet" => "Allocator-backed collection of unique values.".to_owned(),
+        "std::collections::RingBuffer" => {
+            "Fixed-capacity first-in, first-out circular buffer.".to_owned()
+        }
+        "std::string::String" => {
+            "Owned, growable UTF-8 string backed by an explicit allocator.".to_owned()
+        }
+        "std::alloc::Allocator" => {
+            "Handle to an allocation strategy used by allocator-aware APIs.".to_owned()
+        }
+        _ => format!("Struct value containing {field_count} field(s)."),
     }
 }
 

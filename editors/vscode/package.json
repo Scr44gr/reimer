@@ -97,8 +97,6 @@
     "configurationDefaults": {
       "[reimer]": {
         "editor.bracketPairColorization.enabled": true,
-        "editor.guides.bracketPairs": "active",
-        "editor.guides.bracketPairsHorizontal": "active",
         "editor.inlayHints.enabled": "on",
         "editor.matchBrackets": "always"
       }

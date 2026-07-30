@@ -161,7 +161,7 @@ pub fn analyze(source: &str) -> Analysis {
 
     let (type_hints, definitions) = typed.as_ref().map_or_else(
         || (Vec::new(), semantic::syntax_definitions(&syntax)),
-        |program| semantic::index(&syntax, program),
+        |program| semantic::index(source, &syntax, program),
     );
 
     Analysis {
@@ -184,7 +184,17 @@ pub fn index_typed(
     syntax: &ast::Program,
     typed: &hir::Program,
 ) -> (Vec<TypeHint>, Vec<DefinitionLink>) {
-    semantic::index(syntax, typed)
+    semantic::index_with_documentation(syntax, typed, &[])
+}
+
+/// Rebuilds editor indexes and attaches documentation to callable uses.
+#[must_use]
+pub fn index_typed_with_documentation(
+    syntax: &ast::Program,
+    typed: &hir::Program,
+    documentation: &[(hir::FunctionId, String)],
+) -> (Vec<TypeHint>, Vec<DefinitionLink>) {
+    semantic::index_with_documentation(syntax, typed, documentation)
 }
 
 /// Applies lints that require a fully resolved typed program.
