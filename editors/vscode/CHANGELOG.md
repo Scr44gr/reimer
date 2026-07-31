@@ -17,3 +17,5 @@
 - Compiler-linked intradocument rename and dependency-aware incremental
   analysis across all unsaved open modules.
 - Typed `Display` and `Debug` interpolation, including `:?` highlighting.
+- Ownership diagnostics recognize methods whose `self` receiver consumes and
+  transfers the original value.

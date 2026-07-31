@@ -24,8 +24,9 @@ pub(crate) fn lint(source: &str, program: &ast::Program) -> Vec<Finding> {
         });
     }
 
+    let consuming_methods = consuming_method_names(program);
     for function in functions(program) {
-        let mut linter = FunctionLinter::new(source);
+        let mut linter = FunctionLinter::new(source, &consuming_methods);
         walk::function_declaration(&mut linter, function);
         findings.extend(linter.finish());
     }
@@ -71,6 +72,25 @@ fn functions(program: &ast::Program) -> impl Iterator<Item = &ast::Function> {
     })
 }
 
+fn consuming_method_names(program: &ast::Program) -> HashSet<&str> {
+    program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Impl(declaration) => Some(declaration.methods.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|method| {
+            method.parameters.first().is_some_and(|receiver| {
+                receiver.name.name == "self"
+                    && !matches!(receiver.ty.kind, TypeNameKind::Reference { .. })
+            })
+        })
+        .map(|method| method.name.name.as_str())
+        .collect()
+}
+
 struct MutableBinding {
     name: String,
     span: Span,
@@ -82,8 +102,9 @@ struct ResourceBinding {
     kind: &'static str,
 }
 
-struct FunctionLinter<'source> {
+struct FunctionLinter<'source, 'program> {
     source: &'source str,
+    consuming_methods: &'program HashSet<&'program str>,
     findings: Vec<Finding>,
     mutable_bindings: Vec<MutableBinding>,
     assigned: HashSet<String>,
@@ -92,10 +113,11 @@ struct FunctionLinter<'source> {
     transferred: HashSet<String>,
 }
 
-impl<'source> FunctionLinter<'source> {
-    fn new(source: &'source str) -> Self {
+impl<'source, 'program> FunctionLinter<'source, 'program> {
+    fn new(source: &'source str, consuming_methods: &'program HashSet<&'program str>) -> Self {
         Self {
             source,
+            consuming_methods,
             findings: Vec::new(),
             mutable_bindings: Vec::new(),
             assigned: HashSet::new(),
@@ -195,6 +217,9 @@ impl<'source> FunctionLinter<'source> {
             // A method signature may require `&mut self`; the syntax-only lint
             // stays conservative until typed effect information is available.
             self.assigned.insert(owner.to_owned());
+            if self.consuming_methods.contains(name) {
+                self.transferred.insert(owner.to_owned());
+            }
         }
         if name == "deinit" {
             if let Expression::Field(field) = &call.callee
@@ -215,7 +240,7 @@ impl<'source> FunctionLinter<'source> {
     }
 }
 
-impl Visitor for FunctionLinter<'_> {
+impl Visitor for FunctionLinter<'_, '_> {
     fn statement(&mut self, statement: &Statement) {
         match statement {
             Statement::Let(binding) => {
@@ -603,6 +628,46 @@ mod tests {
         let findings = lint(source, &syntax);
 
         assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_treat_by_value_method_receiver_as_ownership_transfer() {
+        let source = "
+            struct Buffer { value: i32 }
+            impl Buffer {
+                fn into_value(self) -> i32 { self.value }
+            }
+            fn main() -> i32 {
+                let buffer = read_to_end(&allocator)?;
+                buffer.into_value()
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_keep_resource_warning_for_borrowed_method_receiver() {
+        let source = "
+            struct Buffer { value: i32 }
+            impl Buffer {
+                fn value(&self) -> i32 { self.value }
+            }
+            fn main() -> i32 {
+                let buffer = read_to_end(&allocator)?;
+                buffer.value()
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(findings.iter().any(|finding| finding.code == "L2010"));
     }
 
     #[test]
