@@ -1,6 +1,7 @@
 //! Static discovery, validation, and AST rewriting for Reimer modules.
 
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -2137,10 +2138,25 @@ fn module_directory(module: &[String], is_facade: bool) -> ModuleName {
 }
 
 fn standard_library_root() -> PathBuf {
+    if let Some(configured_root) = env::var_os("REIMER_STD_PATH") {
+        return PathBuf::from(configured_root);
+    }
+
+    if let Ok(executable) = env::current_exe()
+        && let Some(installed_root) = installed_standard_library_root(&executable)
+    {
+        return installed_root;
+    }
+
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("std")
+}
+
+fn installed_standard_library_root(executable: &Path) -> Option<PathBuf> {
+    let root = executable.parent()?.join("std");
+    root.is_dir().then_some(root)
 }
 
 fn is_facade_path(path: &Path) -> bool {
@@ -2276,7 +2292,8 @@ mod tests {
 
     use super::{
         SourceDependency, SourceGraph, SourcePackage, canonical_name, display_symbol_name,
-        documentation_before, load, load_graph, load_with_overlay, load_with_overlays,
+        documentation_before, installed_standard_library_root, load, load_graph, load_with_overlay,
+        load_with_overlays,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -2312,6 +2329,18 @@ mod tests {
         assert_eq!(
             documentation_before(source, declaration).as_deref(),
             Some("Adds two values.\n\n# Arguments\n- `left`: first value")
+        );
+    }
+
+    #[test]
+    fn installed_standard_library_root_should_find_sibling_directory() {
+        let fixture = Fixture::new();
+        fixture.write("std/alloc.reim", "pub enum AllocError { OutOfMemory }");
+        let executable = fixture.path("reimer.exe");
+
+        assert_eq!(
+            installed_standard_library_root(&executable),
+            Some(fixture.path("std"))
         );
     }
 
