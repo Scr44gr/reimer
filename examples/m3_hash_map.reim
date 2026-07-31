@@ -1,0 +1,150 @@
+from std::alloc import AllocError, general_allocator;
+from std::collections import HashMap;
+
+
+@derive(Copy, Eq, Hash)
+struct Coordinate {
+    row: u32,
+    column: u32,
+}
+
+@derive(Copy, Eq, Hash)
+enum Token {
+    Empty,
+    Pair(u32, u32),
+}
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let created: Result<HashMap<Coordinate, u32>, AllocError> =
+        HashMap::with_capacity(&allocator, 4);
+    let mut coordinates = match created {
+        Ok(value) => value,
+        Err(_) => { return 1; },
+    };
+    defer coordinates.deinit();
+    match coordinates.reserve(1_024) {
+        Ok(_) => (),
+        Err(_) => { return 2; },
+    }
+
+    let mut index: u32 = 0;
+    while index < 1_024 {
+        let key = Coordinate {
+            row: index % 31,
+            column: index,
+        };
+        match coordinates.insert(key, index * 3) {
+            Ok(None) => (),
+            Ok(Some(_)) => { return 3; },
+            Err(_) => { return 4; },
+            _ => { return 24; },
+        }
+        index += 1;
+    }
+    if coordinates.len() != 1_024 {
+        return 5;
+    }
+
+    index = 0;
+    while index < 1_024 {
+        let key = Coordinate {
+            row: index % 31,
+            column: index,
+        };
+        match coordinates.get(key) {
+            Some(value) => {
+                if value != index * 3 {
+                    return 6;
+                }
+            },
+            None => { return 7; },
+        }
+        index += 1;
+    }
+
+    index = 0;
+    while index < 1_024 {
+        if index % 2 == 0 {
+            let key = Coordinate {
+                row: index % 31,
+                column: index,
+            };
+            match coordinates.remove(key) {
+                Some(value) => {
+                    if value != index * 3 {
+                        return 8;
+                    }
+                },
+                None => { return 9; },
+            }
+        }
+        index += 1;
+    }
+
+    index = 1_024;
+    while index < 1_536 {
+        let key = Coordinate {
+            row: index % 31,
+            column: index,
+        };
+        match coordinates.insert(key, index * 3) {
+            Ok(None) => (),
+            Ok(Some(_)) => { return 10; },
+            Err(_) => { return 11; },
+            _ => { return 25; },
+        }
+        index += 1;
+    }
+
+    let replaced_key = Coordinate { row: 7, column: 100 };
+    match coordinates.insert(replaced_key, 99) {
+        Ok(None) => (),
+        Ok(Some(_)) => { return 12; },
+        Err(_) => { return 13; },
+        _ => { return 26; },
+    }
+    match coordinates.insert(replaced_key, 100) {
+        Ok(Some(99)) => (),
+        Ok(_) => { return 14; },
+        Err(_) => { return 15; },
+        _ => { return 27; },
+    }
+
+    let wide_result: Result<HashMap<u128, i32>, AllocError> =
+        HashMap::new(&allocator);
+    let mut wide = match wide_result {
+        Ok(value) => value,
+        Err(_) => { return 19; },
+    };
+    defer wide.deinit();
+    match wide.insert(0x1234_5678_9abc_def0_0123_4567_89ab_cdef, 42) {
+        Ok(_) => (),
+        Err(_) => { return 20; },
+    }
+
+    let tokens_result: Result<HashMap<Token, i32>, AllocError> =
+        HashMap::new(&allocator);
+    let mut tokens = match tokens_result {
+        Ok(value) => value,
+        Err(_) => { return 21; },
+    };
+    defer tokens.deinit();
+    match tokens.insert(Token::Pair(4, 2), 42) {
+        Ok(_) => (),
+        Err(_) => { return 22; },
+    }
+
+    let wide_value = match wide.get(
+        0x1234_5678_9abc_def0_0123_4567_89ab_cdef,
+    ) { Some(value) => value, None => 0 };
+    let token_value = match tokens.get(Token::Pair(4, 2)) {
+        Some(value) => value,
+        None => 0,
+    };
+    if wide_value == 42 && wide_value == token_value {
+        42
+    } else {
+        23
+    }
+}

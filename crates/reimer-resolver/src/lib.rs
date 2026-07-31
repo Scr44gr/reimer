@@ -6878,6 +6878,7 @@ impl<'context> FunctionAnalyzer<'context> {
             "__str_from_parts" => Some(self.analyze_string_from_parts(call, path)),
             "__slice_from_parts" => Some(self.analyze_slice_from_parts(call, path, expected)),
             "__pointee_stride" => Some(self.analyze_pointee_stride(call, path)),
+            "__hash_value" => Some(self.analyze_hash_value(call, path)),
             "__allocate_bytes" => Some(self.analyze_allocate_bytes(call, path, expected)),
             "__deallocate_bytes" => Some(self.analyze_deallocate_bytes(call, path)),
             "__thread_spawn" => Some(self.analyze_thread_spawn(call, path, expected, false)),
@@ -7152,6 +7153,43 @@ impl<'context> FunctionAnalyzer<'context> {
         Expression {
             kind: ExpressionKind::TypeStride { target },
             ty: Type::Usize,
+            span: call.span,
+        }
+    }
+
+    fn analyze_hash_value(&mut self, call: &ast::CallExpression, path: &ast::Path) -> Expression {
+        self.require_standard_collections_intrinsic(call.span);
+        if call.arguments.len() != 2 {
+            self.intrinsic_arity_diagnostic(path, call, 2);
+        }
+        let value = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression(argument),
+        );
+        let seed = call.arguments.get(1).map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::U64)),
+        );
+        for extra in call.arguments.iter().skip(2) {
+            self.analyze_expression(extra);
+        }
+        if !self.types.is_hash_capable(value.ty) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3150",
+                    format!("hashing requires `Hash`, found `{}`", value.ty),
+                    value.span,
+                )
+                .with_help("derive or implement `Hash` for the key type"),
+            );
+        }
+        self.require_type(Type::U64, seed.ty, seed.span, "hash seed");
+        Expression {
+            kind: ExpressionKind::HashValue {
+                value: Box::new(value),
+                seed: Box::new(seed),
+            },
+            ty: Type::U64,
             span: call.span,
         }
     }
@@ -8277,7 +8315,7 @@ impl<'context> FunctionAnalyzer<'context> {
         self.diagnostics.push(
             Diagnostic::error(
                 "E3150",
-                "native element layout is private to `std::collections`",
+                "native collection intrinsics are private to `std::collections`",
                 span,
             )
             .with_help("use a standard owned collection instead"),
@@ -12743,6 +12781,22 @@ mod tests {
     fn resolve_should_keep_native_element_stride_private() {
         let source = "fn invalid() -> usize {
                 __pointee_stride(0 as usize as *const i32)
+            }
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3150")
+        );
+    }
+
+    #[test]
+    fn resolve_should_keep_structural_hashing_private() {
+        let source = "fn invalid() -> u64 {
+                __hash_value(42, 7)
             }
             fn main() -> i32 { 42 }";
 

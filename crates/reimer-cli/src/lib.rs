@@ -652,6 +652,17 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_should_preserve_hash_map_entries_through_growth_and_deletion() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_hash_map.reim");
+
+        let result = execute_file(&path).expect("hash map stress program should execute");
+        let object = compile_file_to_object(&path).expect("hash map stress program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
     fn execute_file_should_complete_m4_module_vertical_slice() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m4_modules/main.reim");

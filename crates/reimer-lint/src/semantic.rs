@@ -752,14 +752,12 @@ impl HirIndexer<'_> {
             | ExpressionKind::StringLength(operand)
             | ExpressionKind::SliceLength(operand) => self.expression(operand),
             ExpressionKind::StringFromParts { data, length }
-            | ExpressionKind::SliceFromParts { data, length } => {
-                self.expression(data);
-                self.expression(length);
-            }
-            ExpressionKind::Binary { left, right, .. } => {
-                self.expression(left);
-                self.expression(right);
-            }
+            | ExpressionKind::SliceFromParts { data, length }
+            | ExpressionKind::HashValue {
+                value: data,
+                seed: length,
+            } => self.expression_pair(data, length),
+            ExpressionKind::Binary { left, right, .. } => self.expression_pair(left, right),
             ExpressionKind::IntegerAddition { mode, left, right } => {
                 self.integer_addition(*mode, left, right, expression.span);
             }
@@ -815,6 +813,11 @@ impl HirIndexer<'_> {
             | ExpressionKind::Unit
             | ExpressionKind::TypeStride { .. } => {}
         }
+    }
+
+    fn expression_pair(&mut self, left: &hir::Expression, right: &hir::Expression) {
+        self.expression(left);
+        self.expression(right);
     }
 
     fn link_local(&mut self, use_span: Span, local: LocalId) {
@@ -1489,9 +1492,11 @@ fn named_struct_documentation(label: &str, field_count: usize) -> String {
             "Growable contiguous collection backed by an explicit allocator.".to_owned()
         }
         "std::collections::HashMap" => {
-            "Allocator-backed hash table that associates unique keys with values.".to_owned()
+            "Flat, allocator-backed hash table with grouped control metadata. Lookup, insertion, and removal are expected O(1).".to_owned()
         }
-        "std::collections::HashSet" => "Allocator-backed collection of unique values.".to_owned(),
+        "std::collections::HashSet" => {
+            "Flat, allocator-backed collection of unique values with expected O(1) membership tests.".to_owned()
+        }
         "std::collections::RingBuffer" => {
             "Fixed-capacity first-in, first-out circular buffer.".to_owned()
         }

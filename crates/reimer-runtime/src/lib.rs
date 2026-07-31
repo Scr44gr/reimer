@@ -11,6 +11,11 @@ use std::thread::JoinHandle;
 
 #[expect(
     unsafe_code,
+    reason = "hash collections use SIMD and validate raw control-byte groups at the ABI boundary"
+)]
+mod collections;
+#[expect(
+    unsafe_code,
     reason = "synchronization primitives expose stable symbols to generated native code"
 )]
 mod concurrency;
@@ -50,6 +55,10 @@ mod temporal;
 )]
 mod text;
 
+pub use collections::{
+    CONTROL_GROUP_MASKS_SYMBOL, HASH_BYTES_SYMBOL, HASH_SEED_SYMBOL, control_group_masks,
+    hash_bytes, hash_seed,
+};
 pub use concurrency::{
     ATOMIC_CLONE_SYMBOL, ATOMIC_COMPARE_EXCHANGE_SYMBOL, ATOMIC_CREATE_SYMBOL,
     ATOMIC_DESTROY_SYMBOL, ATOMIC_FETCH_ADD_SYMBOL, ATOMIC_LOAD_SYMBOL, ATOMIC_STORE_SYMBOL,

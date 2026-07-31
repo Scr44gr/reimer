@@ -6,6 +6,8 @@ pub struct Allocator {
     raw: usize,
 }
 
+impl Copy for Allocator {}
+
 pub struct OwnedBytes {
     data: *mut u8,
     len: usize,
@@ -110,6 +112,16 @@ impl OwnedBytes {
                 panic("std::alloc received invalid bounded byte regions")
             }
         }
+    }
+
+    /// Releases the current region and takes ownership of `replacement`.
+    pub fn replace(&mut self, replacement: OwnedBytes) {
+        unsafe {
+            __deallocate_bytes(self.allocator, self.data, self.len);
+        }
+        self.data = replacement.data;
+        self.len = replacement.len;
+        self.allocator = replacement.allocator;
     }
 
     pub fn deinit(self) {

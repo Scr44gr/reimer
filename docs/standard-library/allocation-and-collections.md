@@ -57,7 +57,9 @@ Useful operations include `len`, `capacity`, `is_empty`, `as_slice`, `as_mut_sli
 
 ## Hash collections
 
-`HashMap<K, V>` supports lookup, containment, insertion, replacement, removal, and explicit cleanup. `HashSet<T>` provides the corresponding key-only operations. Keys must satisfy the required equality and hash contracts.
+`HashMap<K, V>` is a flat, open-addressed table with 16-byte grouped control metadata. It uses per-map randomized structural hashing, an `H2` fingerprint in each occupied control byte, quadratic group probing, and a maximum load of 7/8. Control matching uses SSE2 on x86-64, NEON on AArch64, and a scalar fallback elsewhere.
+
+Lookup, containment, insertion, replacement, and removal have expected O(1) cost. `HashSet<T>` provides the corresponding key-only operations. Keys currently need `Copy + Eq + Hash`, and values need `Copy`; a borrowed scoped `str` therefore cannot be stored as a key. Equal keys must produce equal structural hashes.
 
 ```reimer
 let created: Result<HashMap<u32, i32>, AllocError> =
@@ -70,6 +72,19 @@ let score = match scores.get(7) {
     Some(value) => value,
     None => 0,
 };
+```
+
+Use `with_capacity` when the approximate collection size is known. `reserve(additional)` ensures room for that many extra distinct entries and can also compact deleted slots. `capacity` reports the number of entries that fit before another growth allocation, not the raw number of control slots.
+
+```reimer
+let created: Result<HashSet<u64>, AllocError> =
+    HashSet::with_capacity(&allocator, 1_000);
+let mut seen = created?;
+defer seen.deinit();
+
+seen.reserve(500)?;
+seen.insert(42)?;
+assert(seen.contains(42), "the inserted value should be present");
 ```
 
 ## Ring buffers

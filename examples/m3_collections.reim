@@ -22,7 +22,7 @@ fn main() -> i32 {
     }
 
     let set_result: Result<HashSet<i32>, AllocError> =
-        HashSet::new(&allocator);
+        HashSet::with_capacity(&allocator, 4);
     let mut set = match set_result {
         Ok(value) => value,
         Err(_) => {
@@ -30,6 +30,15 @@ fn main() -> i32 {
         },
     };
     defer set.deinit();
+    if !set.is_empty() || set.capacity() < 4 {
+        return 9;
+    }
+    match set.reserve(16) {
+        Ok(_) => (),
+        Err(_) => {
+            return 10;
+        },
+    }
     match set.insert(7) {
         Ok(_) => (),
         Err(_) => {

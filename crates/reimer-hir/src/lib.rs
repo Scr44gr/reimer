@@ -592,6 +592,13 @@ pub enum ExpressionKind {
         /// Concrete pointee type after generic monomorphization.
         target: Type,
     },
+    /// Computes one seeded structural hash for a `Hash`-capable value.
+    HashValue {
+        /// Concrete value after generic monomorphization.
+        value: Box<Expression>,
+        /// Per-table seed mixed into the result.
+        seed: Box<Expression>,
+    },
     /// Allocates an owned byte region through the runtime allocator ABI.
     AllocateBytes {
         /// Opaque allocator handle.

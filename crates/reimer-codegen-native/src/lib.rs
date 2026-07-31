@@ -318,6 +318,7 @@ pub fn execute_test_with_options(
 
 fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_core_symbols(builder);
+    register_collection_symbols(builder);
     register_target_symbols(builder);
     register_time_symbols(builder);
     register_mathematics_symbols(builder);
@@ -544,6 +545,26 @@ fn register_core_symbols(builder: &mut JITBuilder) {
         ),
     ];
     register_symbol_group(builder, symbols);
+}
+
+fn register_collection_symbols(builder: &mut JITBuilder) {
+    register_symbol_group(
+        builder,
+        [
+            (
+                reimer_runtime::HASH_SEED_SYMBOL,
+                reimer_runtime::hash_seed as *const u8,
+            ),
+            (
+                reimer_runtime::HASH_BYTES_SYMBOL,
+                reimer_runtime::hash_bytes as *const u8,
+            ),
+            (
+                reimer_runtime::CONTROL_GROUP_MASKS_SYMBOL,
+                reimer_runtime::control_group_masks as *const u8,
+            ),
+        ],
+    );
 }
 
 fn register_target_symbols(builder: &mut JITBuilder) {
@@ -1472,6 +1493,27 @@ fn runtime_buffer_equals_reference<M: Module>(
     let function = module
         .declare_function(
             reimer_runtime::BUFFER_EQUALS_SYMBOL,
+            Linkage::Import,
+            &signature,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(module.declare_func_in_func(function, builder.func))
+}
+
+fn runtime_hash_bytes_reference<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+) -> Result<ir::FuncRef, String> {
+    let mut signature = module.make_signature();
+    signature.params.extend([
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+        AbiParam::new(types::I64),
+    ]);
+    signature.returns.push(AbiParam::new(types::I64));
+    let function = module
+        .declare_function(
+            reimer_runtime::HASH_BYTES_SYMBOL,
             Linkage::Import,
             &signature,
         )
@@ -2668,6 +2710,7 @@ fn emit_expression<M: Module>(
         | ExpressionKind::StringFromParts { .. }
         | ExpressionKind::SliceFromParts { .. }
         | ExpressionKind::TypeStride { .. }
+        | ExpressionKind::HashValue { .. }
         | ExpressionKind::AllocateBytes { .. }
         | ExpressionKind::DeallocateBytes { .. }
         | ExpressionKind::ThreadSpawn { .. }
@@ -2921,6 +2964,9 @@ fn emit_runtime_intrinsic_expression<M: Module>(
             length,
         ),
         ExpressionKind::TypeStride { target } => emit_type_stride(builder, state.layouts, *target),
+        ExpressionKind::HashValue { value, seed } => {
+            emit_hash_value_expression(builder, module, functions, state, value, seed)
+        }
         ExpressionKind::AllocateBytes {
             allocator,
             length,
@@ -5841,6 +5887,298 @@ fn emit_saturating_add(
     let left_is_negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, left, 0);
     let bound = builder.ins().select(left_is_negative, minimum, maximum);
     Ok(builder.ins().select(overflow, bound, sum))
+}
+
+fn emit_hash_value_expression<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    value: &Expression,
+    seed: &Expression,
+) -> Result<Emitted, String> {
+    let emitted_value = emit_expression(builder, module, functions, state, value)?;
+    if emitted_value.terminated {
+        return Ok(emitted_value);
+    }
+    let emitted_seed = emit_expression(builder, module, functions, state, seed)?;
+    if emitted_seed.terminated {
+        return Ok(emitted_seed);
+    }
+    let seed = require_value(emitted_seed, "hash seed")?;
+    let hash = emit_value_hash(builder, module, state, value.ty, emitted_value.value, seed)?;
+    Ok(Emitted::value(hash))
+}
+
+fn emit_value_hash<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    ty: Type,
+    value: Option<Value>,
+    seed: Value,
+) -> Result<Value, String> {
+    if ty == Type::Unit {
+        let unit = builder
+            .ins()
+            .iconst(types::I64, 0x4f1b_bcdd_68d8_1e2d_u64.cast_signed());
+        return Ok(emit_hash_word(builder, seed, unit));
+    }
+    let value = value.ok_or_else(|| format!("hash value for `{ty}` has no runtime value"))?;
+    if ty == Type::Str {
+        return emit_string_hash(builder, module, state.layouts, value, seed);
+    }
+    if matches!(ty, Type::I128 | Type::U128) {
+        let low = builder.ins().ireduce(types::I64, value);
+        let shifted = builder.ins().ushr_imm_u(value, 64);
+        let high = builder.ins().ireduce(types::I64, shifted);
+        let hash = emit_hash_word(builder, seed, low);
+        return Ok(emit_hash_word(builder, hash, high));
+    }
+    if !ty.is_composite() {
+        let word = match ty {
+            Type::I8
+            | Type::U8
+            | Type::Bool
+            | Type::I16
+            | Type::U16
+            | Type::I32
+            | Type::U32
+            | Type::Char => builder.ins().uextend(types::I64, value),
+            Type::I64
+            | Type::U64
+            | Type::Isize
+            | Type::Usize
+            | Type::CStr
+            | Type::Reference(_)
+            | Type::RawPointer(_)
+            | Type::Function(_) => value,
+            Type::F32
+            | Type::F64
+            | Type::Never
+            | Type::Unit
+            | Type::Str
+            | Type::Struct(_)
+            | Type::Enum(_)
+            | Type::Tuple(_)
+            | Type::Array(_)
+            | Type::Slice(_) => return Err(format!("type `{ty}` cannot be structurally hashed")),
+            Type::I128 | Type::U128 => unreachable!("128-bit values were handled above"),
+        };
+        return Ok(emit_hash_word(builder, seed, word));
+    }
+    if let Some(fields) = state.layouts.product_fields(ty) {
+        let fields = fields.to_vec();
+        let layout = state.layouts.aggregate(ty)?;
+        let AggregateLayoutKind::Product { offsets } = &layout.kind else {
+            return Err("product metadata does not match its native layout".to_owned());
+        };
+        return emit_product_hash(builder, module, state, &fields, offsets, value, seed);
+    }
+    if let Some((element, length, stride)) = state.layouts.array_shape(ty) {
+        return emit_array_hash(builder, module, state, element, length, stride, value, seed);
+    }
+    if let Some(variants) = state.layouts.enum_variants(ty) {
+        let variants = variants.to_vec();
+        let layout = state.layouts.aggregate(ty)?;
+        let AggregateLayoutKind::Enum { variants: offsets } = &layout.kind else {
+            return Err("enum metadata does not match its native layout".to_owned());
+        };
+        return emit_enum_hash(builder, module, state, &variants, offsets, value, seed);
+    }
+    Err(format!("type `{ty}` has no structural hash layout"))
+}
+
+fn emit_hash_word(builder: &mut FunctionBuilder<'_>, seed: Value, word: Value) -> Value {
+    let increment = builder
+        .ins()
+        .iconst(types::I64, 0x9e37_79b9_7f4a_7c15_u64.cast_signed());
+    let word = builder.ins().iadd(word, increment);
+    let mut mixed = builder.ins().bxor(seed, word);
+    let shifted = builder.ins().ushr_imm_u(mixed, 30);
+    mixed = builder.ins().bxor(mixed, shifted);
+    let multiplier = builder
+        .ins()
+        .iconst(types::I64, 0xbf58_476d_1ce4_e5b9_u64.cast_signed());
+    mixed = builder.ins().imul(mixed, multiplier);
+    let shifted = builder.ins().ushr_imm_u(mixed, 27);
+    mixed = builder.ins().bxor(mixed, shifted);
+    let multiplier = builder
+        .ins()
+        .iconst(types::I64, 0x94d0_49bb_1331_11eb_u64.cast_signed());
+    mixed = builder.ins().imul(mixed, multiplier);
+    let shifted = builder.ins().ushr_imm_u(mixed, 31);
+    builder.ins().bxor(mixed, shifted)
+}
+
+fn emit_product_hash<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    fields: &[Type],
+    offsets: &[u32],
+    address: Value,
+    mut hash: Value,
+) -> Result<Value, String> {
+    if fields.len() != offsets.len() {
+        return Err("product hash metadata has inconsistent field counts".to_owned());
+    }
+    for (field, offset) in fields.iter().zip(offsets) {
+        let field_address = address_at_offset(builder, address, *offset);
+        let field_value = load_at_address(builder, *field, field_address)?.value;
+        hash = emit_value_hash(builder, module, state, *field, field_value, hash)?;
+    }
+    Ok(hash)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "array hashing needs the complete checked layout tuple"
+)]
+fn emit_array_hash<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    element: Type,
+    length: u64,
+    stride: u32,
+    address: Value,
+    seed: Value,
+) -> Result<Value, String> {
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(header, pointer_type());
+    builder.append_block_param(header, types::I64);
+    builder.append_block_param(done, types::I64);
+    let zero = builder.ins().iconst(pointer_type(), 0);
+    builder
+        .ins()
+        .jump(header, &[BlockArg::from(zero), BlockArg::from(seed)]);
+
+    builder.switch_to_block(header);
+    let index = builder
+        .block_params(header)
+        .first()
+        .copied()
+        .ok_or_else(|| "array hash loop has no index".to_owned())?;
+    let hash = builder
+        .block_params(header)
+        .get(1)
+        .copied()
+        .ok_or_else(|| "array hash loop has no accumulator".to_owned())?;
+    let length = i64::try_from(length)
+        .map_err(|_| "array hash length exceeds native addressing".to_owned())?;
+    let length = builder.ins().iconst(pointer_type(), length);
+    let has_element = builder.ins().icmp(IntCC::UnsignedLessThan, index, length);
+    builder
+        .ins()
+        .brif(has_element, body, &[], done, &[BlockArg::from(hash)]);
+
+    builder.switch_to_block(body);
+    let offset = builder.ins().imul_imm_u(index, i64::from(stride));
+    let element_address = builder.ins().iadd(address, offset);
+    let element_value = load_at_address(builder, element, element_address)?.value;
+    let hash = emit_value_hash(builder, module, state, element, element_value, hash)?;
+    let next = builder.ins().iadd_imm_u(index, 1);
+    builder
+        .ins()
+        .jump(header, &[BlockArg::from(next), BlockArg::from(hash)]);
+
+    builder.switch_to_block(done);
+    builder
+        .block_params(done)
+        .first()
+        .copied()
+        .ok_or_else(|| "array hash result is missing".to_owned())
+}
+
+fn emit_enum_hash<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    variants: &[Vec<Type>],
+    offsets: &[Vec<u32>],
+    address: Value,
+    seed: Value,
+) -> Result<Value, String> {
+    if variants.len() != offsets.len() {
+        return Err("enum hash metadata has inconsistent variant counts".to_owned());
+    }
+    let dispatch = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    let discriminant = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), address, 0);
+    let discriminant_word = builder.ins().uextend(types::I64, discriminant);
+    let variant_hash = emit_hash_word(builder, seed, discriminant_word);
+    builder.ins().jump(dispatch, &[]);
+
+    builder.switch_to_block(dispatch);
+    for (index, (fields, field_offsets)) in variants.iter().zip(offsets).enumerate() {
+        let variant_block = builder.create_block();
+        let next = builder.create_block();
+        let index = i64::try_from(index)
+            .map_err(|_| "enum variant index exceeds native discriminant".to_owned())?;
+        let selected = builder.ins().icmp_imm_s(IntCC::Equal, discriminant, index);
+        builder.ins().brif(selected, variant_block, &[], next, &[]);
+        builder.switch_to_block(variant_block);
+        let hash = emit_product_hash(
+            builder,
+            module,
+            state,
+            fields,
+            field_offsets,
+            address,
+            variant_hash,
+        )?;
+        builder.ins().jump(merge, &[BlockArg::from(hash)]);
+        builder.switch_to_block(next);
+    }
+    builder.ins().jump(merge, &[BlockArg::from(variant_hash)]);
+    builder.switch_to_block(merge);
+    builder
+        .block_params(merge)
+        .first()
+        .copied()
+        .ok_or_else(|| "enum hash result is missing".to_owned())
+}
+
+fn emit_string_hash<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    layouts: &Layouts,
+    value: Value,
+    seed: Value,
+) -> Result<Value, String> {
+    let layout = layouts.aggregate(Type::Str)?;
+    let AggregateLayoutKind::Slice {
+        data_offset,
+        length_offset,
+    } = layout.kind
+    else {
+        return Err("string hashing requires a string view layout".to_owned());
+    };
+    let data = builder.ins().load(
+        pointer_type(),
+        MemFlagsData::new(),
+        value,
+        i32::try_from(data_offset).map_err(|_| "string data offset exceeds i32".to_owned())?,
+    );
+    let length = builder.ins().load(
+        pointer_type(),
+        MemFlagsData::new(),
+        value,
+        i32::try_from(length_offset).map_err(|_| "string length offset exceeds i32".to_owned())?,
+    );
+    let function = runtime_hash_bytes_reference(builder, module)?;
+    let call = builder.ins().call(function, &[data, length, seed]);
+    builder
+        .inst_results(call)
+        .first()
+        .copied()
+        .ok_or_else(|| "string hash call has no result".to_owned())
 }
 
 fn emit_value_equality<M: Module>(
