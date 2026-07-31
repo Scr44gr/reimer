@@ -1202,6 +1202,52 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("allocate_bytes", CompletionItemKind::FUNCTION, "std::alloc"),
     ("OperatingSystem", CompletionItemKind::ENUM, "std::target"),
     ("os", CompletionItemKind::FUNCTION, "std::target"),
+    ("EnvError", CompletionItemKind::ENUM, "std::env"),
+    ("Arguments", CompletionItemKind::STRUCT, "std::env"),
+    ("args", CompletionItemKind::FUNCTION, "std::env"),
+    ("argument", CompletionItemKind::FUNCTION, "std::env"),
+    ("var", CompletionItemKind::FUNCTION, "std::env"),
+    ("current_dir", CompletionItemKind::FUNCTION, "std::env"),
+    ("current_exe", CompletionItemKind::FUNCTION, "std::env"),
+    ("ProcessError", CompletionItemKind::ENUM, "std::process"),
+    ("ExitStatus", CompletionItemKind::STRUCT, "std::process"),
+    ("Command", CompletionItemKind::STRUCT, "std::process"),
+    ("Child", CompletionItemKind::STRUCT, "std::process"),
+    ("id", CompletionItemKind::FUNCTION, "std::process"),
+    ("exit", CompletionItemKind::FUNCTION, "std::process"),
+    ("arg", CompletionItemKind::METHOD, "Command::arg"),
+    ("with_arg", CompletionItemKind::METHOD, "Command::with_arg"),
+    ("env", CompletionItemKind::METHOD, "Command::env"),
+    ("with_env", CompletionItemKind::METHOD, "Command::with_env"),
+    (
+        "env_remove",
+        CompletionItemKind::METHOD,
+        "Command::env_remove",
+    ),
+    (
+        "env_clear",
+        CompletionItemKind::METHOD,
+        "Command::env_clear",
+    ),
+    (
+        "without_env",
+        CompletionItemKind::METHOD,
+        "Command::without_env",
+    ),
+    (
+        "with_cleared_env",
+        CompletionItemKind::METHOD,
+        "Command::with_cleared_env",
+    ),
+    (
+        "with_current_dir",
+        CompletionItemKind::METHOD,
+        "Command::with_current_dir",
+    ),
+    ("status", CompletionItemKind::METHOD, "Command::status"),
+    ("spawn", CompletionItemKind::METHOD, "Command::spawn"),
+    ("wait", CompletionItemKind::METHOD, "Child::wait"),
+    ("kill", CompletionItemKind::METHOD, "Child::kill"),
     ("Duration", CompletionItemKind::STRUCT, "std::time"),
     ("Instant", CompletionItemKind::STRUCT, "std::time"),
     ("time", CompletionItemKind::FUNCTION, "std::time"),
@@ -2516,6 +2562,88 @@ fn main() -> i32 {
                 .contains("A non-negative span of time with nanosecond precision.")
         );
         assert!(!binding_contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_environment_and_process_apis() {
+        let source = "from std::env import args;
+from std::process import Command;
+fn main() -> i32 {
+    let arguments = args();
+    let command = Command::new(\"echo\");
+    match command {
+        Ok(command) => {
+            command.deinit();
+            arguments.len() as i32
+        },
+        Err(_) => 0,
+    }
+}
+";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let lines = LineIndex::new(Arc::from(source));
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+        let args_position = lines.position(source.find("args()").expect("args call should exist"));
+        let command_position = lines.position(
+            source
+                .find("Command::new")
+                .expect("command constructor should exist"),
+        );
+
+        let args_hover = document
+            .hover(args_position)
+            .expect("args call should have hover information");
+        let command_hover = document
+            .hover(command_position)
+            .expect("command constructor should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(args_contents) = args_hover.contents else {
+            panic!("args hover should use markdown");
+        };
+        let tower_lsp::lsp_types::HoverContents::Markup(command_contents) = command_hover.contents
+        else {
+            panic!("command hover should use markdown");
+        };
+
+        assert!(
+            args_contents
+                .value
+                .contains("fn std::env::args() -> std::env::Arguments"),
+            "{}",
+            args_contents.value
+        );
+        assert!(
+            args_contents
+                .value
+                .contains("lightweight view over all command-line arguments")
+        );
+        assert!(
+            command_contents.value.contains(
+                "fn std::process::Command::new(program: str) -> \
+                     Result<std::process::Command, std::process::ProcessError>"
+            ),
+            "{}",
+            command_contents.value
+        );
+        assert!(
+            command_contents
+                .value
+                .contains("invokes one executable directly")
+        );
+        assert!(!command_contents.value.contains("__module_"));
+
+        let completions = document.completions();
+        assert!(completions.iter().any(|item| {
+            item.label == "Command" && item.detail.as_deref() == Some("std::process")
+        }));
+        assert!(
+            completions
+                .iter()
+                .any(|item| { item.label == "args" && item.detail.as_deref() == Some("std::env") })
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ similar quality of experience through an original TextMate grammar and LSP.
   imported functions, and local completion items;
 - signatures and documentation for `std::time` clocks, durations, interval
   measurement, and blocking sleep;
+- signatures and documentation for `std::env` arguments and paths plus
+  `std::process` commands, children, and exit status;
 - typed interpolation highlighting and inference for `Display` placeholders
   (`{value}`) and `Debug` placeholders (`{value:?}`);
 - local go-to-definition, compiler-linked rename, document symbols, and
