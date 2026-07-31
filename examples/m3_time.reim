@@ -1,0 +1,27 @@
+from std::time import Duration, Instant, monotonic, perf_counter, sleep, sleep_milliseconds, time, unix_time;
+
+fn main() -> i32 {
+    let wall_before = time();
+    let unix_after = unix_time();
+    let monotonic_before = monotonic();
+    let counter_before = perf_counter();
+    let started = Instant::now();
+
+    sleep(Duration::from_milliseconds(5));
+    sleep_milliseconds(1);
+
+    let elapsed = started.elapsed();
+    let normalized = Duration::from_nanoseconds(1_234_567_890);
+    let zero = Duration::from_microseconds(0);
+    let valid = wall_before > 1_600_000_000.0
+        && unix_after > 1_600_000_000.0
+        && monotonic() >= monotonic_before
+        && perf_counter() >= counter_before
+        && elapsed.as_milliseconds() >= 6
+        && normalized.as_seconds() == 1
+        && normalized.subsec_nanoseconds() == 234_567_890
+        && normalized.as_milliseconds() == 1_234
+        && zero.is_zero();
+
+    if valid { 42 } else { 0 }
+}

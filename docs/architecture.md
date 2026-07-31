@@ -59,6 +59,12 @@ that are not source-language operators. The ABI receives and returns only
 `f32` or `f64`; safe wrappers provide explicit precision and the vector layer
 is implemented entirely in source. See [`mathematics.md`](mathematics.md).
 
+`std::time` keeps wall-clock timestamps separate from monotonic interval
+measurement. Three scalar runtime symbols read Unix seconds, read a
+process-local nanosecond counter, and park the current native thread through
+the operating system. `Duration` and `Instant` remain safe source-level value
+types. See [`time.md`](time.md).
+
 `std::string` keeps allocation decisions in safe source APIs. Concatenation
 precomputes its UTF-8 capacity, incremental formatting reuses an owned
 `String`, typed interpolation selects statically dispatched `Display` or

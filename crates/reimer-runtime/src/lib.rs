@@ -31,6 +31,11 @@ mod job;
 mod mathematics;
 #[expect(
     unsafe_code,
+    reason = "clock and sleep helpers expose stable symbols to generated native code"
+)]
+mod temporal;
+#[expect(
+    unsafe_code,
     reason = "text helpers expose bounded caller-owned buffers to generated native code"
 )]
 mod text;
@@ -82,6 +87,10 @@ pub use mathematics::{
     math_floor_f64, math_ln_f32, math_ln_f64, math_pow_f32, math_pow_f64, math_round_f32,
     math_round_f64, math_sin_f32, math_sin_f64, math_sqrt_f32, math_sqrt_f64, math_tan_f32,
     math_tan_f64,
+};
+pub use temporal::{
+    TIME_MONOTONIC_NANOS_SYMBOL, TIME_SLEEP_SYMBOL, TIME_UNIX_SECONDS_SYMBOL,
+    time_monotonic_nanoseconds, time_sleep, time_unix_seconds,
 };
 pub use text::{
     FORMAT_F32_SYMBOL, FORMAT_F64_SYMBOL, FORMAT_I128_SYMBOL, FORMAT_U128_SYMBOL,

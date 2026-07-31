@@ -367,3 +367,21 @@ trait explicitly, and both contracts write into the caller's existing
 Small bounded runtime helpers implement conversions not directly available in
 Cranelift. They write only into caller-owned capacity and perform no hidden
 allocation. The public standard-library surface remains safe.
+
+## D-017: separate wall and monotonic time
+
+`std::time::time()` and `unix_time()` expose wall-clock seconds relative to the
+Unix epoch. They are timestamps and may move when the operating system adjusts
+its civil clock. Elapsed-time measurements instead use the process-local
+monotonic clock through `Instant`, `monotonic`, or `perf_counter`.
+
+`Duration` is a small `Copy` value containing whole seconds and normalized
+subsecond nanoseconds. Integer constructors avoid normalization overflow, and
+total-unit conversions saturate at `u64::MAX`. `Instant` stores exact monotonic
+nanoseconds and computes saturating differences so an invalid ordering cannot
+underflow.
+
+`sleep(Duration)` parks the current native thread through the host operating
+system. It is a blocking operation, not an active polling loop, and therefore
+does not consume a CPU core while waiting. Async timers remain outside v0.1.
+The safe standard-library wrapper contains the private runtime ABI call.

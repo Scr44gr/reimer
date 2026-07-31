@@ -1202,6 +1202,77 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("allocate_bytes", CompletionItemKind::FUNCTION, "std::alloc"),
     ("OperatingSystem", CompletionItemKind::ENUM, "std::target"),
     ("os", CompletionItemKind::FUNCTION, "std::target"),
+    ("Duration", CompletionItemKind::STRUCT, "std::time"),
+    ("Instant", CompletionItemKind::STRUCT, "std::time"),
+    ("time", CompletionItemKind::FUNCTION, "std::time"),
+    ("unix_time", CompletionItemKind::FUNCTION, "std::time"),
+    ("monotonic", CompletionItemKind::FUNCTION, "std::time"),
+    ("perf_counter", CompletionItemKind::FUNCTION, "std::time"),
+    ("sleep", CompletionItemKind::FUNCTION, "std::time"),
+    ("sleep_seconds", CompletionItemKind::FUNCTION, "std::time"),
+    (
+        "sleep_milliseconds",
+        CompletionItemKind::FUNCTION,
+        "std::time",
+    ),
+    (
+        "from_seconds",
+        CompletionItemKind::METHOD,
+        "Duration::from_seconds",
+    ),
+    (
+        "from_milliseconds",
+        CompletionItemKind::METHOD,
+        "Duration::from_milliseconds",
+    ),
+    (
+        "from_microseconds",
+        CompletionItemKind::METHOD,
+        "Duration::from_microseconds",
+    ),
+    (
+        "from_nanoseconds",
+        CompletionItemKind::METHOD,
+        "Duration::from_nanoseconds",
+    ),
+    (
+        "as_seconds",
+        CompletionItemKind::METHOD,
+        "Duration::as_seconds",
+    ),
+    (
+        "subsec_nanoseconds",
+        CompletionItemKind::METHOD,
+        "Duration::subsec_nanoseconds",
+    ),
+    (
+        "as_seconds_f64",
+        CompletionItemKind::METHOD,
+        "Duration::as_seconds_f64",
+    ),
+    (
+        "as_milliseconds",
+        CompletionItemKind::METHOD,
+        "Duration::as_milliseconds",
+    ),
+    (
+        "as_microseconds",
+        CompletionItemKind::METHOD,
+        "Duration::as_microseconds",
+    ),
+    (
+        "as_nanoseconds",
+        CompletionItemKind::METHOD,
+        "Duration::as_nanoseconds",
+    ),
+    ("is_zero", CompletionItemKind::METHOD, "Duration::is_zero"),
+    ("now", CompletionItemKind::METHOD, "Instant::now"),
+    ("elapsed", CompletionItemKind::METHOD, "Instant::elapsed"),
+    (
+        "duration_since",
+        CompletionItemKind::METHOD,
+        "Instant::duration_since",
+    ),
     ("Option", CompletionItemKind::ENUM, "core"),
     ("Result", CompletionItemKind::ENUM, "core"),
     ("String", CompletionItemKind::STRUCT, "std::string"),
@@ -1566,6 +1637,10 @@ mod tests {
             "AtomicBool",
             "JobPool",
             "parallel_for_mut",
+            "Duration",
+            "Instant",
+            "perf_counter",
+            "sleep",
             "wrapping_add",
             "checked_add",
             "saturating_add",
@@ -2385,6 +2460,61 @@ fn main() -> i32 {
                 .contains("Returns the operating system targeted by the current native build.")
         );
         assert!(binding_contents.value.contains("OperatingSystem"));
+        assert!(!binding_contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_time_signatures_and_documentation() {
+        let source = "from std::time import Duration, Instant, sleep;
+fn main() -> i32 {
+    let duration = Duration::from_milliseconds(1);
+    let started = Instant::now();
+    sleep(duration);
+    let elapsed = started.elapsed();
+    if elapsed.as_milliseconds() >= 1 { 42 } else { 0 }
+}
+";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let lines = LineIndex::new(Arc::from(source));
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+        let call_position =
+            lines.position(source.find("sleep(duration").expect("sleep should exist"));
+        let binding_position = lines.position(
+            source
+                .find("duration =")
+                .expect("duration binding should exist"),
+        );
+
+        let call_hover = document
+            .hover(call_position)
+            .expect("sleep call should have hover information");
+        let binding_hover = document
+            .hover(binding_position)
+            .expect("duration binding should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(call_contents) = call_hover.contents else {
+            panic!("sleep call hover should use markdown");
+        };
+        let tower_lsp::lsp_types::HoverContents::Markup(binding_contents) = binding_hover.contents
+        else {
+            panic!("duration binding hover should use markdown");
+        };
+
+        assert!(call_contents.value.contains("fn std::time::sleep"));
+        assert!(
+            call_contents
+                .value
+                .contains("Blocks the current native thread")
+        );
+        assert!(binding_contents.value.contains("Duration"));
+        assert!(
+            binding_contents
+                .value
+                .contains("A non-negative span of time with nanosecond precision.")
+        );
         assert!(!binding_contents.value.contains("__module_"));
     }
 

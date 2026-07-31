@@ -291,6 +291,7 @@ pub fn execute_test_with_options(
 fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_core_symbols(builder);
     register_target_symbols(builder);
+    register_time_symbols(builder);
     register_mathematics_symbols(builder);
     register_text_symbols(builder);
     register_filesystem_symbols(builder);
@@ -419,6 +420,24 @@ fn register_target_symbols(builder: &mut JITBuilder) {
             reimer_runtime::target_os_code as *const u8,
         )],
     );
+}
+
+fn register_time_symbols(builder: &mut JITBuilder) {
+    let symbols = [
+        (
+            reimer_runtime::TIME_UNIX_SECONDS_SYMBOL,
+            reimer_runtime::time_unix_seconds as *const u8,
+        ),
+        (
+            reimer_runtime::TIME_MONOTONIC_NANOS_SYMBOL,
+            reimer_runtime::time_monotonic_nanoseconds as *const u8,
+        ),
+        (
+            reimer_runtime::TIME_SLEEP_SYMBOL,
+            reimer_runtime::time_sleep as *const u8,
+        ),
+    ];
+    register_symbol_group(builder, symbols);
 }
 
 fn register_mathematics_symbols(builder: &mut JITBuilder) {
@@ -1724,7 +1743,7 @@ fn define_function<M: Module>(
 
     module
         .define_function(function_id, &mut context)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("failed to define function `{}`: {error:?}", function.name))?;
     module.clear_context(&mut context);
     Ok(())
 }

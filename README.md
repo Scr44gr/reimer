@@ -14,7 +14,8 @@ by `unsafe`. Runtime `assert` and debug-only `debug_assert` preserve explicit
 failure messages, and `std::target::os()` exposes the host as a typed enum. The
 standard library includes explicit allocators, safe I/O, owned files with
 explicit allocator-backed reads, recoverable slice access, allocation-free
-UTF-8 byte and character iteration, scalar and vector math, allocator-aware
+UTF-8 byte and character iteration, wall and monotonic clocks, blocking
+CPU-idle sleep, scalar and vector math, allocator-aware
 concatenation and primitive formatting, Unicode text queries, `String`, `Vec`,
 typed `f"..."` interpolation with statically dispatched `Display` and `Debug`,
 `HashMap`, `HashSet`, `RingBuffer`, contiguous tensors with safe views, threads,
@@ -59,6 +60,7 @@ cargo run -p reimer-cli -- run examples/m3_utf8.reim
 cargo run -p reimer-cli -- run examples/m3_assertions.reim
 cargo run -p reimer-cli -- run examples/m3_filesystem.reim
 cargo run -p reimer-cli -- run examples/m3_math.reim
+cargo run -p reimer-cli -- run examples/m3_time.reim
 cargo run -p reimer-cli -- run examples/m3_text.reim
 cargo run -p reimer-cli -- run examples/m3_interpolation.reim
 cargo run -p reimer-cli -- run examples/m5_ffi.reim

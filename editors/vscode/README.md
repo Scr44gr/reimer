@@ -14,6 +14,8 @@ similar quality of experience through an original TextMate grammar and LSP.
   standard-library descriptions, and no internal compiler symbol names;
 - Markdown documentation from `///` comments on declarations, direct calls,
   imported functions, and local completion items;
+- signatures and documentation for `std::time` clocks, durations, interval
+  measurement, and blocking sleep;
 - typed interpolation highlighting and inference for `Display` placeholders
   (`{value}`) and `Debug` placeholders (`{value:?}`);
 - local go-to-definition, compiler-linked rename, document symbols, and

@@ -1,0 +1,184 @@
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+const MICROS_PER_SECOND: u64 = 1_000_000;
+const MILLIS_PER_SECOND: u64 = 1_000;
+const MAX_U64: u64 = 18_446_744_073_709_551_615;
+
+@link("runtime")
+extern "C" {
+    fn time_unix_seconds() -> f64;
+    fn time_monotonic_nanoseconds() -> u64;
+    fn time_sleep(seconds: u64, nanoseconds: u32);
+}
+
+/// A non-negative span of time with nanosecond precision.
+///
+/// Construction normalizes the subsecond component, so values passed to the
+/// native sleep boundary always satisfy its invariants.
+@derive(Copy, Clone, Debug, Eq, Default)
+pub struct Duration {
+    seconds: u64,
+    nanoseconds: u32,
+}
+
+/// One reading from the process-local monotonic clock.
+///
+/// An instant is suitable for measuring elapsed time, but it is not a wall
+/// clock timestamp and must not be persisted across process executions.
+@derive(Copy, Clone, Debug, Eq)
+pub struct Instant {
+    ticks: u64,
+}
+
+impl Duration {
+    /// Creates an exact whole-second duration.
+    pub fn from_seconds(seconds: u64) -> Duration {
+        Duration { seconds: seconds, nanoseconds: 0 }
+    }
+
+    /// Creates a duration from a whole number of milliseconds.
+    pub fn from_milliseconds(milliseconds: u64) -> Duration {
+        Duration {
+            seconds: milliseconds / MILLIS_PER_SECOND,
+            nanoseconds: ((milliseconds % MILLIS_PER_SECOND) * 1_000_000) as u32,
+        }
+    }
+
+    /// Creates a duration from a whole number of microseconds.
+    pub fn from_microseconds(microseconds: u64) -> Duration {
+        Duration {
+            seconds: microseconds / MICROS_PER_SECOND,
+            nanoseconds: ((microseconds % MICROS_PER_SECOND) * 1_000) as u32,
+        }
+    }
+
+    /// Creates a duration from a whole number of nanoseconds.
+    pub fn from_nanoseconds(nanoseconds: u64) -> Duration {
+        Duration {
+            seconds: nanoseconds / NANOS_PER_SECOND,
+            nanoseconds: (nanoseconds % NANOS_PER_SECOND) as u32,
+        }
+    }
+
+    /// Returns the complete whole-second component.
+    pub fn as_seconds(&self) -> u64 {
+        self.seconds
+    }
+
+    /// Returns the fractional nanoseconds after the whole-second component.
+    pub fn subsec_nanoseconds(&self) -> u32 {
+        self.nanoseconds
+    }
+
+    /// Returns the duration as fractional seconds.
+    pub fn as_seconds_f64(&self) -> f64 {
+        self.seconds as f64 + self.nanoseconds as f64 / NANOS_PER_SECOND as f64
+    }
+
+    /// Returns truncated milliseconds, saturating at the largest `u64`.
+    pub fn as_milliseconds(&self) -> u64 {
+        saturating_total(
+            self.seconds,
+            self.nanoseconds as u64 / 1_000_000,
+            MILLIS_PER_SECOND,
+        )
+    }
+
+    /// Returns truncated microseconds, saturating at the largest `u64`.
+    pub fn as_microseconds(&self) -> u64 {
+        saturating_total(
+            self.seconds,
+            self.nanoseconds as u64 / 1_000,
+            MICROS_PER_SECOND,
+        )
+    }
+
+    /// Returns nanoseconds, saturating at the largest `u64`.
+    pub fn as_nanoseconds(&self) -> u64 {
+        saturating_total(
+            self.seconds,
+            self.nanoseconds as u64,
+            NANOS_PER_SECOND,
+        )
+    }
+
+    /// Returns whether this duration contains no time.
+    pub fn is_zero(&self) -> bool {
+        self.seconds == 0 && self.nanoseconds == 0
+    }
+}
+
+fn saturating_total(seconds: u64, subsecond: u64, units_per_second: u64) -> u64 {
+    if seconds > (MAX_U64 - subsecond) / units_per_second {
+        MAX_U64
+    } else {
+        seconds * units_per_second + subsecond
+    }
+}
+
+impl Instant {
+    /// Reads the process-local monotonic clock.
+    pub fn now() -> Instant {
+        Instant { ticks: unsafe { time_monotonic_nanoseconds() } }
+    }
+
+    /// Returns the time elapsed since this instant.
+    pub fn elapsed(&self) -> Duration {
+        let current = Instant::now();
+        current.duration_since(self)
+    }
+
+    /// Returns the saturating duration since an earlier instant.
+    pub fn duration_since(&self, earlier: &Instant) -> Duration {
+        if self.ticks >= earlier.ticks {
+            Duration::from_nanoseconds(self.ticks - earlier.ticks)
+        } else {
+            Duration::from_nanoseconds(0)
+        }
+    }
+}
+
+/// Returns wall-clock seconds before or after the Unix epoch.
+///
+/// Wall-clock adjustments can move this value forwards or backwards. Use
+/// `Instant` or `monotonic` when measuring elapsed time.
+pub fn unix_time() -> f64 {
+    unsafe { time_unix_seconds() }
+}
+
+/// Python-style alias for `unix_time`.
+pub fn time() -> f64 {
+    unix_time()
+}
+
+/// Returns fractional seconds from a process-local monotonic clock.
+pub fn monotonic() -> f64 {
+    unsafe { time_monotonic_nanoseconds() } as f64 / NANOS_PER_SECOND as f64
+}
+
+/// Returns the highest-resolution monotonic counter available to the runtime.
+///
+/// This is an alias for `monotonic`; `Instant` preserves exact nanoseconds for
+/// interval measurements.
+pub fn perf_counter() -> f64 {
+    monotonic()
+}
+
+/// Blocks the current native thread for at least `duration`.
+///
+/// The operating system parks the thread, so waiting does not use a busy loop
+/// and other runnable threads may continue executing.
+pub fn sleep(duration: Duration) {
+    unsafe {
+        time_sleep(duration.seconds, duration.nanoseconds);
+    }
+}
+
+/// Blocks the current native thread for a whole number of seconds.
+pub fn sleep_seconds(seconds: u64) {
+    sleep(Duration::from_seconds(seconds));
+}
+
+/// Blocks the current native thread for a whole number of milliseconds.
+pub fn sleep_milliseconds(milliseconds: u64) {
+    sleep(Duration::from_milliseconds(milliseconds));
+}

@@ -19,3 +19,5 @@
 - Typed `Display` and `Debug` interpolation, including `:?` highlighting.
 - Ownership diagnostics recognize methods whose `self` receiver consumes and
   transfers the original value.
+- Completion and hover documentation for `std::time`, including `Duration`,
+  `Instant`, monotonic measurement, and blocking sleep.
