@@ -315,6 +315,18 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_should_complete_numeric_literal_vertical_slice() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m2_numeric_literals.reim");
+
+        let result = execute_file(&path).expect("numeric literal program should execute");
+        let object = compile_file_to_object(&path).expect("numeric literal program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
     fn execute_source_should_complete_m2_composite_vertical_slice() {
         let source = include_str!("../../../examples/m2_composites.reim");
 

@@ -154,6 +154,20 @@ assertScope(
   "COUNTER",
   "variable.other.constant.reimer",
 );
+for (const literal of ["0xDEAD_BEEF", "0b1010_0110", "0o755", "1_000_000"]) {
+  assertScope(
+    grammar,
+    `let value = ${literal};`,
+    literal,
+    "constant.numeric.integer.reimer",
+  );
+}
+assertScope(
+  grammar,
+  "let value = 1_024.5_0e2;",
+  "1_024.5_0e2",
+  "constant.numeric.float.reimer",
+);
 for (const tokenText of ["*", "->"]) {
   assertScope(
     grammar,

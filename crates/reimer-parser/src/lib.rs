@@ -2122,8 +2122,9 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_integer_literal(&mut self, spelling: &str, span: Span) -> Option<Expression> {
-        let normalized = spelling.replace('_', "");
-        if let Ok(value) = normalized.parse::<u128>() {
+        let (radix, digits) = integer_literal_parts(spelling);
+        let normalized = digits.replace('_', "");
+        if let Ok(value) = u128::from_str_radix(&normalized, radix) {
             Some(Expression::Integer(IntegerLiteral { value, span }))
         } else {
             self.diagnostics.push(Diagnostic::error(
@@ -2326,6 +2327,27 @@ impl<'tokens> Parser<'tokens> {
         {
             self.advance();
         }
+    }
+}
+
+fn integer_literal_parts(spelling: &str) -> (u32, &str) {
+    if let Some(digits) = spelling
+        .strip_prefix("0b")
+        .or_else(|| spelling.strip_prefix("0B"))
+    {
+        (2, digits)
+    } else if let Some(digits) = spelling
+        .strip_prefix("0o")
+        .or_else(|| spelling.strip_prefix("0O"))
+    {
+        (8, digits)
+    } else if let Some(digits) = spelling
+        .strip_prefix("0x")
+        .or_else(|| spelling.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else {
+        (10, spelling)
     }
 }
 
@@ -2534,6 +2556,33 @@ mod tests {
         };
         assert!(matches!(outer.value, Expression::Cast(_)));
         assert!(matches!(outer.target.kind, TypeNameKind::Path(_)));
+    }
+
+    #[test]
+    fn parse_should_normalize_integer_bases_and_separators() {
+        let source = "fn main() -> i32 { let values = (0xFF, 0b1010, 0o755, 1_000_000); 0 }";
+        let tokens = lex(source).expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected function");
+        };
+        let Statement::Let(binding) = &function.body.statements[0] else {
+            panic!("expected binding");
+        };
+        let Expression::Tuple(tuple) = &binding.initializer else {
+            panic!("expected tuple");
+        };
+        let values = tuple
+            .elements
+            .iter()
+            .map(|element| match element {
+                Expression::Integer(literal) => literal.value,
+                _ => panic!("expected integer literal"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, [255, 10, 493, 1_000_000]);
     }
 
     #[test]

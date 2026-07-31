@@ -45,6 +45,7 @@ cargo run -p reimer-cli -- build examples/exit_42.reim
 cargo run -p reimer-cli -- run examples/exit_42.reim
 cargo run -p reimer-cli -- run examples/m1_language.reim
 cargo run -p reimer-cli -- run examples/m2_scalars.reim
+cargo run -p reimer-cli -- run examples/m2_numeric_literals.reim
 cargo run -p reimer-cli -- run examples/m2_composites.reim
 cargo run -p reimer-cli -- run examples/m2_control.reim
 cargo run -p reimer-cli -- run examples/m3_views.reim
@@ -101,6 +102,8 @@ Target-correct C aliases and raw-pointer helpers are documented in
 [`docs/c-interop.md`](docs/c-interop.md).
 Allocator-aware concatenation, primitive formatting, and Unicode behavior are
 documented in [`docs/text-and-formatting.md`](docs/text-and-formatting.md).
+Integer bases, numeric separators, contextual typing, and literal range rules
+are documented in [`docs/numeric-literals.md`](docs/numeric-literals.md).
 `reimer doc` validates the complete package and writes its public `///`
 documentation to `target/reimer/doc/<package>.md`.
 

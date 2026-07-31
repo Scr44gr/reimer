@@ -1,0 +1,16 @@
+fn main() -> i32 {
+    let decimal = 1_000_000;
+    let hexadecimal: u32 = 0xDEAD_BEEF;
+    let binary = 0b1010_0110;
+    let octal = 0o755;
+
+    if decimal == 1_000_000
+        && hexadecimal == 3_735_928_559
+        && binary == 166
+        && octal == 493
+    {
+        42
+    } else {
+        0
+    }
+}

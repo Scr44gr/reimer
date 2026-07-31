@@ -420,6 +420,13 @@ impl<'source> Lexer<'source> {
     }
 
     fn number(&mut self, start: usize) {
+        if self.source.as_bytes().get(start) == Some(&b'0')
+            && let Some((radix, name)) = self.integer_radix_prefix()
+        {
+            self.prefixed_integer(start, radix, name);
+            return;
+        }
+
         while self.cursor < self.source.len() {
             let byte = self.source.as_bytes()[self.cursor];
             if !byte.is_ascii_digit() && byte != b'_' {
@@ -427,6 +434,7 @@ impl<'source> Lexer<'source> {
             }
             self.cursor += 1;
         }
+        self.validate_decimal_separators(start, self.cursor);
 
         let mut is_float = false;
         if self.source.as_bytes().get(self.cursor) == Some(&b'.')
@@ -438,7 +446,9 @@ impl<'source> Lexer<'source> {
         {
             is_float = true;
             self.cursor += 1;
+            let fraction_start = self.cursor;
             self.scan_decimal_digits();
+            self.validate_decimal_separators(fraction_start, self.cursor);
         }
         if matches!(self.source.as_bytes().get(self.cursor), Some(b'e' | b'E')) {
             is_float = true;
@@ -448,7 +458,12 @@ impl<'source> Lexer<'source> {
             }
             let exponent_start = self.cursor;
             self.scan_decimal_digits();
-            if exponent_start == self.cursor {
+            let exponent_has_digit = self.source[exponent_start..self.cursor]
+                .bytes()
+                .any(|byte| byte.is_ascii_digit());
+            if exponent_has_digit {
+                self.validate_decimal_separators(exponent_start, self.cursor);
+            } else {
                 self.diagnostics.push(
                     Diagnostic::error(
                         "E0003",
@@ -470,6 +485,59 @@ impl<'source> Lexer<'source> {
         });
     }
 
+    fn integer_radix_prefix(&mut self) -> Option<(u32, &'static str)> {
+        let (radix, name) = match self.source.as_bytes().get(self.cursor).copied()? {
+            b'b' | b'B' => (2, "binary"),
+            b'o' | b'O' => (8, "octal"),
+            b'x' | b'X' => (16, "hexadecimal"),
+            _ => return None,
+        };
+        self.cursor += 1;
+        Some((radix, name))
+    }
+
+    fn prefixed_integer(&mut self, start: usize, radix: u32, name: &str) {
+        let digits_start = self.cursor;
+        while self
+            .source
+            .as_bytes()
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            self.cursor += 1;
+        }
+
+        let digits = &self.source[digits_start..self.cursor];
+        if digits.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E0011",
+                    format!("{name} integer literal requires at least one digit"),
+                    Span::new(start, self.cursor),
+                )
+                .with_help(format!("add a base-{radix} digit after the prefix")),
+            );
+        } else if let Some((offset, character)) = invalid_radix_digit(digits, radix) {
+            let invalid_start = digits_start.saturating_add(offset);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E0011",
+                    format!("digit `{character}` is not valid in a {name} integer literal"),
+                    Span::new(invalid_start, invalid_start.saturating_add(1)),
+                )
+                .with_help(format!("use only base-{radix} digits and `_` separators")),
+            );
+        } else if let Some(offset) = invalid_separator(digits, |byte| radix_accepts(radix, byte)) {
+            let separator_start = digits_start.saturating_add(offset);
+            self.numeric_separator_diagnostic(separator_start);
+        }
+
+        self.tokens.push(Token {
+            kind: TokenKind::Integer(self.source[start..self.cursor].to_owned()),
+            span: Span::new(start, self.cursor),
+        });
+    }
+
     fn scan_decimal_digits(&mut self) {
         while let Some(byte) = self.source.as_bytes().get(self.cursor) {
             if !byte.is_ascii_digit() && *byte != b'_' {
@@ -477,6 +545,26 @@ impl<'source> Lexer<'source> {
             }
             self.cursor += 1;
         }
+    }
+
+    fn validate_decimal_separators(&mut self, start: usize, end: usize) {
+        let Some(digits) = self.source.get(start..end) else {
+            return;
+        };
+        if let Some(offset) = invalid_separator(digits, |byte| byte.is_ascii_digit()) {
+            self.numeric_separator_diagnostic(start.saturating_add(offset));
+        }
+    }
+
+    fn numeric_separator_diagnostic(&mut self, start: usize) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E0012",
+                "numeric separator `_` must appear between two digits",
+                Span::new(start, start.saturating_add(1)),
+            )
+            .with_help("write separators between digits, for example `1_000_000`"),
+        );
     }
 
     fn character(&mut self, start: usize) {
@@ -800,6 +888,35 @@ fn is_identifier_continue(character: char) -> bool {
     is_identifier_start(character) || character.is_ascii_digit()
 }
 
+fn invalid_radix_digit(digits: &str, radix: u32) -> Option<(usize, char)> {
+    digits
+        .char_indices()
+        .find(|(_, character)| *character != '_' && character.to_digit(radix).is_none())
+}
+
+fn invalid_separator(digits: &str, accepts_digit: impl Fn(u8) -> bool) -> Option<usize> {
+    let bytes = digits.as_bytes();
+    bytes.iter().enumerate().find_map(|(index, byte)| {
+        if *byte != b'_' {
+            return None;
+        }
+        let separated = index
+            .checked_sub(1)
+            .and_then(|previous| bytes.get(previous))
+            .copied()
+            .is_some_and(&accepts_digit)
+            && bytes
+                .get(index.saturating_add(1))
+                .copied()
+                .is_some_and(&accepts_digit);
+        (!separated).then_some(index)
+    })
+}
+
+fn radix_accepts(radix: u32, byte: u8) -> bool {
+    char::from(byte).is_digit(radix)
+}
+
 fn shift_tokens(tokens: Vec<Token>, offset: usize) -> Vec<Token> {
     tokens
         .into_iter()
@@ -952,6 +1069,57 @@ mod tests {
                 TokenKind::Character('λ') | TokenKind::LeftShiftEqual
             )
         }));
+    }
+
+    #[test]
+    fn lex_should_tokenize_integer_bases_and_numeric_separators() {
+        let source = "0xDEAD_BEEF 0B1010_0110 0o755 1_000_000 1_024.5_0e2";
+
+        let tokens = lex(source).expect("numeric literals should lex");
+        let spellings = tokens
+            .iter()
+            .filter_map(|token| match &token.kind {
+                TokenKind::Integer(spelling) | TokenKind::Float(spelling) => {
+                    Some(spelling.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            spellings,
+            [
+                "0xDEAD_BEEF",
+                "0B1010_0110",
+                "0o755",
+                "1_000_000",
+                "1_024.5_0e2",
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_should_reject_invalid_based_digits_and_numeric_separators() {
+        for source in ["0x", "0b102", "0o8"] {
+            let diagnostics = lex(source).expect_err("invalid based literal should fail");
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0011"),
+                "expected a based-literal diagnostic for {source}"
+            );
+        }
+        for source in ["1__000", "123_", "0x_FF", "1e_2"] {
+            let diagnostics = lex(source).expect_err("invalid separator should fail");
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0012"),
+                "expected a separator diagnostic for {source}"
+            );
+        }
     }
 
     #[test]
