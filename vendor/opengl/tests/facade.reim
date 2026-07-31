@@ -1,0 +1,16 @@
+from self::facade import COLOR_BUFFER, DEPTH_BUFFER, STENCIL_BUFFER;
+import self::raw;
+
+fn main() -> i32 {
+    let color = COLOR_BUFFER;
+    let color_depth = color.with(DEPTH_BUFFER);
+    let mask = color_depth.with(STENCIL_BUFFER);
+    let expected: u32 = raw::GL_COLOR_BUFFER_BIT
+        | raw::GL_DEPTH_BUFFER_BIT
+        | raw::GL_STENCIL_BUFFER_BIT;
+    if mask.raw() == expected && raw::CORE_FUNCTION_COUNT > 300 {
+        0
+    } else {
+        1
+    }
+}

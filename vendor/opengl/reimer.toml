@@ -1,0 +1,12 @@
+[package]
+name = "opengl"
+version = "4.6.0"
+edition = "2026"
+
+[dependencies]
+
+[profile.debug]
+optimization = 0
+
+[profile.release]
+optimization = 3

@@ -1,0 +1,3 @@
+/// Khronos OpenGL 4.6 core types, constants, and context-local command loading.
+pub from self::facade import COLOR_BUFFER, ClearMask, DEPTH_BUFFER, Error, STENCIL_BUFFER, clear, clear_color, get_error, viewport;
+pub import self::raw as raw;

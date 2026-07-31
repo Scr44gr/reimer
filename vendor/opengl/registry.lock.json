@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/KhronosGroup/OpenGL-Registry",
+  "commit": "9d527dbc81bb76e35ba284fe385ed8a5ddb90cbc",
+  "path": "xml/gl.xml",
+  "sha256": "5e5ae64cad4dc4d4d3d122790086a0bb9df41eba53917d0b0fc93890c7c35499",
+  "api": "gl",
+  "version": "4.6"
+}

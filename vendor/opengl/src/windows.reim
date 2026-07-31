@@ -1,0 +1,30 @@
+/// Windows WGL/OpenGL command resolution independent of context creation.
+
+@link("opengl32")
+extern "C" {
+    fn wglGetProcAddress(name: cstr) -> *const u8;
+}
+
+@link("kernel32")
+extern "C" {
+    fn GetModuleHandleA(name: cstr) -> *mut ();
+    fn GetProcAddress(module: *mut (), name: cstr) -> *const u8;
+}
+
+/// Resolves an OpenGL command for the current Windows OpenGL context.
+///
+/// OpenGL 1.1 commands fall back to exports from `opengl32.dll` as required by
+/// the WGL loading rules. The caller must have made a context current first.
+pub fn get_proc_address(name: cstr) -> *const u8 {
+    let extension = unsafe { wglGetProcAddress(name) };
+    let value = extension as usize;
+    if value > 3 && value as isize != -1 {
+        return extension;
+    }
+    let module = unsafe { GetModuleHandleA(c"opengl32.dll") };
+    if module as usize == 0 {
+        0 as usize as *const u8
+    } else {
+        unsafe { GetProcAddress(module, name) }
+    }
+}

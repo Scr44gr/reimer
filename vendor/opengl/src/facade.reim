@@ -1,0 +1,124 @@
+import self::raw;
+
+/// A bit mask accepted by `clear`.
+@derive(Copy, Clone, Debug, Eq)
+pub struct ClearMask {
+    value: u32,
+}
+
+impl ClearMask {
+    /// Creates a mask from raw OpenGL bits.
+    pub fn from_raw(value: u32) -> ClearMask {
+        ClearMask { value: value }
+    }
+
+    /// Combines two clear masks.
+    pub fn with(&self, other: ClearMask) -> ClearMask {
+        ClearMask {
+            value: self.value | other.value,
+        }
+    }
+
+    /// Returns the OpenGL bit representation.
+    pub fn raw(&self) -> u32 {
+        self.value
+    }
+}
+
+/// Clears the color buffer.
+pub const COLOR_BUFFER: ClearMask = ClearMask {
+    value: raw::GL_COLOR_BUFFER_BIT,
+};
+/// Clears the depth buffer.
+pub const DEPTH_BUFFER: ClearMask = ClearMask {
+    value: raw::GL_DEPTH_BUFFER_BIT,
+};
+/// Clears the stencil buffer.
+pub const STENCIL_BUFFER: ClearMask = ClearMask {
+    value: raw::GL_STENCIL_BUFFER_BIT,
+};
+
+/// Errors reported by the checked facade.
+@derive(Copy, Clone, Debug, Eq)
+pub enum Error {
+    FunctionUnavailable,
+    InvalidEnum,
+    InvalidValue,
+    InvalidOperation,
+    InvalidFramebufferOperation,
+    OutOfMemory,
+    ContextLost,
+    Unknown(u32),
+}
+
+/// Sets the clear color when the command is available.
+pub fn clear_color(
+    functions: &raw::Functions,
+    red: f32,
+    green: f32,
+    blue: f32,
+    alpha: f32,
+) -> Result<(), Error> {
+    match functions.glClearColor {
+        Some(call) => {
+            call(red, green, blue, alpha);
+            Ok(())
+        },
+        None => Err(Error::FunctionUnavailable),
+    }
+}
+
+/// Clears the selected buffers when the command is available.
+pub fn clear(functions: &raw::Functions, mask: ClearMask) -> Result<(), Error> {
+    match functions.glClear {
+        Some(call) => {
+            call(mask.raw());
+            Ok(())
+        },
+        None => Err(Error::FunctionUnavailable),
+    }
+}
+
+/// Sets the viewport when the command is available.
+pub fn viewport(
+    functions: &raw::Functions,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), Error> {
+    match functions.glViewport {
+        Some(call) => {
+            call(x, y, width, height);
+            Ok(())
+        },
+        None => Err(Error::FunctionUnavailable),
+    }
+}
+
+/// Reads and maps the oldest OpenGL error.
+pub fn get_error(functions: &raw::Functions) -> Result<Option<Error>, Error> {
+    let code = match functions.glGetError {
+        Some(call) => call(),
+        None => {
+            return Err(Error::FunctionUnavailable);
+        },
+    };
+    if code == raw::GL_NO_ERROR {
+        Ok(None)
+    } else if code == raw::GL_INVALID_ENUM {
+        Ok(Some(Error::InvalidEnum))
+    } else if code == raw::GL_INVALID_VALUE {
+        Ok(Some(Error::InvalidValue))
+    } else if code == raw::GL_INVALID_OPERATION {
+        Ok(Some(Error::InvalidOperation))
+    } else if code == raw::GL_INVALID_FRAMEBUFFER_OPERATION {
+        Ok(Some(Error::InvalidFramebufferOperation))
+    } else if code == raw::GL_OUT_OF_MEMORY {
+        Ok(Some(Error::OutOfMemory))
+    } else if code == raw::GL_CONTEXT_LOST {
+        Ok(Some(Error::ContextLost))
+    } else {
+        Ok(Some(Error::Unknown(code)))
+    }
+}

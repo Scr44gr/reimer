@@ -1,0 +1,10 @@
+format = 1
+
+[[package]]
+id = "522b7861fc2f32769ab2f94f"
+name = "opengl"
+version = "4.6.0"
+source = "path+."
+checksum = "08461dca30538279f44b22564e34e9649ad5fa65e22a9531d68444d55667c6ee"
+dependencies = []
+
