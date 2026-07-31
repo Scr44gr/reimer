@@ -1,0 +1,237 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Resolve release tag
+        id: tag
+        shell: pwsh
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$env:REQUESTED_TAG"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag and package versions
+        id: version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: ./scripts/release/verify-tag.ps1 -Tag $env:RELEASE_TAG
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Run strict Clippy checks
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --locked --
+          -W clippy::perf
+          -W clippy::redundant_clone
+          -W clippy::needless_collect
+          -D warnings
+
+  build:
+    name: Package ${{ matrix.name }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            host: x86_64-unknown-linux-gnu
+            suffix: ""
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            host: aarch64-unknown-linux-gnu
+            suffix: ""
+          - name: windows-x64
+            os: windows-latest
+            host: x86_64-pc-windows-msvc
+            suffix: .exe
+          - name: macos-x64
+            os: macos-15-intel
+            host: x86_64-apple-darwin
+            suffix: ""
+          - name: macos-arm64
+            os: macos-15
+            host: aarch64-apple-darwin
+            suffix: ""
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify native host
+        shell: pwsh
+        run: |
+          $hostLine = rustc -vV | Select-String '^host:'
+          $actualHost = $hostLine.ToString().Substring(5).Trim()
+          if ($actualHost -ne '${{ matrix.host }}') {
+            throw "runner host '$actualHost' does not match '${{ matrix.host }}'"
+          }
+
+      - name: Build release tools
+        run: >-
+          cargo build --release --locked
+          -p reimer-cli
+          -p reimer-lsp
+          -p reimer-lint
+
+      - name: Smoke-test release compiler
+        shell: pwsh
+        run: |
+          $compiler = (Resolve-Path "target/release/reimer${{ matrix.suffix }}").Path
+          $program = Join-Path $env:RUNNER_TEMP "exit_42${{ matrix.suffix }}"
+          & $compiler check examples/exit_42.reim
+          if ($LASTEXITCODE -ne 0) { throw 'release compiler check failed' }
+          & $compiler build examples/exit_42.reim --release -o $program
+          if ($LASTEXITCODE -ne 0) { throw 'release compiler build failed' }
+          & $program
+          if ($LASTEXITCODE -ne 42) {
+            throw "native smoke test returned $LASTEXITCODE instead of 42"
+          }
+
+      - name: Package release archive
+        id: package
+        shell: pwsh
+        run: >-
+          ./scripts/release/package.ps1
+          -Version '${{ needs.validate.outputs.version }}'
+          -TargetHost '${{ matrix.host }}'
+
+      - name: Smoke-test packaged layout
+        shell: pwsh
+        run: |
+          $archive = (Resolve-Path '${{ steps.package.outputs.archive }}').Path
+          $unpackRoot = Join-Path $env:RUNNER_TEMP 'reimer-package-smoke-${{ matrix.name }}'
+          New-Item -ItemType Directory -Path $unpackRoot | Out-Null
+
+          if ($archive.EndsWith('.zip')) {
+            Expand-Archive -LiteralPath $archive -DestinationPath $unpackRoot
+          } else {
+            & tar -C $unpackRoot -xzf $archive
+            if ($LASTEXITCODE -ne 0) { throw 'release archive extraction failed' }
+          }
+
+          $packageName = 'reimer-v${{ needs.validate.outputs.version }}-${{ matrix.host }}'
+          $compiler = Join-Path $unpackRoot "$packageName/reimer${{ matrix.suffix }}"
+          & $compiler --version
+          if ($LASTEXITCODE -ne 0) { throw 'packaged compiler did not start' }
+          & $compiler check examples/m3_time.reim
+          if ($LASTEXITCODE -ne 0) {
+            throw 'packaged compiler could not resolve its standard library'
+          }
+
+      - name: Install Node.js for VS Code package
+        if: runner.os == 'Windows'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Package VS Code extension
+        if: runner.os == 'Windows'
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npm test
+          npm run package
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload VS Code extension
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-vscode
+          path: editors/vscode/*.vsix
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          $assets = @(Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name)
+          if ($assets.Count -eq 0) { throw 'no release assets were downloaded' }
+
+          $arguments = @(
+            'release', 'create', $env:RELEASE_TAG,
+            '--verify-tag',
+            '--generate-notes',
+            '--title', "Reimer $env:RELEASE_TAG"
+          )
+          $arguments += $assets.FullName
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }

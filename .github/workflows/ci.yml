@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Run strict Clippy checks
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --locked --
+          -W clippy::perf
+          -W clippy::redundant_clone
+          -W clippy::needless_collect
+          -D warnings
+
+  native-smoke:
+    name: Native smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: ""
+          - os: windows-latest
+            suffix: .exe
+          - os: macos-latest
+            suffix: ""
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build optimized compiler
+        run: cargo build --release --locked -p reimer-cli
+
+      - name: Check and link a native program
+        shell: pwsh
+        run: |
+          $compiler = (Resolve-Path "target/release/reimer${{ matrix.suffix }}").Path
+          & $compiler check examples/exit_42.reim
+          if ($LASTEXITCODE -ne 0) { throw 'reimer check failed' }
+
+          & $compiler run examples/exit_42.reim --release
+          if ($LASTEXITCODE -ne 0) { throw 'reimer run failed' }
+
+          $program = Join-Path $env:RUNNER_TEMP "exit_42${{ matrix.suffix }}"
+          & $compiler build examples/exit_42.reim --release -o $program
+          if ($LASTEXITCODE -ne 0) { throw 'reimer build failed' }
+
+          & $program
+          if ($LASTEXITCODE -ne 42) {
+            throw "native program returned $LASTEXITCODE instead of 42"
+          }
+
+  editor:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install extension dependencies
+        run: npm ci
+
+      - name: Test extension and grammar
+        run: npm test
