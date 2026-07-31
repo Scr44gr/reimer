@@ -147,7 +147,10 @@ impl Type {
     /// Returns whether this is a thin address value.
     #[must_use]
     pub const fn is_thin_pointer(self) -> bool {
-        matches!(self, Self::Reference(_) | Self::RawPointer(_) | Self::CStr)
+        matches!(
+            self,
+            Self::Reference(_) | Self::RawPointer(_) | Self::Function(_) | Self::CStr
+        )
     }
 
     /// Returns the integer width for the current compilation host.

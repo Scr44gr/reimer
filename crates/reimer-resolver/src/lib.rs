@@ -2391,6 +2391,15 @@ impl TypeRegistry {
                     || self.is_ffi_safe_type(target)
                     || self.is_c_representation_struct(target)
             }),
+            Type::Function(_) => {
+                self.function_shape(ty)
+                    .is_some_and(|(parameters, return_type)| {
+                        parameters
+                            .iter()
+                            .all(|parameter| self.is_ffi_safe_type(*parameter))
+                            && self.is_ffi_safe_return_type(return_type)
+                    })
+            }
             Type::I128
             | Type::U128
             | Type::Char
@@ -2399,7 +2408,6 @@ impl TypeRegistry {
             | Type::Tuple(_)
             | Type::Array(_)
             | Type::Reference(_)
-            | Type::Function(_)
             | Type::Slice(_)
             | Type::Str
             | Type::Unit
@@ -10006,6 +10014,22 @@ impl<'context> FunctionAnalyzer<'context> {
             .resolve_type_name_in(&cast.target, &self.generic_environment, self.diagnostics)
             .unwrap_or(Type::Unit);
         let value = self.analyze_expression(&cast.value);
+        if matches!(target, Type::Function(_))
+            && value.ty != target
+            && value.ty != Type::Never
+            && self.unsafe_depth == 0
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E5002",
+                    "casting an address to a function pointer requires `unsafe`",
+                    cast.span,
+                )
+                .with_help(
+                    "validate the loaded symbol and perform the cast inside `unsafe { ... }`",
+                ),
+            );
+        }
         if value.ty != Type::Never && !is_valid_cast(value.ty, target) {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -10606,7 +10630,7 @@ fn is_valid_cast(source: Type, target: Type) -> bool {
         || (source == Type::Char && target.is_integer())
         || (source.is_thin_pointer() && target.is_thin_pointer())
         || (source.is_thin_pointer() && target == Type::Usize)
-        || (source == Type::Usize && matches!(target, Type::RawPointer(_)))
+        || (source == Type::Usize && matches!(target, Type::RawPointer(_) | Type::Function(_)))
 }
 
 fn is_builtin_trait(name: &str) -> bool {
@@ -12627,6 +12651,67 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "E5001")
         );
+    }
+
+    #[test]
+    fn resolve_should_accept_abi_safe_callbacks_in_external_signatures() {
+        let source = "
+            extern \"C\" fn native_apply(
+                callback: fn(i32) -> i32,
+                value: i32,
+            ) -> i32;
+            fn increment(value: i32) -> i32 { value + 1 }
+            fn main() -> i32 {
+                unsafe { native_apply(increment, 41) }
+            }";
+
+        resolve_fixture(source).expect("ABI-safe callback should resolve");
+    }
+
+    #[test]
+    fn resolve_should_reject_non_abi_safe_callback_parameters() {
+        let source = "
+            extern \"C\" fn install(callback: fn(str) -> ());
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E5001")
+        );
+    }
+
+    #[test]
+    fn resolve_should_require_unsafe_for_address_to_function_casts() {
+        let source = "
+            fn main() -> i32 {
+                let address = 1 as usize;
+                let callback = address as fn(i32) -> i32;
+                callback(41)
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E5002")
+        );
+    }
+
+    #[test]
+    fn resolve_should_accept_unsafe_loaded_function_casts() {
+        let source = "
+            extern \"C\" fn load(name: cstr) -> fn() -> ();
+            fn main() -> i32 {
+                let loaded = unsafe { load(c\"increment\") };
+                let callback = unsafe { loaded as fn(i32) -> i32 };
+                callback(41)
+            }";
+
+        resolve_fixture(source).expect("unsafe function cast should resolve");
     }
 
     #[test]

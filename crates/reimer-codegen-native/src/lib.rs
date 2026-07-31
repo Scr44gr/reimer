@@ -7350,7 +7350,7 @@ fn emit_cast<M: Module>(
 
     let converted = if (source.is_thin_pointer() && target.is_thin_pointer())
         || (source.is_thin_pointer() && target == Type::Usize)
-        || (source == Type::Usize && matches!(target, Type::RawPointer(_)))
+        || (source == Type::Usize && matches!(target, Type::RawPointer(_) | Type::Function(_)))
     {
         value
     } else if (source.is_integer() || source == Type::Char) && target.is_integer() {
@@ -8087,6 +8087,22 @@ mod tests {
                  callback(left, right)
              }
              fn main() -> i32 { apply(add, 20, 22) }",
+        );
+
+        let result = execute(&program).expect("fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_call_a_function_loaded_from_an_address() {
+        let program = compile_fixture(
+            "fn increment(value: i32) -> i32 { value + 1 }
+             fn main() -> i32 {
+                 let address = increment as usize;
+                 let callback = unsafe { address as fn(i32) -> i32 };
+                 callback(41)
+             }",
         );
 
         let result = execute(&program).expect("fixture should execute");

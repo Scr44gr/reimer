@@ -50,6 +50,29 @@ binding requires and tests each platform ABI case.
 booleans. Use `Bool` only when the C declaration specifically uses `_Bool` or
 `bool`.
 
+## Callbacks and loaded functions
+
+An external signature may accept or return a typed function pointer when every
+parameter and return value is ABI-safe:
+
+```reimer
+extern "C" fn install(callback: fn(i32) -> i32);
+```
+
+This supports C callbacks and APIs such as Vulkan that load commands at
+runtime. Reinterpreting a raw address or one function signature as another
+requires an explicit `unsafe` block:
+
+```reimer
+let loaded = unsafe { get_proc_address(c"draw") };
+let draw = unsafe { loaded as fn(u32, u32) -> () };
+```
+
+The caller must prove that the address is non-null, remains valid for every
+call, uses the platform C calling convention, and exactly matches the target
+signature. Passing references, slices, `str`, or owning Reimer values through
+a C callback remains rejected.
+
 ## Safety boundary
 
 Declaring and calling an external function still requires `unsafe`. A signature
