@@ -122,6 +122,10 @@
               },
               "patterns": [
                 {
+                  "name": "storage.modifier.format.debug.reimer",
+                  "match": ":\\?(?=\\s*\\})"
+                },
+                {
                   "include": "$self"
                 }
               ]

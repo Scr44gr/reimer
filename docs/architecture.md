@@ -61,9 +61,10 @@ is implemented entirely in source. See [`mathematics.md`](mathematics.md).
 
 `std::string` keeps allocation decisions in safe source APIs. Concatenation
 precomputes its UTF-8 capacity, incremental formatting reuses an owned
-`String`, and Unicode queries operate on borrowed views. Bounded runtime
-helpers cover float formatting, full-width integer conversion, scalar
-encoding, and Unicode case properties without hidden allocation. See
+`String`, typed interpolation selects statically dispatched `Display` or
+`Debug`, and Unicode queries operate on borrowed views. Bounded runtime helpers
+cover float formatting, full-width integer conversion, scalar encoding, and
+Unicode case properties without hidden allocation. See
 [`text-and-formatting.md`](text-and-formatting.md).
 
 ## Integer overflow

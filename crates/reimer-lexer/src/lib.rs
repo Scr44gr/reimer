@@ -25,9 +25,20 @@ pub enum FormattedStringFragment {
     Expression {
         /// Tokens with spans shifted into the containing source file.
         tokens: Vec<Token>,
+        /// Presentation selected by the placeholder suffix.
+        style: FormattingStyle,
         /// Source range inside the braces.
         span: Span,
     },
+}
+
+/// Presentation requested for one interpolated value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormattingStyle {
+    /// User-facing formatting from `{value}`.
+    Display,
+    /// Developer-facing formatting from `{value:?}`.
+    Debug,
 }
 
 /// Token categories recognized by the current lexer.
@@ -648,7 +659,8 @@ impl<'source> Lexer<'source> {
                     let Some(expression_end) = self.scan_interpolation_end(start) else {
                         return;
                     };
-                    let expression_source = &self.source[expression_start..expression_end];
+                    let placeholder_source = &self.source[expression_start..expression_end];
+                    let (expression_source, style) = split_formatting_style(placeholder_source);
                     if expression_source.trim().is_empty() {
                         self.diagnostics.push(
                             Diagnostic::error(
@@ -662,7 +674,11 @@ impl<'source> Lexer<'source> {
                         match lex(expression_source) {
                             Ok(tokens) => fragments.push(FormattedStringFragment::Expression {
                                 tokens: shift_tokens(tokens, expression_start),
-                                span: Span::new(expression_start, expression_end),
+                                style,
+                                span: Span::new(
+                                    expression_start,
+                                    expression_start + expression_source.len(),
+                                ),
                             }),
                             Err(diagnostics) => {
                                 self.diagnostics.extend(diagnostics.into_iter().map(
@@ -928,7 +944,7 @@ fn shift_tokens(tokens: Vec<Token>, offset: usize) -> Vec<Token> {
                         FormattedStringFragment::Text { span, .. } => {
                             *span = shift_span(*span, offset);
                         }
-                        FormattedStringFragment::Expression { tokens, span } => {
+                        FormattedStringFragment::Expression { tokens, span, .. } => {
                             *span = shift_span(*span, offset);
                             *tokens = shift_tokens(std::mem::take(tokens), offset);
                         }
@@ -952,11 +968,20 @@ const fn shift_span(span: Span, offset: usize) -> Span {
     )
 }
 
+fn split_formatting_style(placeholder: &str) -> (&str, FormattingStyle) {
+    let trimmed = placeholder.trim_end();
+    trimmed
+        .strip_suffix(":?")
+        .map_or((placeholder, FormattingStyle::Display), |expression| {
+            (expression, FormattingStyle::Debug)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use reimer_diagnostics::Span;
 
-    use super::{FormattedStringFragment, TokenKind, lex};
+    use super::{FormattedStringFragment, FormattingStyle, TokenKind, lex};
 
     #[test]
     fn lex_should_tokenize_m0_program() {
@@ -991,17 +1016,35 @@ mod tests {
         ));
         let FormattedStringFragment::Expression {
             tokens: expression,
+            style,
             span,
         } = &fragments[1]
         else {
             panic!("second fragment should be an expression");
         };
         assert_eq!(*span, Span::new(32, 43));
+        assert_eq!(*style, FormattingStyle::Display);
         assert_eq!(
             expression[0].kind,
             TokenKind::Identifier("player".to_owned())
         );
         assert_eq!(expression[0].span, Span::new(32, 38));
+    }
+
+    #[test]
+    fn lex_should_recognize_debug_interpolation() {
+        let tokens =
+            lex("let message = f\"player={player:?}\";").expect("debug interpolation should lex");
+        let TokenKind::FormattedString(fragments) = &tokens[3].kind else {
+            panic!("fourth token should be a formatted string");
+        };
+        let FormattedStringFragment::Expression { tokens, style, .. } = &fragments[1] else {
+            panic!("second fragment should be an expression");
+        };
+
+        assert_eq!(*style, FormattingStyle::Debug);
+        assert_eq!(tokens[0].kind, TokenKind::Identifier("player".to_owned()));
+        assert_eq!(tokens[0].span, Span::new(24, 30));
     }
 
     #[test]

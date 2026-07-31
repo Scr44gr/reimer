@@ -16,8 +16,8 @@ standard library includes explicit allocators, safe I/O, owned files with
 explicit allocator-backed reads, recoverable slice access, allocation-free
 UTF-8 byte and character iteration, scalar and vector math, allocator-aware
 concatenation and primitive formatting, Unicode text queries, `String`, `Vec`,
-typed `f"..."` interpolation with statically dispatched `Display`, `HashMap`,
-`HashSet`, `RingBuffer`, contiguous tensors with safe views, threads,
+typed `f"..."` interpolation with statically dispatched `Display` and `Debug`,
+`HashMap`, `HashSet`, `RingBuffer`, contiguous tensors with safe views, threads,
 synchronization, atomics, and a work-stealing job pool:
 
 ```reimer

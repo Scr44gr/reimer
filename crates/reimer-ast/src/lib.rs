@@ -721,8 +721,10 @@ pub struct FormattedStringExpression {
 pub enum FormattedStringFragment {
     /// Decoded literal UTF-8.
     Text(StringLiteral),
-    /// An expression written between braces.
-    Expression(Expression),
+    /// An expression using its user-facing representation.
+    Display(Expression),
+    /// An expression using its developer-facing representation.
+    Debug(Expression),
 }
 
 /// A pattern-based branch expression.

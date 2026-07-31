@@ -1488,7 +1488,9 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
         | Expression::Unit(_) => {}
         Expression::FormattedString(formatted) => {
             for fragment in &formatted.fragments {
-                if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                if let ast::FormattedStringFragment::Display(expression)
+                | ast::FormattedStringFragment::Debug(expression) = fragment
+                {
                     visit_expression_paths(expression, paths);
                 }
             }
@@ -1919,11 +1921,7 @@ fn rewrite_expression(
         | Expression::Boolean(_)
         | Expression::Unit(_) => {}
         Expression::FormattedString(formatted) => {
-            for fragment in &mut formatted.fragments {
-                if let ast::FormattedStringFragment::Expression(expression) = fragment {
-                    rewrite_expression(expression, scope, apis, diagnostics);
-                }
-            }
+            rewrite_formatted_fragments(formatted, scope, apis, diagnostics);
         }
         Expression::Tuple(tuple) => {
             for element in &mut tuple.elements {
@@ -2007,6 +2005,21 @@ fn rewrite_expression(
         }
         Expression::Try { value, .. } => {
             rewrite_expression(value, scope, apis, diagnostics);
+        }
+    }
+}
+
+fn rewrite_formatted_fragments(
+    formatted: &mut ast::FormattedStringExpression,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+) {
+    for fragment in &mut formatted.fragments {
+        if let ast::FormattedStringFragment::Display(expression)
+        | ast::FormattedStringFragment::Debug(expression) = fragment
+        {
+            rewrite_expression(expression, scope, apis, diagnostics);
         }
     }
 }

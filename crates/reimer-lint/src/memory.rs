@@ -202,7 +202,9 @@ impl<'function> Estimator<'function> {
             }
             Expression::FormattedString(formatted) => {
                 for fragment in &formatted.fragments {
-                    if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                    if let ast::FormattedStringFragment::Display(expression)
+                    | ast::FormattedStringFragment::Debug(expression) = fragment
+                    {
                         self.scan_expression(expression, loop_depth);
                     }
                 }

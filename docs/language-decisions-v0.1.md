@@ -359,6 +359,11 @@ formatting covers the full 128-bit range, float formatting uses a shortest
 round-trippable representation, and Unicode case conversion returns an owned
 string because one scalar can map to multiple scalars.
 
+Typed interpolation distinguishes user-facing `Display` (`{value}`) from
+developer-facing `Debug` (`{value:?}`). Nominal values implement the selected
+trait explicitly, and both contracts write into the caller's existing
+`String` through a safe `Formatter`.
+
 Small bounded runtime helpers implement conversions not directly available in
 Cranelift. They write only into caller-owned capacity and perform no hidden
 allocation. The public standard-library surface remains safe.

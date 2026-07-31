@@ -1,0 +1,19 @@
+from std::alloc import AllocError, general_allocator;
+from std::string import String;
+
+struct Undebuggable {
+    value: i32,
+}
+
+fn build() -> Result<(), AllocError> {
+    let allocator = general_allocator();
+    let value = Undebuggable { value: 42 };
+    let mut message = String::with_capacity(&allocator, 32)?;
+    message.push_format(f"value={value:?}")?;
+    message.deinit();
+    Ok(())
+}
+
+fn main() -> i32 {
+    0
+}

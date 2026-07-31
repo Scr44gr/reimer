@@ -543,6 +543,25 @@ mod tests {
     }
 
     #[test]
+    fn check_file_should_require_debug_for_debug_interpolation() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/m3_missing_debug_error.reim");
+
+        let diagnostics = check_file(&path).expect_err("missing Debug should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.diagnostic.code == "E3161"
+                && diagnostic.diagnostic.message.contains("Undebuggable")
+                && !diagnostic.diagnostic.message.contains("__module_")
+                && diagnostic
+                    .diagnostic
+                    .help
+                    .as_deref()
+                    .is_some_and(|help| help.contains("std::fmt::Debug"))
+        }));
+    }
+
+    #[test]
     fn execute_file_should_complete_owned_vector_vertical_slice() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_vec.reim");
 

@@ -17,7 +17,9 @@ use reimer_ast::{
     UnaryExpression, UnaryOperator, WherePredicate, WhileStatement,
 };
 use reimer_diagnostics::{Diagnostic, Span};
-use reimer_lexer::{FormattedStringFragment as LexicalFormattedFragment, Token, TokenKind};
+use reimer_lexer::{
+    FormattedStringFragment as LexicalFormattedFragment, FormattingStyle, Token, TokenKind,
+};
 
 /// Parses a token stream into a Reimer syntax tree.
 ///
@@ -1870,10 +1872,17 @@ impl<'tokens> Parser<'tokens> {
                 LexicalFormattedFragment::Text { value, span } => {
                     parsed.push(FormattedStringFragment::Text(StringLiteral { value, span }));
                 }
-                LexicalFormattedFragment::Expression { tokens, .. } => {
+                LexicalFormattedFragment::Expression { tokens, style, .. } => {
                     match Parser::new(&tokens).parse_complete_expression() {
                         Ok(expression) => {
-                            parsed.push(FormattedStringFragment::Expression(expression));
+                            parsed.push(match style {
+                                FormattingStyle::Display => {
+                                    FormattedStringFragment::Display(expression)
+                                }
+                                FormattingStyle::Debug => {
+                                    FormattedStringFragment::Debug(expression)
+                                }
+                            });
                         }
                         Err(diagnostics) => {
                             self.diagnostics.extend(diagnostics);
@@ -2411,8 +2420,33 @@ mod tests {
         ));
         assert!(matches!(
             &formatted.fragments[1],
-            FormattedStringFragment::Expression(Expression::Path(path))
+            FormattedStringFragment::Display(Expression::Path(path))
                 if path.display() == "name"
+        ));
+    }
+
+    #[test]
+    fn parse_should_preserve_debug_interpolation_style() {
+        let tokens =
+            lex("fn main() { message.push_format(f\"{player:?}\"); }").expect("fixture should lex");
+        let program = parse(&tokens).expect("fixture should parse");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("fixture should contain a function");
+        };
+        let Statement::Expression(statement) = &function.body.statements[0] else {
+            panic!("function should contain an expression statement");
+        };
+        let Expression::Call(call) = &statement.expression else {
+            panic!("statement should be a call");
+        };
+        let Expression::FormattedString(formatted) = &call.arguments[0] else {
+            panic!("call should contain a formatted string");
+        };
+
+        assert!(matches!(
+            &formatted.fragments[0],
+            FormattedStringFragment::Debug(Expression::Path(path))
+                if path.display() == "player"
         ));
     }
 

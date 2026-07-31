@@ -16,3 +16,4 @@
 - Bracket matching without intrusive active-block guide lines.
 - Compiler-linked intradocument rename and dependency-aware incremental
   analysis across all unsaved open modules.
+- Typed `Display` and `Debug` interpolation, including `:?` highlighting.

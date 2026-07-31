@@ -1,5 +1,5 @@
 from std::alloc import AllocError, general_allocator;
-from std::fmt import Display, FormatError, Formatter;
+from std::fmt import Debug, Display, FormatError, Formatter;
 from std::string import String;
 
 struct Player {
@@ -17,6 +17,17 @@ impl Display for Player {
     }
 }
 
+impl Debug for Player {
+    fn fmt_debug(
+        &self,
+        formatter: &mut Formatter,
+    ) -> Result<(), FormatError> {
+        formatter.write_str("Player { score: ")?;
+        formatter.write_u128(self.score as u128)?;
+        formatter.write_str(" }")
+    }
+}
+
 fn build_message() -> Result<i32, AllocError> {
     let allocator = general_allocator();
     let name: str = "Ada";
@@ -25,10 +36,10 @@ fn build_message() -> Result<i32, AllocError> {
     let mut message = String::with_capacity(&allocator, 64)?;
 
     message.push_format(
-        f"hello {name}, score={score}, active={true}, player={player}",
+        f"hello {name}, score={score}, active={true}, player={player}, debug={player:?}",
     )?;
     let valid = message.matches(
-        "hello Ada, score=42, active=true, player=Player(7)",
+        "hello Ada, score=42, active=true, player=Player(7), debug=Player { score: 7 }",
     );
     message.deinit();
 

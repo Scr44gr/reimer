@@ -96,6 +96,12 @@ assertScope(
 );
 assertScope(
   grammar,
+  'let text = f"value={score:?}";',
+  ":?",
+  "storage.modifier.format.debug.reimer",
+);
+assertScope(
+  grammar,
   "comptime fn factorial(value: usize) -> usize { value }",
   "comptime",
   "storage.modifier.reimer",

@@ -52,7 +52,7 @@ base-ten formatting. Floating-point methods use the shortest round-trippable
 display representation. Float formatting and 128-bit integer conversion use
 bounded runtime buffers; they do not allocate behind the source program.
 
-## Interpolated strings and `Display`
+## Interpolated strings, `Display`, and `Debug`
 
 An `f"..."` expression is a typed list of text and value placeholders. It is
 appended to an existing owned string so the allocator and failure path remain
@@ -67,7 +67,7 @@ Primitive values, `str`, and `String` use compiler-selected standard writes.
 A user-defined nominal type must implement `std::fmt::Display`:
 
 ```reimer
-from std::fmt import Display, FormatError, Formatter;
+from std::fmt import Debug, Display, FormatError, Formatter;
 
 struct Player {
     score: u32,
@@ -89,6 +89,29 @@ impl Display for Player {
 implementations are type errors. `Formatter` writes directly into the
 destination `String`, so a custom implementation cannot hide a second
 allocation. Write `{{` or `}}` for a literal brace.
+
+Developer-facing formatting uses the explicit `:?` placeholder suffix and a
+separate `std::fmt::Debug` contract:
+
+```reimer
+impl Debug for Player {
+    fn fmt_debug(
+        &self,
+        formatter: &mut Formatter,
+    ) -> Result<(), FormatError> {
+        formatter.write_str("Player { score: ")?;
+        formatter.write_u128(self.score as u128)?;
+        formatter.write_str(" }")
+    }
+}
+
+message.push_format(f"player={player:?}")?;
+```
+
+Primitive values use their compiler-selected formatter in both modes.
+Nominal types must implement the trait selected by the placeholder, so a
+`Display` implementation cannot accidentally satisfy `:?` and a `Debug`
+implementation cannot silently become user-facing output.
 
 ## UTF-8 queries
 

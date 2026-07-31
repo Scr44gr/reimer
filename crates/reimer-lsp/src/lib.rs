@@ -1205,6 +1205,7 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("Option", CompletionItemKind::ENUM, "core"),
     ("Result", CompletionItemKind::ENUM, "core"),
     ("String", CompletionItemKind::STRUCT, "std::string"),
+    ("Debug", CompletionItemKind::INTERFACE, "std::fmt"),
     ("Display", CompletionItemKind::INTERFACE, "std::fmt"),
     ("Formatter", CompletionItemKind::STRUCT, "std::fmt"),
     ("FormatArgs", CompletionItemKind::STRUCT, "std::fmt"),
@@ -1273,6 +1274,7 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
         CompletionItemKind::METHOD,
         "Formatter::write_f64",
     ),
+    ("fmt_debug", CompletionItemKind::METHOD, "Debug::fmt_debug"),
     ("concat", CompletionItemKind::FUNCTION, "std::string"),
     ("concat3", CompletionItemKind::FUNCTION, "std::string"),
     ("repeat", CompletionItemKind::FUNCTION, "std::string"),
@@ -1567,6 +1569,7 @@ mod tests {
             "wrapping_add",
             "checked_add",
             "saturating_add",
+            "Debug",
             "Display",
             "Formatter",
             "push_format",
@@ -2534,7 +2537,7 @@ fn build() -> Result<i32, AllocError> {
     let allocator = general_allocator();
     let score = 42;
     let mut message = String::with_capacity(&allocator, 32)?;
-    message.push_format(f\"score={score}\")?;
+    message.push_format(f\"score={score:?}\")?;
     message.deinit();
     Ok(score)
 }
@@ -2549,7 +2552,7 @@ fn main() -> i32 { 0 }
         );
         let value_position = lines.position(
             source
-                .find("{score}")
+                .find("{score:?}")
                 .expect("formatted value should exist")
                 .saturating_add(1),
         );

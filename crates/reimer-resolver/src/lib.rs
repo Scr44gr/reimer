@@ -21,6 +21,14 @@ use reimer_types::{Type, TypeId};
 const STANDARD_STRING_TYPE: &str = "__module_3_std_6_string$String";
 const STANDARD_DISPLAY_TRAIT: &str = "__module_3_std_6_string$Display";
 const STANDARD_APPEND_DISPLAY: &str = "__module_3_std_6_string$append_display";
+const STANDARD_DEBUG_TRAIT: &str = "__module_3_std_6_string$Debug";
+const STANDARD_APPEND_DEBUG: &str = "__module_3_std_6_string$append_debug";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormattingMode {
+    Display,
+    Debug,
+}
 
 /// Resolves names and checks the types of one parsed compilation unit.
 ///
@@ -4641,7 +4649,9 @@ impl<'context> FunctionAnalyzer<'context> {
             }
             AstExpression::FormattedString(formatted) => {
                 for fragment in &formatted.fragments {
-                    if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                    if let ast::FormattedStringFragment::Display(expression)
+                    | ast::FormattedStringFragment::Debug(expression) = fragment
+                    {
                         self.analyze_expression(expression);
                     }
                 }
@@ -6048,12 +6058,24 @@ impl<'context> FunctionAnalyzer<'context> {
                         literal.span,
                     ));
                 }
-                ast::FormattedStringFragment::Expression(value) => {
+                ast::FormattedStringFragment::Display(value) => {
                     if let Some(expression) = self.analyze_formatted_value(
                         field,
                         receiver_type,
                         value,
                         signature.return_type,
+                        FormattingMode::Display,
+                    ) {
+                        calls.push(expression);
+                    }
+                }
+                ast::FormattedStringFragment::Debug(value) => {
+                    if let Some(expression) = self.analyze_formatted_value(
+                        field,
+                        receiver_type,
+                        value,
+                        signature.return_type,
+                        FormattingMode::Debug,
                     ) {
                         calls.push(expression);
                     }
@@ -6093,6 +6115,7 @@ impl<'context> FunctionAnalyzer<'context> {
         receiver_type: Type,
         value: &AstExpression,
         result_type: Type,
+        mode: FormattingMode,
     ) -> Option<Expression> {
         let place_type = self.place_expression_type(value);
         let mut analyzed = None;
@@ -6131,10 +6154,11 @@ impl<'context> FunctionAnalyzer<'context> {
             ));
         }
 
-        if self
-            .types
-            .satisfies_trait(value_type, STANDARD_DISPLAY_TRAIT)
-        {
+        let (trait_name, append_function, trait_label) = match mode {
+            FormattingMode::Display => (STANDARD_DISPLAY_TRAIT, STANDARD_APPEND_DISPLAY, "Display"),
+            FormattingMode::Debug => (STANDARD_DEBUG_TRAIT, STANDARD_APPEND_DEBUG, "Debug"),
+        };
+        if self.types.satisfies_trait(value_type, trait_name) {
             if place_type.is_none() {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -6146,7 +6170,12 @@ impl<'context> FunctionAnalyzer<'context> {
                 );
                 return None;
             }
-            return Some(self.analyze_display_append_call(field, value, result_type));
+            return Some(self.analyze_trait_append_call(
+                field,
+                value,
+                result_type,
+                append_function,
+            ));
         }
 
         let value_type_name = self.types.reflection_type_name(value_type);
@@ -6156,7 +6185,9 @@ impl<'context> FunctionAnalyzer<'context> {
                 format!("type `{value_type_name}` cannot be interpolated"),
                 value.span(),
             )
-            .with_help("implement `std::fmt::Display` for this nominal type"),
+            .with_help(format!(
+                "implement `std::fmt::{trait_label}` for this nominal type"
+            )),
         );
         None
     }
@@ -6209,17 +6240,18 @@ impl<'context> FunctionAnalyzer<'context> {
         }
     }
 
-    fn analyze_display_append_call(
+    fn analyze_trait_append_call(
         &mut self,
         field: &ast::FieldExpression,
         value: &AstExpression,
         result_type: Type,
+        append_function: &str,
     ) -> Expression {
         let span = Span::new(field.base.span().start, value.span().end);
         let call = ast::CallExpression {
             callee: AstExpression::Path(ast::Path {
                 segments: vec![ast::Identifier {
-                    name: STANDARD_APPEND_DISPLAY.to_owned(),
+                    name: append_function.to_owned(),
                     span,
                 }],
                 span,
@@ -10773,7 +10805,9 @@ fn validate_comptime_formatted_string(
         .with_help("format runtime text into an allocator-owned String"),
     );
     for fragment in &formatted.fragments {
-        if let ast::FormattedStringFragment::Expression(expression) = fragment {
+        if let ast::FormattedStringFragment::Display(expression)
+        | ast::FormattedStringFragment::Debug(expression) = fragment
+        {
             validate_comptime_expression(expression, comptime_functions, diagnostics);
         }
     }

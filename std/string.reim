@@ -456,6 +456,15 @@ pub trait Display {
     ) -> Result<(), AllocError>;
 }
 
+/// Defines the developer-facing representation accepted by `f"{value:?}"`.
+pub trait Debug {
+    /// Writes structural or diagnostic text into the supplied destination.
+    fn fmt_debug(
+        &self,
+        formatter: &mut Formatter,
+    ) -> Result<(), AllocError>;
+}
+
 /// Appends a value through its statically selected `Display` implementation.
 pub fn append_display<T: Display>(
     output: &mut String,
@@ -463,6 +472,15 @@ pub fn append_display<T: Display>(
 ) -> Result<(), AllocError> {
     let mut formatter = Formatter { output: output };
     (*value).fmt(&mut formatter)
+}
+
+/// Appends a value through its statically selected `Debug` implementation.
+pub fn append_debug<T: Debug>(
+    output: &mut String,
+    value: &T,
+) -> Result<(), AllocError> {
+    let mut formatter = Formatter { output: output };
+    (*value).fmt_debug(&mut formatter)
 }
 
 /// Allocates one string containing `left` followed by `right`.

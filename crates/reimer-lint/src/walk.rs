@@ -179,7 +179,9 @@ pub(crate) fn expression(visitor: &mut impl Visitor, expression: &Expression) {
         | Expression::Path(_) => {}
         Expression::FormattedString(formatted) => {
             for fragment in &formatted.fragments {
-                if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                if let ast::FormattedStringFragment::Display(expression)
+                | ast::FormattedStringFragment::Debug(expression) = fragment
+                {
                     self::expression(visitor, expression);
                 }
             }
