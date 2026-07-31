@@ -140,13 +140,17 @@ machine code and native objects.
   -> typed HIR
   -> Cranelift IR
   -> JIT for `reimer run`
-  -> native object for `reimer build`
-  -> runtime + LLD for the final executable
+  -> native object for `reimer emit-object`
+  -> startup + embedded runtime + LLD for `reimer build`
 ```
 
-Object generation is not linking. Each platform needs a startup runtime, ABI,
-system libraries, and LLD configuration. M0 provides executable JIT and native
-objects; standalone executables are a later backend increment.
+Object generation and linking remain separate stages. Executable builds add a
+minimal startup shim that calls `program_main`, cleans up session-owned threads
+and job pools, and returns the source program's `i32` exit code. The compiler
+embeds its matching runtime archive and invokes the bundled LLD through the
+Rust toolchain that built it. The resulting executable has no separate Reimer
+runtime dependency. Library packages continue to emit objects because their
+archive and shared-library ABI needs a separate decision.
 
 Operations with Reimer semantics are not delegated blindly to the host:
 

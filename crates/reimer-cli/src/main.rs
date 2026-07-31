@@ -14,6 +14,7 @@ use reimer_codegen_native::OptimizationLevel;
 use reimer_project::{BuildProfile, LockMode, Project};
 
 mod documentation;
+mod native_linker;
 
 const MANIFEST_FILE: &str = "reimer.toml";
 
@@ -151,9 +152,26 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
             profile_optimization(options.profile),
         )
         .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
-        let output = output.map_or_else(|| default_source_output(&options.path), Path::to_path_buf);
-        write_output(&output, &object)?;
-        println!("emitted {}", output.display());
+        if is_library_source(&options.path) {
+            let output = output.map_or_else(
+                || default_source_object_output(&options.path),
+                Path::to_path_buf,
+            );
+            write_output(&output, &object)?;
+            println!("emitted library object {}", output.display());
+            return Ok(());
+        }
+        let output = output.map_or_else(
+            || default_source_executable_output(&options.path),
+            Path::to_path_buf,
+        );
+        let artifact_directory = source_artifact_directory(&options.path, options.profile);
+        let object_path = native_linker::link_executable(&object, &output, &artifact_directory)?;
+        println!(
+            "built executable {}\nobject: {}",
+            output.display(),
+            object_path.display()
+        );
         return Ok(());
     }
 
@@ -162,17 +180,35 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
     let optimization = selected_optimization(&project, options.profile)?;
     let object = compile_graph_to_object(&project.source_graph(&entry), optimization)
         .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+    if is_library_source(&entry) {
+        let output = output.map_or_else(
+            || default_project_object_output(&project, options.profile),
+            Path::to_path_buf,
+        );
+        write_output(&output, &object)?;
+        println!(
+            "built {} {} ({})\nobject: {}\nlockfile: {}",
+            project.package_name(),
+            display_version(&project),
+            profile_name(options.profile),
+            output.display(),
+            project.lock_path().display()
+        );
+        return Ok(());
+    }
     let output = output.map_or_else(
-        || default_project_output(&project, options.profile),
+        || default_project_executable_output(&project, options.profile),
         Path::to_path_buf,
     );
-    write_output(&output, &object)?;
+    let artifact_directory = project_artifact_directory(&project, options.profile);
+    let object_path = native_linker::link_executable(&object, &output, &artifact_directory)?;
     println!(
-        "built {} {} ({})\nobject: {}\nlockfile: {}",
+        "built {} {} ({})\nexecutable: {}\nobject: {}\nlockfile: {}",
         project.package_name(),
         display_version(&project),
         profile_name(options.profile),
         output.display(),
+        object_path.display(),
         project.lock_path().display()
     );
     Ok(())
@@ -756,7 +792,7 @@ fn write_output(path: &Path, contents: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("failed to write `{}`: {error}", path.display()))
 }
 
-fn default_source_output(source: &Path) -> PathBuf {
+fn default_source_object_output(source: &Path) -> PathBuf {
     let stem = source.file_stem().unwrap_or(source.as_os_str()).to_owned();
     PathBuf::from("target")
         .join("reimer")
@@ -764,7 +800,21 @@ fn default_source_output(source: &Path) -> PathBuf {
         .with_extension(object_extension())
 }
 
-fn default_project_output(project: &Project, profile: BuildProfile) -> PathBuf {
+fn default_source_executable_output(source: &Path) -> PathBuf {
+    let stem = source.file_stem().unwrap_or(source.as_os_str()).to_owned();
+    executable_path(PathBuf::from("target").join("reimer").join(stem))
+}
+
+fn source_artifact_directory(source: &Path, profile: BuildProfile) -> PathBuf {
+    let stem = source.file_stem().unwrap_or(source.as_os_str()).to_owned();
+    PathBuf::from("target")
+        .join("reimer")
+        .join("artifacts")
+        .join(profile_name(profile))
+        .join(stem)
+}
+
+fn default_project_object_output(project: &Project, profile: BuildProfile) -> PathBuf {
     project
         .root_directory()
         .join("target")
@@ -772,6 +822,39 @@ fn default_project_output(project: &Project, profile: BuildProfile) -> PathBuf {
         .join(profile_name(profile))
         .join(project.package_name())
         .with_extension(object_extension())
+}
+
+fn default_project_executable_output(project: &Project, profile: BuildProfile) -> PathBuf {
+    executable_path(
+        project
+            .root_directory()
+            .join("target")
+            .join("reimer")
+            .join(profile_name(profile))
+            .join(project.package_name()),
+    )
+}
+
+fn project_artifact_directory(project: &Project, profile: BuildProfile) -> PathBuf {
+    project
+        .root_directory()
+        .join("target")
+        .join("reimer")
+        .join("artifacts")
+        .join(profile_name(profile))
+        .join(project.package_name())
+}
+
+fn executable_path(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        path.with_extension("exe")
+    } else {
+        path
+    }
+}
+
+fn is_library_source(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("package.reim")
 }
 
 const fn object_extension() -> &'static str {
@@ -1216,7 +1299,7 @@ fn usage() -> &'static str {
      reimer new <path>\n  \
      reimer init [path]\n  \
      reimer check [path] [--locked|--refresh]\n  \
-     reimer build [path] [--release] [--locked|--refresh] [-o <file.obj>]\n  \
+     reimer build [path] [--release] [--locked|--refresh] [-o <executable>]\n  \
      reimer run [path] [--release] [--locked|--refresh]\n  \
      reimer test [path] [--release] [--locked|--refresh]\n  \
      reimer doc [path] [--locked|--refresh] [-o <file.md>]\n  \
@@ -1238,7 +1321,7 @@ mod tests {
 
     #[test]
     fn invocation_should_parse_project_build_options() {
-        let arguments = ["build", "demo", "--release", "--locked", "-o", "demo.obj"]
+        let arguments = ["build", "demo", "--release", "--locked", "-o", "demo.exe"]
             .map(OsString::from)
             .to_vec();
 
@@ -1250,7 +1333,7 @@ mod tests {
         assert_eq!(options.path, Path::new("demo"));
         assert_eq!(options.profile, BuildProfile::Release);
         assert_eq!(options.lock_mode, LockMode::Locked);
-        assert_eq!(output, Some(PathBuf::from("demo.obj")));
+        assert_eq!(output, Some(PathBuf::from("demo.exe")));
     }
 
     #[test]

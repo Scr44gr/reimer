@@ -35,7 +35,8 @@ fn factorial(value: i32) -> i32 {
 
 The pipeline covers `.reim` source -> tokens with spans -> AST -> name
 resolution and type checking -> typed HIR -> Cranelift. `run` executes the
-program through JIT, while `build` emits a native object.
+program through JIT, while `build` links an independent native executable with
+the bundled runtime and LLD. `emit-object` remains available for raw objects.
 
 ## Usage
 
@@ -109,8 +110,11 @@ are documented in [`docs/numeric-literals.md`](docs/numeric-literals.md).
 `reimer doc` validates the complete package and writes its public `///`
 documentation to `target/reimer/doc/<package>.md`.
 
-The generated object is not yet a standalone executable. Linking it with the
-startup runtime and LLD is the next backend increment.
+Executable packages built with `reimer build` do not require the compiler or a
+separate Reimer runtime when launched. Library packages continue to produce a
+native object until a stable library archive format is specified. The current
+compiler build embeds its matching runtime archive and uses the Rust toolchain
+that built the compiler as the LLD driver.
 
 ## VS Code
 

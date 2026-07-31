@@ -150,7 +150,15 @@ fn commands_should_compile_and_test_a_transitive_path_graph() {
     assert_success(&invoke(&["test", &app, "--locked"]));
 
     assert!(fixture.path("app/reimer.lock").is_file());
-    assert!(fixture.path("app/target/reimer/release/app.obj").is_file());
+    let executable = fixture.path(&format!(
+        "app/target/reimer/release/app{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    assert!(executable.is_file());
+    let status = Command::new(executable)
+        .status()
+        .expect("built executable should start");
+    assert_eq!(status.code(), Some(42));
 }
 
 #[test]

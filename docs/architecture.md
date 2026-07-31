@@ -40,8 +40,10 @@
   statically in multi-file packages.
 - The only currently linkable entry point is `fn main() -> i32`.
 - Cranelift is a replaceable backend. The AST contains no backend details.
-- `run` uses JIT and `build` produces a native object. Standalone linking will
-  be added with the startup runtime for each platform.
+- `run` uses JIT. For executable packages, `build` links the Cranelift object,
+  a minimal startup shim, and the embedded runtime through LLD. The result has
+  no separate Reimer runtime dependency. `emit-object` and library-package
+  builds retain native object output.
 - The runtime encapsulates FFI, allocator, and I/O boundaries; programs use
   safe standard-library wrappers.
 - `std::c` aliases are resolved to the native target's actual scalar ABI before
