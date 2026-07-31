@@ -525,8 +525,8 @@ mod tests {
 
     #[test]
     fn check_file_should_require_display_for_interpolated_structs() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/m3_missing_display_error.reim");
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/missing_display.reim");
 
         let diagnostics = check_file(&path).expect_err("missing Display should fail");
 
@@ -544,8 +544,7 @@ mod tests {
 
     #[test]
     fn check_file_should_require_debug_for_debug_interpolation() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/m3_missing_debug_error.reim");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/missing_debug.reim");
 
         let diagnostics = check_file(&path).expect_err("missing Debug should fail");
 
