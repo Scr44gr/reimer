@@ -1,0 +1,10 @@
+format = 1
+
+[[package]]
+id = "0c735ad59bd4c6d39bf1167b"
+name = "sdl3"
+version = "3.4.12"
+source = "path+."
+checksum = "0b31262349dc989b34b4b8d20409de2ed3fd10d7b710031f22230591c372d66a"
+dependencies = []
+

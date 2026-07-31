@@ -31,6 +31,7 @@
 - [Concurrency and jobs](standard-library/concurrency.md)
 - [Tensors](standard-library/tensors.md)
 - [C interoperability](interoperability/c.md)
+- [Vendored SDL3 package](interoperability/vendor-sdl3.md)
 
 # Tools and workflows
 

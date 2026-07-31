@@ -27,11 +27,12 @@ From the repository root:
 .\scripts\demos\run-sdl-opengl.ps1
 ```
 
-The script downloads SDL 3.4.12 from its official release only when missing,
-verifies the archive SHA-256, and temporarily adds the `SDL3.dll` directory to
-`PATH`. OpenGL 1.1 comes from `opengl32.dll`, which is included with Windows.
-The example only calls `glClearColor` and `glClear`, so it does not require an
-extension loader.
+The script uses the pinned SDL 3.4.12 runtime in
+`vendor/sdl3/native/windows-x86_64` and temporarily adds that directory to
+`PATH`. The upstream archive and checked-in artifact digests are recorded in
+`vendor/sdl3/checksums.sha256`. OpenGL 1.1 comes from `opengl32.dll`, which is
+included with Windows. The example only calls `glClearColor` and `glClear`, so
+it does not require an extension loader.
 
 A successful run displays a blue window and ends with
 `program returned 42`.
@@ -46,5 +47,5 @@ cargo run -p reimer-cli --locked -- emit-object examples/m5_sdl_opengl.reim
 ```
 
 Execution requires Windows x64 with a working OpenGL driver. On other systems,
-replace the `opengl32` link with the platform OpenGL library and provide SDL3
-on the dynamic loader path.
+replace the `opengl32` link with the platform OpenGL library and add a matching
+native target to the vendored SDL3 package.

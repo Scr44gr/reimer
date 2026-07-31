@@ -1,0 +1,28 @@
+from std::alloc import general_allocator;
+
+from self::video import FrameBuffer, rgb;
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let created = FrameBuffer::new(&allocator, 4, 3);
+    let mut frame = match created {
+        Ok(value) => value,
+        Err(_) => {
+            return 1;
+        },
+    };
+    defer frame.deinit();
+
+    let sky = rgb(135, 206, 235);
+    frame.clear(sky);
+    if !frame.set_pixel(2, 1, rgb(12, 34, 56)) {
+        return 2;
+    }
+    frame.draw_vertical(0, -4, 2, rgb(7, 8, 9));
+
+    match frame.pixel(2, 1) {
+        Some(0xff0c_2238) => 0,
+        Some(_) => 3,
+        None => 4,
+    }
+}
