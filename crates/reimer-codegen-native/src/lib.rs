@@ -292,6 +292,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_core_symbols(builder);
     register_target_symbols(builder);
     register_mathematics_symbols(builder);
+    register_text_symbols(builder);
     register_filesystem_symbols(builder);
     register_storage_symbols(builder);
     register_coordination_symbols(builder);
@@ -509,6 +510,68 @@ fn register_mathematics_symbols(builder: &mut JITBuilder) {
         (
             reimer_runtime::MATH_POW_F64_SYMBOL,
             reimer_runtime::math_pow_f64 as *const u8,
+        ),
+    ];
+    register_symbol_group(builder, symbols);
+}
+
+fn register_text_symbols(builder: &mut JITBuilder) {
+    let symbols = [
+        (
+            reimer_runtime::FORMAT_F32_SYMBOL,
+            reimer_runtime::text_format_f32 as *const u8,
+        ),
+        (
+            reimer_runtime::FORMAT_F64_SYMBOL,
+            reimer_runtime::text_format_f64 as *const u8,
+        ),
+        (
+            reimer_runtime::FORMAT_I128_SYMBOL,
+            reimer_runtime::text_format_i128 as *const u8,
+        ),
+        (
+            reimer_runtime::FORMAT_U128_SYMBOL,
+            reimer_runtime::text_format_u128 as *const u8,
+        ),
+        (
+            reimer_runtime::UTF8_ENCODE_CHAR_SYMBOL,
+            reimer_runtime::utf8_encode_char as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_LOWERCASE_SYMBOL,
+            reimer_runtime::unicode_lowercase as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_UPPERCASE_SYMBOL,
+            reimer_runtime::unicode_uppercase as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_IS_ALPHABETIC_SYMBOL,
+            reimer_runtime::unicode_is_alphabetic as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_IS_ALPHANUMERIC_SYMBOL,
+            reimer_runtime::unicode_is_alphanumeric as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_IS_NUMERIC_SYMBOL,
+            reimer_runtime::unicode_is_numeric as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_IS_WHITESPACE_SYMBOL,
+            reimer_runtime::unicode_is_whitespace as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_IS_LOWERCASE_SYMBOL,
+            reimer_runtime::unicode_is_lowercase as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_IS_UPPERCASE_SYMBOL,
+            reimer_runtime::unicode_is_uppercase as *const u8,
+        ),
+        (
+            reimer_runtime::UNICODE_IS_CONTROL_SYMBOL,
+            reimer_runtime::unicode_is_control as *const u8,
         ),
     ];
     register_symbol_group(builder, symbols);

@@ -994,9 +994,42 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("Option", CompletionItemKind::ENUM, "core"),
     ("Result", CompletionItemKind::ENUM, "core"),
     ("String", CompletionItemKind::STRUCT, "std::string"),
+    (
+        "with_capacity",
+        CompletionItemKind::METHOD,
+        "String::with_capacity",
+    ),
     ("from", CompletionItemKind::METHOD, "String::from"),
     ("as_str", CompletionItemKind::METHOD, "String::as_str"),
     ("clone_in", CompletionItemKind::METHOD, "String::clone_in"),
+    ("push_str", CompletionItemKind::METHOD, "String::push_str"),
+    (
+        "push_string",
+        CompletionItemKind::METHOD,
+        "String::push_string",
+    ),
+    ("push_char", CompletionItemKind::METHOD, "String::push_char"),
+    ("push_bool", CompletionItemKind::METHOD, "String::push_bool"),
+    ("push_i128", CompletionItemKind::METHOD, "String::push_i128"),
+    ("push_u128", CompletionItemKind::METHOD, "String::push_u128"),
+    ("push_f32", CompletionItemKind::METHOD, "String::push_f32"),
+    ("push_f64", CompletionItemKind::METHOD, "String::push_f64"),
+    ("concat", CompletionItemKind::FUNCTION, "std::string"),
+    ("concat3", CompletionItemKind::FUNCTION, "std::string"),
+    ("repeat", CompletionItemKind::FUNCTION, "std::string"),
+    ("join_strings", CompletionItemKind::FUNCTION, "std::string"),
+    ("char_count", CompletionItemKind::FUNCTION, "std::string"),
+    ("starts_with", CompletionItemKind::FUNCTION, "std::string"),
+    ("ends_with", CompletionItemKind::FUNCTION, "std::string"),
+    ("contains", CompletionItemKind::FUNCTION, "std::string"),
+    ("find", CompletionItemKind::FUNCTION, "std::string"),
+    (
+        "is_char_boundary",
+        CompletionItemKind::FUNCTION,
+        "std::string",
+    ),
+    ("to_lowercase", CompletionItemKind::FUNCTION, "std::string"),
+    ("to_uppercase", CompletionItemKind::FUNCTION, "std::string"),
     (
         "wrapping_add",
         CompletionItemKind::METHOD,
@@ -2052,6 +2085,45 @@ fn main() -> i32 {
                 .contains("Three-dimensional single-precision vector.")
         );
         assert!(!binding_contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn document_should_show_text_documentation_and_allocator_estimates() {
+        let source = "from std::alloc import AllocError, general_allocator;
+from std::string import String, concat;
+fn build() -> Result<String, AllocError> {
+    let allocator = general_allocator();
+    concat(&allocator, \"hello\", \" world\")
+}
+fn main() -> i32 { 0 }
+";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let lines = LineIndex::new(Arc::from(source));
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+        let call_position = lines.position(
+            source
+                .find("concat(&allocator")
+                .expect("concatenation call should exist"),
+        );
+
+        let hover = document
+            .hover(call_position)
+            .expect("concatenation call should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("text call hover should use markdown");
+        };
+
+        assert!(contents.value.contains("fn std::string::concat"));
+        assert!(
+            contents
+                .value
+                .contains("Allocates one string containing `left` followed by `right`.")
+        );
+        assert!(contents.value.contains("11 B reserved"));
     }
 
     #[test]

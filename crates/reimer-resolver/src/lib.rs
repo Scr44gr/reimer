@@ -6646,7 +6646,7 @@ impl<'context> FunctionAnalyzer<'context> {
     }
 
     fn analyze_slice_length(&mut self, call: &ast::CallExpression, path: &ast::Path) -> Expression {
-        self.require_standard_job_intrinsic(call.span);
+        self.require_standard_slice_intrinsic(call.span);
         if call.arguments.len() != 1 {
             self.intrinsic_arity_diagnostic(path, call, 1);
         }
@@ -7967,6 +7967,23 @@ impl<'context> FunctionAnalyzer<'context> {
         self.diagnostics.push(
             Diagnostic::error("E3154", "job intrinsics are private to `std::job`", span)
                 .with_help("import and call the safe standard job wrappers"),
+        );
+    }
+
+    fn require_standard_slice_intrinsic(&mut self, span: Span) {
+        if matches!(
+            self.module_identity.as_deref(),
+            Some("3_std_3_job" | "3_std_6_string")
+        ) {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3154",
+                "raw slice inspection is private to the standard library",
+                span,
+            )
+            .with_help("use safe slice and string APIs instead"),
         );
     }
 

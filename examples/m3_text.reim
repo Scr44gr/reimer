@@ -1,0 +1,56 @@
+from std::alloc import AllocError, general_allocator;
+from std::string import String, char_count, concat, contains, repeat, to_uppercase;
+
+fn text_is_valid(
+    formatted: &String,
+    combined: &String,
+    repeated: &String,
+    uppercase: &String,
+) -> bool {
+    formatted.matches("value=-42, ready=true🦀")
+        && combined.matches("hello world")
+        && repeated.matches("nanana")
+        && uppercase.matches("SS")
+        && contains(combined.as_str(), "lo wo")
+        && char_count(formatted.as_str()) == 22
+}
+
+fn exercise_text() -> Result<i32, AllocError> {
+    let allocator = general_allocator();
+
+    let mut formatted = String::with_capacity(&allocator, 32)?;
+    formatted.push_str("value=")?;
+    formatted.push_i32(-42)?;
+    formatted.push_str(", ready=")?;
+    formatted.push_bool(true)?;
+    formatted.push_char('🦀')?;
+
+    let combined = concat(&allocator, "hello", " world")?;
+    let repeated = repeat(&allocator, "na", 3)?;
+    let uppercase = to_uppercase(&allocator, 'ß')?;
+
+    let valid = text_is_valid(
+        &formatted,
+        &combined,
+        &repeated,
+        &uppercase,
+    );
+
+    uppercase.deinit();
+    repeated.deinit();
+    combined.deinit();
+    formatted.deinit();
+
+    if valid {
+        Ok(42)
+    } else {
+        Ok(0)
+    }
+}
+
+fn main() -> i32 {
+    match exercise_text() {
+        Ok(value) => value,
+        Err(_) => 1,
+    }
+}

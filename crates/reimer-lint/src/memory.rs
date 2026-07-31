@@ -76,6 +76,13 @@ struct AllocatorIdentity {
     label: String,
 }
 
+struct AllocationSpecification {
+    allocator_index: usize,
+    amount: Option<u128>,
+    upper_bound: bool,
+    explanation: &'static str,
+}
+
 struct Estimator<'function> {
     function: &'function ast::Function,
     allocators: HashMap<String, AllocatorIdentity>,
@@ -269,46 +276,34 @@ impl<'function> Estimator<'function> {
         let Some(operation) = call_name(&call.callee) else {
             return;
         };
-        let specification = match operation {
-            "allocate_bytes" => Some((0, 1, "byte reservation")),
-            "read" | "read_exact" | "read_line" | "read_to_end" => Some((
-                0,
-                call.arguments.len().saturating_sub(1),
-                "input buffer reservation",
-            )),
-            "init" if callee_contains_name(&call.callee, "FixedBufferAllocator") => {
-                Some((usize::MAX, 1, "fixed backing-store capacity"))
-            }
-            "with_capacity_in" => Some((0, 1, "container capacity; element size is unknown")),
-            "from" if callee_contains_name(&call.callee, "String") => {
-                Some((0, 1, "owned UTF-8 copy"))
-            }
-            "clone_in" => Some((0, usize::MAX, "owned UTF-8 clone")),
-            _ => None,
-        };
-        let Some((allocator_index, amount_index, explanation)) = specification else {
+        let Some(specification) = allocation_specification(call, operation) else {
             return;
         };
-        let amount = call.arguments.get(amount_index).and_then(constant_bytes);
-        let quantity = match (amount, loop_depth) {
-            (Some(bytes), 0) if operation == "init" => AllocationQuantity::AtMost(bytes),
+        let quantity = match (specification.amount, loop_depth) {
+            (Some(bytes), 0) if specification.upper_bound => AllocationQuantity::AtMost(bytes),
             (Some(bytes), 0) => AllocationQuantity::Exact(bytes),
             (Some(bytes), _) => AllocationQuantity::PerIteration(bytes),
             (None, _) => AllocationQuantity::Dynamic,
         };
-        let allocator = if allocator_index == usize::MAX {
+        let allocator = if specification.allocator_index == usize::MAX {
             "caller-provided fixed buffer".to_owned()
         } else {
-            call.arguments.get(allocator_index).map_or_else(
-                || "implicit allocator".to_owned(),
-                |argument| self.allocator_label(argument),
-            )
+            call.arguments
+                .get(specification.allocator_index)
+                .map_or_else(
+                    || "implicit allocator".to_owned(),
+                    |argument| self.allocator_label(argument),
+                )
         };
         let explanation = if loop_depth == 0 {
-            format!("static estimate: {explanation}; control-flow frequency is not modeled")
+            format!(
+                "static estimate: {}; control-flow frequency is not modeled",
+                specification.explanation
+            )
         } else {
             format!(
-                "static estimate per loop iteration: {explanation}; iteration count is not known"
+                "static estimate per loop iteration: {}; iteration count is not known",
+                specification.explanation
             )
         };
         self.allocations.push(AllocationEstimate {
@@ -339,6 +334,81 @@ impl<'function> Estimator<'function> {
         }
         "unknown allocator".to_owned()
     }
+}
+
+fn allocation_specification(
+    call: &ast::CallExpression,
+    operation: &str,
+) -> Option<AllocationSpecification> {
+    let exact = |allocator_index, amount, explanation| AllocationSpecification {
+        allocator_index,
+        amount,
+        upper_bound: false,
+        explanation,
+    };
+    match operation {
+        "allocate_bytes" => Some(exact(0, argument_bytes(call, 1), "byte reservation")),
+        "read" | "read_exact" | "read_line" | "read_to_end" => Some(exact(
+            0,
+            argument_bytes(call, call.arguments.len().saturating_sub(1)),
+            "input buffer reservation",
+        )),
+        "init" if callee_contains_name(&call.callee, "FixedBufferAllocator") => {
+            Some(AllocationSpecification {
+                allocator_index: usize::MAX,
+                amount: argument_bytes(call, 1),
+                upper_bound: true,
+                explanation: "fixed backing-store capacity",
+            })
+        }
+        "with_capacity_in" => Some(exact(
+            0,
+            argument_bytes(call, 1),
+            "container capacity; element size is unknown",
+        )),
+        "with_capacity" if callee_contains_name(&call.callee, "String") => {
+            Some(exact(0, argument_bytes(call, 1), "owned UTF-8 capacity"))
+        }
+        "from" if callee_contains_name(&call.callee, "String") => {
+            Some(exact(0, argument_bytes(call, 1), "owned UTF-8 copy"))
+        }
+        "clone_in" => Some(exact(0, None, "owned UTF-8 clone")),
+        "concat" => Some(exact(
+            0,
+            sum_argument_bytes(call, &[1, 2]),
+            "concatenated UTF-8 bytes",
+        )),
+        "concat3" => Some(exact(
+            0,
+            sum_argument_bytes(call, &[1, 2, 3]),
+            "concatenated UTF-8 bytes",
+        )),
+        "repeat" => Some(exact(
+            0,
+            argument_bytes(call, 1)
+                .zip(call.arguments.get(2).and_then(constant_value))
+                .and_then(|(bytes, count)| bytes.checked_mul(count)),
+            "repeated UTF-8 bytes",
+        )),
+        "join_strings" => Some(exact(0, None, "joined UTF-8 bytes")),
+        "to_lowercase" | "to_uppercase" => Some(AllocationSpecification {
+            allocator_index: 0,
+            amount: Some(12),
+            upper_bound: true,
+            explanation: "full Unicode case mapping",
+        }),
+        _ => None,
+    }
+}
+
+fn argument_bytes(call: &ast::CallExpression, index: usize) -> Option<u128> {
+    call.arguments.get(index).and_then(constant_bytes)
+}
+
+fn sum_argument_bytes(call: &ast::CallExpression, indices: &[usize]) -> Option<u128> {
+    indices.iter().try_fold(0_u128, |total, index| {
+        total.checked_add(argument_bytes(call, *index)?)
+    })
 }
 
 fn constant_value(expression: &Expression) -> Option<u128> {
@@ -467,12 +537,40 @@ mod tests {
 
     #[test]
     fn estimate_should_count_utf8_bytes_copied_into_an_owned_string() {
-        let source = "fn main() { let text = String::from(&allocator, \"á\"); }";
+        let source = "fn main() { let text = String::from(&allocator, \"\u{00e1}\"); }";
         let syntax =
             parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
 
         let (allocations, _) = estimate(&syntax);
 
         assert_eq!(allocations[0].quantity, AllocationQuantity::Exact(2));
+    }
+
+    #[test]
+    fn estimate_should_combine_literal_concatenation_and_repetition_sizes() {
+        let source = r#"
+            fn main() {
+                let joined = concat(&allocator, "hello", " world");
+                let repeated = repeat(&allocator, "na", 3);
+            }
+        "#;
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let (allocations, _) = estimate(&syntax);
+
+        assert_eq!(allocations[0].quantity, AllocationQuantity::Exact(11));
+        assert_eq!(allocations[1].quantity, AllocationQuantity::Exact(6));
+    }
+
+    #[test]
+    fn estimate_should_bound_full_unicode_case_mapping() {
+        let source = "fn main() { let text = to_uppercase(&allocator, '\u{00df}'); }";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let (allocations, _) = estimate(&syntax);
+
+        assert_eq!(allocations[0].quantity, AllocationQuantity::AtMost(12));
     }
 }

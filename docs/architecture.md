@@ -59,6 +59,13 @@ that are not source-language operators. The ABI receives and returns only
 `f32` or `f64`; safe wrappers provide explicit precision and the vector layer
 is implemented entirely in source. See [`mathematics.md`](mathematics.md).
 
+`std::string` keeps allocation decisions in safe source APIs. Concatenation
+precomputes its UTF-8 capacity, incremental formatting reuses an owned
+`String`, and Unicode queries operate on borrowed views. Bounded runtime
+helpers cover float formatting, full-width integer conversion, scalar
+encoding, and Unicode case properties without hidden allocation. See
+[`text-and-formatting.md`](text-and-formatting.md).
+
 ## Integer overflow
 
 Ordinary integer `+`, `-`, and `*` operations are checked in every profile and

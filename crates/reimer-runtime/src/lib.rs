@@ -29,6 +29,11 @@ mod job;
     reason = "scalar math helpers expose stable symbols to generated native code"
 )]
 mod mathematics;
+#[expect(
+    unsafe_code,
+    reason = "text helpers expose bounded caller-owned buffers to generated native code"
+)]
+mod text;
 
 pub use concurrency::{
     ATOMIC_CLONE_SYMBOL, ATOMIC_COMPARE_EXCHANGE_SYMBOL, ATOMIC_CREATE_SYMBOL,
@@ -77,6 +82,16 @@ pub use mathematics::{
     math_floor_f64, math_ln_f32, math_ln_f64, math_pow_f32, math_pow_f64, math_round_f32,
     math_round_f64, math_sin_f32, math_sin_f64, math_sqrt_f32, math_sqrt_f64, math_tan_f32,
     math_tan_f64,
+};
+pub use text::{
+    FORMAT_F32_SYMBOL, FORMAT_F64_SYMBOL, FORMAT_I128_SYMBOL, FORMAT_U128_SYMBOL,
+    UNICODE_IS_ALPHABETIC_SYMBOL, UNICODE_IS_ALPHANUMERIC_SYMBOL, UNICODE_IS_CONTROL_SYMBOL,
+    UNICODE_IS_LOWERCASE_SYMBOL, UNICODE_IS_NUMERIC_SYMBOL, UNICODE_IS_UPPERCASE_SYMBOL,
+    UNICODE_IS_WHITESPACE_SYMBOL, UNICODE_LOWERCASE_SYMBOL, UNICODE_UPPERCASE_SYMBOL,
+    UTF8_ENCODE_CHAR_SYMBOL, text_format_f32, text_format_f64, text_format_i128, text_format_u128,
+    unicode_is_alphabetic, unicode_is_alphanumeric, unicode_is_control, unicode_is_lowercase,
+    unicode_is_numeric, unicode_is_uppercase, unicode_is_whitespace, unicode_lowercase,
+    unicode_uppercase, utf8_encode_char,
 };
 
 /// Runtime failure categories emitted by checked native operations.

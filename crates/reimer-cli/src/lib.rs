@@ -489,6 +489,17 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_should_complete_text_formatting_vertical_slice() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_text.reim");
+
+        let result = execute_file(&path).expect("text formatting program should execute");
+        let object = compile_file_to_object(&path).expect("text formatting program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
     fn execute_file_should_complete_owned_vector_vertical_slice() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_vec.reim");
 

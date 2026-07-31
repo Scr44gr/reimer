@@ -323,8 +323,13 @@ fn resource_kind(expression: &Expression) -> Option<&'static str> {
     match call_name(&call.callee)? {
         "allocate_bytes" => Some("owned allocation"),
         "read" | "read_exact" | "read_line" | "read_to_end" => Some("owned input buffer"),
-        "from" if callee_contains_name(&call.callee, "String") => Some("owned string"),
+        "from" | "with_capacity" if callee_contains_name(&call.callee, "String") => {
+            Some("owned string")
+        }
         "clone_in" => Some("owned string clone"),
+        "concat" | "concat3" | "repeat" | "join_strings" | "to_lowercase" | "to_uppercase" => {
+            Some("owned string")
+        }
         "init" if callee_contains_name(&call.callee, "ArenaAllocator") => Some("arena allocator"),
         "init" if callee_contains_name(&call.callee, "FixedBufferAllocator") => {
             Some("fixed-buffer allocator")

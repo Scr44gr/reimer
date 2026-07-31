@@ -339,3 +339,26 @@ therefore 32-bit on 64-bit Windows and 64-bit on the usual 64-bit Unix targets.
 Bindings should use `std::c` names rather than assuming that C `long` matches
 `isize`. Typed null pointers and pointer/count records remain non-owning; native
 calls and pointer dereferences still require `unsafe`.
+
+## D-016: explicit text allocation and concatenation
+
+`str` remains a borrowed UTF-8 view, while every operation that creates an
+owned `String` receives an allocator and returns `Result`. String `+` is not
+overloaded because an infallible arithmetic spelling would hide both the
+allocation strategy and possible failure.
+
+```reimer
+let label = concat(&allocator, "score: ", "42")?;
+let divider = repeat(&allocator, "-", 40)?;
+builder.push_string(&label)?;
+```
+
+`concat`, `concat3`, `repeat`, and `join_strings` precompute their required
+capacity. Incremental `push_*` methods reuse an existing `String`. Integer
+formatting covers the full 128-bit range, float formatting uses a shortest
+round-trippable representation, and Unicode case conversion returns an owned
+string because one scalar can map to multiple scalars.
+
+Small bounded runtime helpers implement conversions not directly available in
+Cranelift. They write only into caller-owned capacity and perform no hidden
+allocation. The public standard-library surface remains safe.

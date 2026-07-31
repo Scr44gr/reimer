@@ -24,9 +24,64 @@ extern "C" {
         right: *const u8,
         right_len: usize,
     ) -> bool;
+    fn text_format_f32(
+        value: f32,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> isize;
+    fn text_format_f64(
+        value: f64,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> isize;
+    fn text_format_i128(
+        value: *const u8,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> isize;
+    fn text_format_u128(
+        value: *const u8,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> isize;
+    fn utf8_encode_char(
+        value: u32,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> isize;
+    fn unicode_lowercase(
+        value: u32,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> isize;
+    fn unicode_uppercase(
+        value: u32,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> isize;
+    fn unicode_is_alphabetic(value: u32) -> bool;
+    fn unicode_is_alphanumeric(value: u32) -> bool;
+    fn unicode_is_numeric(value: u32) -> bool;
+    fn unicode_is_whitespace(value: u32) -> bool;
+    fn unicode_is_lowercase(value: u32) -> bool;
+    fn unicode_is_uppercase(value: u32) -> bool;
+    fn unicode_is_control(value: u32) -> bool;
 }
 
 impl String {
+    /// Creates an empty string with room for at least `capacity` UTF-8 bytes.
+    pub fn with_capacity(
+        allocator: &Allocator,
+        capacity: usize,
+    ) -> Result<String, AllocError> {
+        let bytes = allocate_bytes(allocator, capacity)?;
+        Ok(String {
+            bytes: bytes,
+            len: 0,
+        })
+    }
+
+    /// Copies one borrowed UTF-8 string into allocator-owned storage.
     pub fn from(
         allocator: &Allocator,
         value: str,
@@ -128,6 +183,179 @@ impl String {
         }
     }
 
+    /// Appends another owned string without consuming it.
+    pub fn push_string(
+        &mut self,
+        value: &String,
+    ) -> Result<(), AllocError> {
+        self.push_str(value.as_str())
+    }
+
+    /// Appends one Unicode scalar encoded as UTF-8.
+    pub fn push_char(
+        &mut self,
+        value: char,
+    ) -> Result<(), AllocError> {
+        String::reserve(&mut *self, 4)?;
+        let destination =
+            (self.bytes.as_mut_ptr() as usize + self.len) as *mut u8;
+        let written = unsafe {
+            utf8_encode_char(value as u32, destination, 4)
+        };
+        if written < 0 {
+            panic("std::string could not encode a valid Unicode scalar")
+        } else {
+            self.len += written as usize;
+            Ok(())
+        }
+    }
+
+    /// Appends a boolean using `true` or `false`.
+    pub fn push_bool(
+        &mut self,
+        value: bool,
+    ) -> Result<(), AllocError> {
+        if value {
+            self.push_str("true")
+        } else {
+            self.push_str("false")
+        }
+    }
+
+    /// Appends an unsigned integer in base ten.
+    pub fn push_u128(
+        &mut self,
+        value: u128,
+    ) -> Result<(), AllocError> {
+        String::reserve(&mut *self, 64)?;
+        let destination =
+            (self.bytes.as_mut_ptr() as usize + self.len) as *mut u8;
+        let written = unsafe {
+            text_format_u128(
+                &value as *const u128 as *const u8,
+                destination,
+                64,
+            )
+        };
+        if written < 0 {
+            panic("std::string could not format u128")
+        } else {
+            self.len += written as usize;
+            Ok(())
+        }
+    }
+
+    /// Appends a signed integer in base ten.
+    pub fn push_i128(
+        &mut self,
+        value: i128,
+    ) -> Result<(), AllocError> {
+        String::reserve(&mut *self, 64)?;
+        let destination =
+            (self.bytes.as_mut_ptr() as usize + self.len) as *mut u8;
+        let written = unsafe {
+            text_format_i128(
+                &value as *const i128 as *const u8,
+                destination,
+                64,
+            )
+        };
+        if written < 0 {
+            panic("std::string could not format i128")
+        } else {
+            self.len += written as usize;
+            Ok(())
+        }
+    }
+
+    /// Appends an unsigned pointer-sized integer in base ten.
+    pub fn push_usize(&mut self, value: usize) -> Result<(), AllocError> {
+        self.push_u128(value as u128)
+    }
+
+    /// Appends an unsigned 64-bit integer in base ten.
+    pub fn push_u64(&mut self, value: u64) -> Result<(), AllocError> {
+        self.push_u128(value as u128)
+    }
+
+    /// Appends an unsigned 32-bit integer in base ten.
+    pub fn push_u32(&mut self, value: u32) -> Result<(), AllocError> {
+        self.push_u128(value as u128)
+    }
+
+    /// Appends an unsigned 16-bit integer in base ten.
+    pub fn push_u16(&mut self, value: u16) -> Result<(), AllocError> {
+        self.push_u128(value as u128)
+    }
+
+    /// Appends an unsigned 8-bit integer in base ten.
+    pub fn push_u8(&mut self, value: u8) -> Result<(), AllocError> {
+        self.push_u128(value as u128)
+    }
+
+    /// Appends a signed pointer-sized integer in base ten.
+    pub fn push_isize(&mut self, value: isize) -> Result<(), AllocError> {
+        self.push_i128(value as i128)
+    }
+
+    /// Appends a signed 64-bit integer in base ten.
+    pub fn push_i64(&mut self, value: i64) -> Result<(), AllocError> {
+        self.push_i128(value as i128)
+    }
+
+    /// Appends a signed 32-bit integer in base ten.
+    pub fn push_i32(&mut self, value: i32) -> Result<(), AllocError> {
+        self.push_i128(value as i128)
+    }
+
+    /// Appends a signed 16-bit integer in base ten.
+    pub fn push_i16(&mut self, value: i16) -> Result<(), AllocError> {
+        self.push_i128(value as i128)
+    }
+
+    /// Appends a signed 8-bit integer in base ten.
+    pub fn push_i8(&mut self, value: i8) -> Result<(), AllocError> {
+        self.push_i128(value as i128)
+    }
+
+    /// Appends a single-precision float using a shortest round-trippable form.
+    pub fn push_f32(
+        &mut self,
+        value: f32,
+    ) -> Result<(), AllocError> {
+        String::reserve(&mut *self, 64)?;
+        let destination =
+            (self.bytes.as_mut_ptr() as usize + self.len) as *mut u8;
+        let written = unsafe {
+            text_format_f32(value, destination, 64)
+        };
+        if written < 0 {
+            panic("std::string could not format f32")
+        } else {
+            self.len += written as usize;
+            Ok(())
+        }
+    }
+
+    /// Appends a double-precision float using a shortest round-trippable form.
+    pub fn push_f64(
+        &mut self,
+        value: f64,
+    ) -> Result<(), AllocError> {
+        String::reserve(&mut *self, 64)?;
+        let destination =
+            (self.bytes.as_mut_ptr() as usize + self.len) as *mut u8;
+        let written = unsafe {
+            text_format_f64(value, destination, 64)
+        };
+        if written < 0 {
+            panic("std::string could not format f64")
+        } else {
+            self.len += written as usize;
+            Ok(())
+        }
+    }
+
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -135,6 +363,265 @@ impl String {
     pub fn deinit(self) {
         self.bytes.deinit();
     }
+}
+
+/// Allocates one string containing `left` followed by `right`.
+pub fn concat(
+    allocator: &Allocator,
+    left: str,
+    right: str,
+) -> Result<String, AllocError> {
+    let capacity = __string_length(left) + __string_length(right);
+    let mut output = String::with_capacity(allocator, capacity)?;
+    output.push_str(left)?;
+    output.push_str(right)?;
+    Ok(output)
+}
+
+/// Allocates one string containing three values in order.
+pub fn concat3(
+    allocator: &Allocator,
+    first: str,
+    second: str,
+    third: str,
+) -> Result<String, AllocError> {
+    let capacity =
+        __string_length(first)
+        + __string_length(second)
+        + __string_length(third);
+    let mut output = String::with_capacity(allocator, capacity)?;
+    output.push_str(first)?;
+    output.push_str(second)?;
+    output.push_str(third)?;
+    Ok(output)
+}
+
+/// Repeats one borrowed string `count` times.
+pub fn repeat(
+    allocator: &Allocator,
+    value: str,
+    count: usize,
+) -> Result<String, AllocError> {
+    let capacity = __string_length(value) * count;
+    let mut output = String::with_capacity(allocator, capacity)?;
+    let mut index: usize = 0;
+    while index < count {
+        output.push_str(value)?;
+        index += 1;
+    }
+    Ok(output)
+}
+
+/// Joins owned strings without consuming them.
+pub fn join_strings(
+    allocator: &Allocator,
+    values: &[String],
+    separator: str,
+) -> Result<String, AllocError> {
+    let mut capacity: usize = 0;
+    let mut index: usize = 0;
+    let values_len = __slice_length(values);
+    while index < values_len {
+        capacity += values[index].len();
+        index += 1;
+    }
+    if values_len > 1 {
+        capacity += __string_length(separator) * (values_len - 1);
+    }
+
+    let mut output = String::with_capacity(allocator, capacity)?;
+    index = 0;
+    while index < values_len {
+        if index > 0 {
+            output.push_str(separator)?;
+        }
+        output.push_str(values[index].as_str())?;
+        index += 1;
+    }
+    Ok(output)
+}
+
+/// Returns the UTF-8 byte length of a borrowed string.
+pub fn byte_len(value: str) -> usize {
+    __string_length(value)
+}
+
+/// Counts Unicode scalar values rather than UTF-8 bytes.
+pub fn char_count(value: str) -> usize {
+    let mut count: usize = 0;
+    for _ in value.chars() {
+        count += 1;
+    }
+    count
+}
+
+/// Reports whether `prefix` appears at the start of `value`.
+pub fn starts_with(value: str, prefix: str) -> bool {
+    let value_len = __string_length(value);
+    let prefix_len = __string_length(prefix);
+    if prefix_len > value_len {
+        false
+    } else {
+        unsafe {
+            buffer_equals(
+                __string_data(value),
+                prefix_len,
+                __string_data(prefix),
+                prefix_len,
+            )
+        }
+    }
+}
+
+/// Reports whether `suffix` appears at the end of `value`.
+pub fn ends_with(value: str, suffix: str) -> bool {
+    let value_len = __string_length(value);
+    let suffix_len = __string_length(suffix);
+    if suffix_len > value_len {
+        false
+    } else {
+        let start =
+            (__string_data(value) as usize + value_len - suffix_len)
+            as *const u8;
+        unsafe {
+            buffer_equals(
+                start,
+                suffix_len,
+                __string_data(suffix),
+                suffix_len,
+            )
+        }
+    }
+}
+
+/// Finds the first byte offset of `needle` within `value`.
+pub fn find(value: str, needle: str) -> Option<usize> {
+    let value_len = __string_length(value);
+    let needle_len = __string_length(needle);
+    if needle_len == 0 {
+        Some(0)
+    } else if needle_len > value_len {
+        None
+    } else {
+        let mut index: usize = 0;
+        while index <= value_len - needle_len {
+            let start =
+                (__string_data(value) as usize + index) as *const u8;
+            let matches = unsafe {
+                buffer_equals(
+                    start,
+                    needle_len,
+                    __string_data(needle),
+                    needle_len,
+                )
+            };
+            if matches {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+/// Reports whether `needle` occurs within `value`.
+pub fn contains(value: str, needle: str) -> bool {
+    match find(value, needle) {
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Reports whether a byte offset lies on a UTF-8 scalar boundary.
+pub fn is_char_boundary(value: str, index: usize) -> bool {
+    let len = __string_length(value);
+    if index == 0 || index == len {
+        true
+    } else if index > len {
+        false
+    } else {
+        let byte = value.bytes()[index];
+        (byte & 192) != 128
+    }
+}
+
+/// Allocates the full Unicode lowercase mapping of one scalar.
+pub fn to_lowercase(
+    allocator: &Allocator,
+    value: char,
+) -> Result<String, AllocError> {
+    let mut output = String::with_capacity(allocator, 12)?;
+    let written = unsafe {
+        unicode_lowercase(
+            value as u32,
+            output.bytes.as_mut_ptr(),
+            output.bytes.len(),
+        )
+    };
+    if written < 0 {
+        output.deinit();
+        panic("std::string could not lowercase a valid Unicode scalar")
+    } else {
+        output.len = written as usize;
+        Ok(output)
+    }
+}
+
+/// Allocates the full Unicode uppercase mapping of one scalar.
+pub fn to_uppercase(
+    allocator: &Allocator,
+    value: char,
+) -> Result<String, AllocError> {
+    let mut output = String::with_capacity(allocator, 12)?;
+    let written = unsafe {
+        unicode_uppercase(
+            value as u32,
+            output.bytes.as_mut_ptr(),
+            output.bytes.len(),
+        )
+    };
+    if written < 0 {
+        output.deinit();
+        panic("std::string could not uppercase a valid Unicode scalar")
+    } else {
+        output.len = written as usize;
+        Ok(output)
+    }
+}
+
+/// Reports whether a scalar has the Unicode Alphabetic property.
+pub fn is_alphabetic(value: char) -> bool {
+    unsafe { unicode_is_alphabetic(value as u32) }
+}
+
+/// Reports whether a scalar is Unicode alphabetic or numeric.
+pub fn is_alphanumeric(value: char) -> bool {
+    unsafe { unicode_is_alphanumeric(value as u32) }
+}
+
+/// Reports whether a scalar has the Unicode Numeric property.
+pub fn is_numeric(value: char) -> bool {
+    unsafe { unicode_is_numeric(value as u32) }
+}
+
+/// Reports whether a scalar has the Unicode White_Space property.
+pub fn is_whitespace(value: char) -> bool {
+    unsafe { unicode_is_whitespace(value as u32) }
+}
+
+/// Reports whether a scalar has the Unicode Lowercase property.
+pub fn is_lowercase(value: char) -> bool {
+    unsafe { unicode_is_lowercase(value as u32) }
+}
+
+/// Reports whether a scalar has the Unicode Uppercase property.
+pub fn is_uppercase(value: char) -> bool {
+    unsafe { unicode_is_uppercase(value as u32) }
+}
+
+/// Reports whether a scalar is a Unicode control character.
+pub fn is_control(value: char) -> bool {
+    unsafe { unicode_is_control(value as u32) }
 }
 
 pub fn from_initialized_bytes(
