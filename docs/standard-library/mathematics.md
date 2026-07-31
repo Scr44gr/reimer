@@ -1,4 +1,4 @@
-# Mathematics API
+# Mathematics
 
 `std::math` provides scalar floating-point functions and compact
 single-precision vectors. Its native scalar ABI is private to the standard

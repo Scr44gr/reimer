@@ -1,4 +1,4 @@
-# Numeric literals
+# Numeric literals and integer behavior
 
 Reimer supports decimal, hexadecimal, binary, and octal integer literals:
 

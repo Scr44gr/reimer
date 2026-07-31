@@ -1,0 +1,45 @@
+[book]
+title = "The Reimer Programming Language"
+authors = ["Reimer contributors"]
+description = "A practical guide and reference for the Reimer programming language."
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+create-missing = false
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "ayu"
+smart-punctuation = true
+definition-lists = true
+admonitions = true
+additional-css = ["docs/theme/reimer.css"]
+additional-js = ["docs/theme/reimer.js"]
+no-section-label = true
+git-repository-url = "https://github.com/Scr44gr/reimer"
+git-repository-icon = "fab-github"
+edit-url-template = "https://github.com/Scr44gr/reimer/edit/master/{path}"
+site-url = "/reimer/"
+input-404 = "404.md"
+sidebar-header-nav = true
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.playground]
+runnable = false
+copyable = true
+
+[output.html.search]
+enable = true
+limit-results = 40
+teaser-word-count = 24
+use-boolean-and = true
+boost-title = 3
+boost-hierarchy = 2
+boost-paragraph = 1
+expand = true
+heading-split-level = 3

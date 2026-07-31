@@ -1,4 +1,4 @@
-# SDL3, OpenGL, and tensor integration test
+# SDL3 and OpenGL demo
 
 `examples/m5_sdl_opengl.reim` validates the first complete native graphics
 path from LDD section 22.1:
@@ -24,7 +24,7 @@ and cleanup remain safe source-language operations.
 From the repository root:
 
 ```powershell
-.\scripts\run-sdl-opengl-demo.ps1
+.\scripts\demos\run-sdl-opengl.ps1
 ```
 
 The script downloads SDL 3.4.12 from its official release only when missing,

@@ -1,4 +1,4 @@
-# Concurrency in Reimer
+# Concurrency and jobs
 
 M9 provides native concurrency without expanding the public `unsafe` surface.
 Programs use `std::thread` and `std::job`; pointers, ABI buffers, and function

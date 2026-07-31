@@ -1,4 +1,4 @@
-# Environment and child processes
+# Environment and processes
 
 Reimer exposes process context through safe `std::env` and `std::process`
 wrappers. Native operating-system values remain behind a private runtime ABI;

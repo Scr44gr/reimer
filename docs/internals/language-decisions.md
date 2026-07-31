@@ -1,4 +1,4 @@
-# Frozen decisions for Reimer v0.1
+# Language decisions for the experimental release
 
 This document records design decisions accepted before continuing the frontend
 and native backend. They take precedence over contradictory proposals in the

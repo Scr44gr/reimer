@@ -1,4 +1,4 @@
-# Compile-time metaprogramming
+# Compile-time programming and metadata
 
 M10 adds deterministic frontend evaluation without introducing a runtime
 virtual machine or allowing external effects during compilation.

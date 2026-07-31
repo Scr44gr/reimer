@@ -1,4 +1,4 @@
-# File-system API
+# Filesystem
 
 `std::fs` exposes owned files and UTF-8 path operations without requiring
 application code to enter `unsafe`. Its native ABI is private to the standard

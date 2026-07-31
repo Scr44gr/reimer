@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $release = '3.4.12'
 $archiveHash = '326e9f5ae2cbab478c03a9e2b22a560e5a9358b5f5eed8e61f5a7c8333750cf1'
 $archiveUrl = "https://github.com/libsdl-org/SDL/releases/download/release-$release/SDL3-$release-win32-x64.zip"
-$workspace = Split-Path -Parent $PSScriptRoot
+$workspace = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $nativeRoot = Join-Path $workspace "target\native\sdl-$release"
 $archive = Join-Path $nativeRoot "SDL3-$release-win32-x64.zip"
 $library = Join-Path $nativeRoot 'SDL3.dll'
@@ -31,9 +31,9 @@ if (-not (Test-Path -LiteralPath $library)) {
 $env:PATH = "$nativeRoot;$env:PATH"
 Push-Location $workspace
 try {
-    cargo run -p reimer-cli --locked -- run examples/m5_sdl_window.reim
+    cargo run -p reimer-cli --locked -- run examples/m5_sdl_opengl.reim
     if ($LASTEXITCODE -ne 0) {
-        throw "the SDL window demo failed with exit code $LASTEXITCODE"
+        throw "the SDL3/OpenGL demo failed with exit code $LASTEXITCODE"
     }
 }
 finally {

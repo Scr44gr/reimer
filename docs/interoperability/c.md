@@ -1,4 +1,4 @@
-# C interoperability helpers
+# C interoperability
 
 `std::c` provides target-correct aliases and small helpers for declaring native
 ABIs. The aliases are transparent: they use the matching scalar layout and call

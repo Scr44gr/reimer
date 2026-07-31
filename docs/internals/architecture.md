@@ -1,4 +1,4 @@
-# Initial Reimer architecture
+# Compiler architecture
 
 ## Implemented pipeline
 
@@ -48,24 +48,24 @@
   safe standard-library wrappers.
 - `std::c` aliases are resolved to the native target's actual scalar ABI before
   HIR lowering. They are transparent and introduce no wrapper layout. See
-  [`c-interop.md`](c-interop.md).
+  [C interoperability](../interoperability/c.md).
 
 `std::fs` follows the same boundary. Generated code passes bounded UTF-8 paths
 and byte regions to a small runtime registry of opaque native file handles.
 Files remain move-only source values, reads receive an explicit allocator, and
 all public operations return recoverable errors. The detailed ownership and
-buffer contracts are documented in [`filesystem.md`](filesystem.md).
+buffer contracts are documented in the [filesystem guide](../standard-library/filesystem.md).
 
 `std::math` uses a smaller private ABI for scalar floating-point operations
 that are not source-language operators. The ABI receives and returns only
 `f32` or `f64`; safe wrappers provide explicit precision and the vector layer
-is implemented entirely in source. See [`mathematics.md`](mathematics.md).
+is implemented entirely in source. See [mathematics](../standard-library/mathematics.md).
 
 `std::time` keeps wall-clock timestamps separate from monotonic interval
 measurement. Three scalar runtime symbols read Unix seconds, read a
 process-local nanosecond counter, and park the current native thread through
 the operating system. `Duration` and `Instant` remain safe source-level value
-types. See [`time.md`](time.md).
+types. See [time](../standard-library/time.md).
 
 `std::env` converts native argument, environment, and path values explicitly
 to UTF-8 through stable snapshots. JIT sessions receive an isolated argument
@@ -74,7 +74,7 @@ arguments. `std::process` stores commands and children behind opaque runtime
 handles, invokes executables without a shell, and makes wait or terminating
 cleanup explicit. Child-only environment configuration avoids unsafe global
 mutation. See
-[`environment-and-processes.md`](environment-and-processes.md).
+[environment and processes](../standard-library/environment-and-processes.md).
 
 `std::string` keeps allocation decisions in safe source APIs. Concatenation
 precomputes its UTF-8 capacity, incremental formatting reuses an owned
@@ -82,7 +82,7 @@ precomputes its UTF-8 capacity, incremental formatting reuses an owned
 `Debug`, and Unicode queries operate on borrowed views. Bounded runtime helpers
 cover float formatting, full-width integer conversion, scalar encoding, and
 Unicode case properties without hidden allocation. See
-[`text-and-formatting.md`](text-and-formatting.md).
+[text and formatting](../guide/text-and-formatting.md).
 
 ## Integer overflow
 
@@ -160,7 +160,7 @@ the byte boundary before creating a Rust slice; generated code owns the cursor
 and never exposes raw pointers to source programs.
 
 Frozen syntax and semantic decisions are recorded in
-[`language-decisions-v0.1.md`](language-decisions-v0.1.md).
+[language decisions](language-decisions.md).
 
 ## M7 Tensor
 
@@ -175,7 +175,7 @@ that write results receive an explicit output.
 ## M8 Packages
 
 The declarative system is described in
-[`package-system.md`](package-system.md). Path identities are relative to the
+[package system](../guide/package-system.md). Path identities are relative to the
 root so the lockfile survives relocation. Git is pinned to a commit;
 `--locked` prevents drift. A root with `src/package.reim` resolves as a library
 without inventing a `main`.
@@ -194,7 +194,7 @@ compilations do not interfere. Private ABI boundaries keep documented `unsafe`
 blocks; user code sees only safe wrappers.
 
 The API and its invariants are described in
-[`concurrency.md`](concurrency.md).
+[concurrency guide](../standard-library/concurrency.md).
 
 ## M10 Comptime
 
@@ -210,4 +210,4 @@ registers unit functions, and the CLI executes each one in an isolated JIT
 process. `@must_use` is published as a linter/LSP diagnostic.
 
 Syntax, limits, and guarantees are described in
-[`metaprogramming.md`](metaprogramming.md).
+[compile-time programming guide](../guide/metaprogramming.md).

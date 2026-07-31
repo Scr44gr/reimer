@@ -1,136 +1,53 @@
 # Reimer
 
-Reimer is a compiled language initially aimed at games, engines, and content
-tools. The compiler is written in Rust, and its first backend generates machine
-code through Cranelift.
+[![CI](https://github.com/Scr44gr/reimer/actions/workflows/ci.yml/badge.svg)](https://github.com/Scr44gr/reimer/actions/workflows/ci.yml)
+[![Documentation](https://github.com/Scr44gr/reimer/actions/workflows/docs.yml/badge.svg)](https://scr44gr.github.io/reimer/)
 
-The compiler implements milestones M0-M10 from the language design document.
-In addition to the minimum program, it compiles every scalar and aggregate
-type, complete control flow, recoverable errors, moves and references, modules
-with `::` paths, C FFI, methods, type and `const` generics, monomorphization,
-traits with static dispatch, `comptime` evaluation, attributes, closed derives,
-typed reflection, and stable-address `static` storage with `static mut` guarded
-by `unsafe`. Runtime `assert` and debug-only `debug_assert` preserve explicit
-failure messages, and `std::target::os()` exposes the host as a typed enum. The
-standard library includes explicit allocators, safe I/O, owned files with
-explicit allocator-backed reads, recoverable slice access, allocation-free
-UTF-8 byte and character iteration, wall and monotonic clocks, blocking
-CPU-idle sleep, command-line arguments, environment inspection, current paths,
-process identity, scoped direct child processes, scalar and vector math, allocator-aware
-concatenation and primitive formatting, Unicode text queries, `String`, `Vec`,
-typed `f"..."` interpolation with statically dispatched `Display` and `Debug`,
-`HashMap`, `HashSet`, `RingBuffer`, contiguous tensors with safe views, threads,
-synchronization, atomics, and a work-stealing job pool:
+Reimer is an experimental compiled language for games, engines, and content tools. The compiler is written in Rust and lowers typed HIR to native machine code through Cranelift.
+
+The current v0.1 surface includes static types, implicit moves, references, explicit allocators, recoverable errors, modules with `::` paths, packages and lockfiles, C FFI, traits and generics, compile-time evaluation, Unicode text, collections, filesystem and process APIs, tensors, concurrency, a linter/LSP, and standalone native executable linking.
 
 ```reimer
-fn factorial(value: i32) -> i32 {
-    let mut current = value;
-    let mut result = 1;
-    while current > 1 {
-        result *= current;
-        current -= 1;
+from std::io import println;
+
+fn main() -> i32 {
+    match println("Hello from Reimer") {
+        Ok(_) => 0,
+        Err(_) => 1,
     }
-    result
 }
 ```
 
-The pipeline covers `.reim` source -> tokens with spans -> AST -> name
-resolution and type checking -> typed HIR -> Cranelift. `run` executes the
-program through JIT, while `build` links an independent native executable with
-the bundled runtime and LLD. `emit-object` remains available for raw objects.
+## Start here
 
-## Usage
+The complete, searchable guide is published at [scr44gr.github.io/reimer](https://scr44gr.github.io/reimer/).
 
-```text
-cargo run -p reimer-cli -- check examples/exit_42.reim
-cargo run -p reimer-cli -- emit-object examples/exit_42.reim
-cargo run -p reimer-cli -- build examples/exit_42.reim
-cargo run -p reimer-cli -- run examples/exit_42.reim
-cargo run -p reimer-cli -- run examples/m1_language.reim
-cargo run -p reimer-cli -- run examples/m2_scalars.reim
-cargo run -p reimer-cli -- run examples/m2_numeric_literals.reim
-cargo run -p reimer-cli -- run examples/m2_composites.reim
-cargo run -p reimer-cli -- run examples/m2_control.reim
-cargo run -p reimer-cli -- run examples/m3_views.reim
-cargo run -p reimer-cli -- run examples/m3_io.reim
-cargo run -p reimer-cli -- run examples/m3_string.reim
-cargo run -p reimer-cli -- run examples/m3_vec.reim
-cargo run -p reimer-cli -- run examples/m3_collections.reim
-cargo run -p reimer-cli -- run examples/m3_integer_overflow.reim
-cargo run -p reimer-cli -- run examples/m3_slice_access.reim
-cargo run -p reimer-cli -- run examples/m3_utf8.reim
-cargo run -p reimer-cli -- run examples/m3_assertions.reim
-cargo run -p reimer-cli -- run examples/m3_filesystem.reim
-cargo run -p reimer-cli -- run examples/m3_math.reim
-cargo run -p reimer-cli -- run examples/m3_time.reim
-cargo run -p reimer-cli -- run examples/platform_environment.reim -- hello
-cargo run -p reimer-cli -- run examples/platform_process.reim
-cargo run -p reimer-cli -- run examples/m3_text.reim
-cargo run -p reimer-cli -- run examples/m3_interpolation.reim
-cargo run -p reimer-cli -- run examples/m5_ffi.reim
-cargo run -p reimer-cli -- run examples/m5_c_types.reim
-cargo run -p reimer-cli -- run examples/m6_generics.reim
-cargo run -p reimer-cli -- run examples/m7_tensor.reim
-cargo run -p reimer-cli -- run examples/m7_matmul.reim
-cargo run -p reimer-cli -- check examples/m8_packages/app --locked
-cargo run -p reimer-cli -- run examples/m8_packages/app --release --locked
-cargo run -p reimer-cli -- test examples/m8_packages/app --locked
-cargo run -p reimer-cli -- run examples/m9_threads/main.reim
-cargo run -p reimer-cli -- run examples/m9_synchronization/main.reim
-cargo run -p reimer-cli -- run examples/m9_atomics/main.reim
-cargo run -p reimer-cli -- run examples/m9_jobs/main.reim
-cargo run -p reimer-cli -- run examples/m9_tensor_parallel/main.reim
-cargo run -p reimer-cli -- check examples/m10_comptime.reim
-cargo run -p reimer-cli -- run examples/m10_comptime.reim
-cargo run -p reimer-cli -- test examples/m10_comptime.reim
-```
+- [Installation](docs/getting-started/installation.md)
+- [Your first project](docs/getting-started/first-project.md)
+- [Language tour](docs/guide/tour.md)
+- [Standard library](docs/standard-library/overview.md)
+- [Command-line reference](docs/tools/cli-reference.md)
+- [Implementation status](docs/internals/implementation-status.md)
 
-To create a project:
+## Build from source
+
+The Rust version and components are pinned in `rust-toolchain.toml`.
 
 ```text
-reimer new game
-reimer add physics --path ../physics --project game
-reimer check game
-reimer build game --release --locked
-reimer doc game
+cargo install --path crates/reimer-cli --locked --force
+reimer --version
+reimer check examples/exit_42.reim
+reimer run examples/exit_42.reim --release
+reimer build examples/exit_42.reim --release -o answer
 ```
 
-The `reimer.toml` format, lockfile semantics, profiles, and path/Git
-dependencies are documented in
-[`docs/package-system.md`](docs/package-system.md). Compile-time evaluation,
-attributes, and reflection are specified in
-[`docs/metaprogramming.md`](docs/metaprogramming.md).
-Safe owned file handles, UTF-8 paths, and explicit reads are documented in
-[`docs/filesystem.md`](docs/filesystem.md).
-Arguments, environment values, process identity, exit status, and scoped child
-processes are documented in
-[`docs/environment-and-processes.md`](docs/environment-and-processes.md).
-Scalar functions and `Vec2`/`Vec3`/`Vec4` are documented in
-[`docs/mathematics.md`](docs/mathematics.md).
-Target-correct C aliases and raw-pointer helpers are documented in
-[`docs/c-interop.md`](docs/c-interop.md).
-Allocator-aware concatenation, primitive formatting, and Unicode behavior are
-documented in [`docs/text-and-formatting.md`](docs/text-and-formatting.md).
-Integer bases, numeric separators, contextual typing, and literal range rules
-are documented in [`docs/numeric-literals.md`](docs/numeric-literals.md).
-`reimer doc` validates the complete package and writes its public `///`
-documentation to `target/reimer/doc/<package>.md`.
-
-Executable packages built with `reimer build` do not require the compiler or a
-separate Reimer runtime when launched. Library packages continue to produce a
-native object until a stable library archive format is specified. The current
-compiler build embeds its matching runtime archive and uses the Rust toolchain
-that built the compiler as the LLD driver.
+Downloaded release archives keep `reimer`, `reimer-lsp`, `reimer-lint`, and `std` together. Source builds can use the checkout's standard library; `REIMER_STD_PATH` explicitly selects another standard-library directory when needed.
 
 ## VS Code
 
-`editors/vscode` contains TextMate highlighting and an extension connected to
-`reimer-lsp`. The server publishes diagnostics, inferred types, hover,
-completion, definitions, compiler-linked rename, dependency-aware analysis of
-unsaved open modules, import organization, quick fixes for typos and
-antipatterns, and static allocator reservation estimates. Installation and
-packaging are described in
-[`editors/vscode/README.md`](editors/vscode/README.md).
+`editors/vscode` contains the original TextMate grammar and compiler-backed language client. It provides canonical inferred types, Markdown hovers, completion, diagnostics, rename, import organization, quick fixes, antipattern detection, and static allocator estimates.
+
+See the [editor setup guide](docs/getting-started/editor.md).
 
 ## Development
 
@@ -140,6 +57,11 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -W clippy::perf -W clippy::redundant_clone -W clippy::needless_collect -D warnings
 ```
 
-The architecture and exact milestone scope are described in
-[`docs/architecture.md`](docs/architecture.md). Full LDD coverage is tracked in
-[`docs/implementation-status.md`](docs/implementation-status.md).
+Build the documentation locally with:
+
+```text
+pwsh ./scripts/docs/check-links.ps1
+mdbook serve --open
+```
+
+See [Contributing](docs/contributing.md) for the repository map and the required vertical compiler workflow.

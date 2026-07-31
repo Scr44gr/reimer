@@ -1,7 +1,7 @@
-# LDD implementation coverage
+# Implementation status
 
 This matrix follows the v0.1 LDD roadmap and the decisions frozen in
-[`language-decisions-v0.1.md`](language-decisions-v0.1.md). A milestone is only
+[language decisions](language-decisions.md). A milestone is only
 complete when it has a specification, implementation, positive and negative
 tests, and an executable `.reim` program.
 
@@ -46,7 +46,7 @@ reported as implemented:
 | Slices and UTF-8 views | Checked `[]`; recoverable `get`/`get_mut`; slice iteration; validated `str`; zero-copy `bytes()`; allocation-free `chars()` with `next()` and `for` | - |
 | Standard library plan | `alloc`, `c`, `collections`, `env`, `fmt`, `fs`, `io`, `math`, `process`, `string`, `target`, `time`, `thread`, `job`, and `tensor`; UTF-8 command-line arguments, environment and current-path inspection, process identity, direct scoped child processes with child-only environment configuration, wall and monotonic clocks, `Duration`, `Instant`, CPU-idle blocking sleep, allocator-aware concatenation, primitive formatting, typed interpolated strings with distinct `Display` (`{value}`) and `Debug` (`{value:?}`) contracts, Unicode queries, and full scalar case mappings | - |
 | Tooling | Formatter, checker, tests, generated `///` Markdown, hover, completion, definitions, compiler-linked intradocument rename, dependency-aware incremental snapshots, CodeLens, and diagnostics | - |
-| First integrated demo | `examples/m5_sdl_opengl.reim` combines SDL3/OpenGL setup, allocator-backed RGBA tensor data, recoverable `Result` paths, two ordered `defer` cleanups, drawing, presentation, and native teardown; `scripts/run-sdl-opengl-demo.ps1` supplies a verified SDL3 runtime | - |
+| First integrated demo | `examples/m5_sdl_opengl.reim` combines SDL3/OpenGL setup, allocator-backed RGBA tensor data, recoverable `Result` paths, two ordered `defer` cleanups, drawing, presentation, and native teardown; `scripts/demos/run-sdl-opengl.ps1` supplies a verified SDL3 runtime | - |
 
 ## Deliberate differences from the draft
 
