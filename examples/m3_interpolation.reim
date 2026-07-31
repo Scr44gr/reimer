@@ -1,0 +1,47 @@
+from std::alloc import AllocError, general_allocator;
+from std::fmt import Display, FormatError, Formatter;
+from std::string import String;
+
+struct Player {
+    score: u32,
+}
+
+impl Display for Player {
+    fn fmt(
+        &self,
+        formatter: &mut Formatter,
+    ) -> Result<(), FormatError> {
+        formatter.write_str("Player(")?;
+        formatter.write_u128(self.score as u128)?;
+        formatter.write_char(')')
+    }
+}
+
+fn build_message() -> Result<i32, AllocError> {
+    let allocator = general_allocator();
+    let name: str = "Ada";
+    let score: i32 = 42;
+    let player = Player { score: 7 };
+    let mut message = String::with_capacity(&allocator, 64)?;
+
+    message.push_format(
+        f"hello {name}, score={score}, active={true}, player={player}",
+    )?;
+    let valid = message.matches(
+        "hello Ada, score=42, active=true, player=Player(7)",
+    );
+    message.deinit();
+
+    if valid {
+        Ok(42)
+    } else {
+        Ok(0)
+    }
+}
+
+fn main() -> i32 {
+    match build_message() {
+        Ok(value) => value,
+        Err(_) => 1,
+    }
+}

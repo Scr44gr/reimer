@@ -714,6 +714,9 @@ impl HirIndexer<'_> {
                     self.expression(argument);
                 }
             }
+            ExpressionKind::FormatPush {
+                function, calls, ..
+            } => self.format_push(*function, calls, expression.span),
             ExpressionKind::Tuple(elements)
             | ExpressionKind::Array(elements)
             | ExpressionKind::Struct(elements) => {
@@ -811,6 +814,21 @@ impl HirIndexer<'_> {
                 self.typed,
                 TypeHintKind::Binding,
             ));
+        }
+    }
+
+    fn format_push(&mut self, function: FunctionId, calls: &[hir::Expression], span: Span) {
+        if let Some(use_span) = self.syntax_index.call_callees.get(&span_key(span)).copied() {
+            self.add_callable_hint(function, use_span);
+            if let Some(target_span) = self.function_targets.get(&function).copied() {
+                self.definitions.push(DefinitionLink {
+                    use_span,
+                    target_span,
+                });
+            }
+        }
+        for call in calls {
+            self.expression_kind(call);
         }
     }
 

@@ -994,6 +994,14 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("Option", CompletionItemKind::ENUM, "core"),
     ("Result", CompletionItemKind::ENUM, "core"),
     ("String", CompletionItemKind::STRUCT, "std::string"),
+    ("Display", CompletionItemKind::INTERFACE, "std::fmt"),
+    ("Formatter", CompletionItemKind::STRUCT, "std::fmt"),
+    ("FormatArgs", CompletionItemKind::STRUCT, "std::fmt"),
+    (
+        "FormatError",
+        CompletionItemKind::TYPE_PARAMETER,
+        "std::fmt",
+    ),
     (
         "with_capacity",
         CompletionItemKind::METHOD,
@@ -1014,6 +1022,46 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ("push_u128", CompletionItemKind::METHOD, "String::push_u128"),
     ("push_f32", CompletionItemKind::METHOD, "String::push_f32"),
     ("push_f64", CompletionItemKind::METHOD, "String::push_f64"),
+    (
+        "push_format",
+        CompletionItemKind::METHOD,
+        "String::push_format",
+    ),
+    (
+        "write_str",
+        CompletionItemKind::METHOD,
+        "Formatter::write_str",
+    ),
+    (
+        "write_char",
+        CompletionItemKind::METHOD,
+        "Formatter::write_char",
+    ),
+    (
+        "write_bool",
+        CompletionItemKind::METHOD,
+        "Formatter::write_bool",
+    ),
+    (
+        "write_i128",
+        CompletionItemKind::METHOD,
+        "Formatter::write_i128",
+    ),
+    (
+        "write_u128",
+        CompletionItemKind::METHOD,
+        "Formatter::write_u128",
+    ),
+    (
+        "write_f32",
+        CompletionItemKind::METHOD,
+        "Formatter::write_f32",
+    ),
+    (
+        "write_f64",
+        CompletionItemKind::METHOD,
+        "Formatter::write_f64",
+    ),
     ("concat", CompletionItemKind::FUNCTION, "std::string"),
     ("concat3", CompletionItemKind::FUNCTION, "std::string"),
     ("repeat", CompletionItemKind::FUNCTION, "std::string"),
@@ -1308,6 +1356,9 @@ mod tests {
             "wrapping_add",
             "checked_add",
             "saturating_add",
+            "Display",
+            "Formatter",
+            "push_format",
             "comptime",
             "size_of",
             "fields",
@@ -2124,6 +2175,77 @@ fn main() -> i32 { 0 }
                 .contains("Allocates one string containing `left` followed by `right`.")
         );
         assert!(contents.value.contains("11 B reserved"));
+    }
+
+    #[test]
+    fn document_should_understand_interpolated_values_and_destination_growth() {
+        let source = "from std::alloc import AllocError, general_allocator;
+from std::string import String;
+fn build() -> Result<i32, AllocError> {
+    let allocator = general_allocator();
+    let score = 42;
+    let mut message = String::with_capacity(&allocator, 32)?;
+    message.push_format(f\"score={score}\")?;
+    message.deinit();
+    Ok(score)
+}
+fn main() -> i32 { 0 }
+";
+        let fixture = Fixture::new();
+        let main = fixture.write("main.reim", source);
+        let lines = LineIndex::new(Arc::from(source));
+        let document = Document::new(
+            Url::from_file_path(main).expect("file URL should be created"),
+            source.to_owned(),
+        );
+        let value_position = lines.position(
+            source
+                .find("{score}")
+                .expect("formatted value should exist")
+                .saturating_add(1),
+        );
+        let call_position = lines.position(
+            source
+                .find("push_format")
+                .expect("formatting call should exist"),
+        );
+
+        let value_hover = document
+            .hover(value_position)
+            .expect("formatted value should have hover information");
+        let call_hover = document
+            .hover(call_position)
+            .expect("formatting call should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(value_contents) = value_hover.contents
+        else {
+            panic!("formatted value hover should use markdown");
+        };
+        let tower_lsp::lsp_types::HoverContents::Markup(call_contents) = call_hover.contents else {
+            panic!("formatting call hover should use markdown");
+        };
+        let value_byte = lines
+            .byte(value_position)
+            .expect("formatted value position should map to a byte");
+        let value_candidates = document
+            .analysis
+            .type_hints
+            .iter()
+            .filter(|hint| value_byte >= hint.span.start && value_byte <= hint.span.end)
+            .collect::<Vec<_>>();
+
+        assert!(
+            value_contents.value.contains("i32"),
+            "unexpected hover: {}; candidates: {value_candidates:?}",
+            value_contents.value,
+        );
+        assert!(value_contents.value.contains("32-bit signed integer"));
+        assert!(call_contents.value.contains("String::push_format"));
+        assert!(call_contents.value.contains("runtime-sized reservation"));
+        assert!(
+            call_contents
+                .value
+                .contains("allocator retained by String `message`")
+        );
     }
 
     #[test]

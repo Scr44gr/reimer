@@ -5,6 +5,14 @@ pub enum StringError {
     LengthExceedsCapacity,
 }
 
+/// Compiler-owned marker carried only by an `f"..."` expression.
+pub struct FormatArgs {
+    marker: (),
+}
+
+/// Formatting into an owned string can fail only when its allocator fails.
+pub type FormatError = AllocError;
+
 pub struct String {
     bytes: OwnedBytes,
     len: usize,
@@ -356,6 +364,17 @@ impl String {
         }
     }
 
+    /// Appends every fragment of an interpolated string.
+    ///
+    /// The compiler expands the `FormatArgs` operand into typed writes. A
+    /// `FormatArgs` value cannot be constructed or stored by user code.
+    pub fn push_format(
+        &mut self,
+        arguments: FormatArgs,
+    ) -> Result<(), AllocError> {
+        panic("push_format must be expanded by the compiler")
+    }
+
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -363,6 +382,87 @@ impl String {
     pub fn deinit(self) {
         self.bytes.deinit();
     }
+}
+
+/// Safe formatting destination passed to user-defined `Display` code.
+pub struct Formatter {
+    output: &mut String,
+}
+
+impl Formatter {
+    /// Appends a borrowed UTF-8 string without consuming it.
+    pub fn write_str(
+        &mut self,
+        value: str,
+    ) -> Result<(), AllocError> {
+        String::push_str(&mut *self.output, value)
+    }
+
+    /// Appends one Unicode scalar value encoded as UTF-8.
+    pub fn write_char(
+        &mut self,
+        value: char,
+    ) -> Result<(), AllocError> {
+        String::push_char(&mut *self.output, value)
+    }
+
+    /// Appends `true` or `false`.
+    pub fn write_bool(
+        &mut self,
+        value: bool,
+    ) -> Result<(), AllocError> {
+        String::push_bool(&mut *self.output, value)
+    }
+
+    /// Appends a signed integer in base ten.
+    pub fn write_i128(
+        &mut self,
+        value: i128,
+    ) -> Result<(), AllocError> {
+        String::push_i128(&mut *self.output, value)
+    }
+
+    /// Appends an unsigned integer in base ten.
+    pub fn write_u128(
+        &mut self,
+        value: u128,
+    ) -> Result<(), AllocError> {
+        String::push_u128(&mut *self.output, value)
+    }
+
+    /// Appends the shortest round-trippable representation of an `f32`.
+    pub fn write_f32(
+        &mut self,
+        value: f32,
+    ) -> Result<(), AllocError> {
+        String::push_f32(&mut *self.output, value)
+    }
+
+    /// Appends the shortest round-trippable representation of an `f64`.
+    pub fn write_f64(
+        &mut self,
+        value: f64,
+    ) -> Result<(), AllocError> {
+        String::push_f64(&mut *self.output, value)
+    }
+}
+
+/// Defines the user-facing representation accepted by `f"{value}"`.
+pub trait Display {
+    /// Writes `self` into the supplied destination without allocating separately.
+    fn fmt(
+        &self,
+        formatter: &mut Formatter,
+    ) -> Result<(), AllocError>;
+}
+
+/// Appends a value through its statically selected `Display` implementation.
+pub fn append_display<T: Display>(
+    output: &mut String,
+    value: &T,
+) -> Result<(), AllocError> {
+    let mut formatter = Formatter { output: output };
+    (*value).fmt(&mut formatter)
 }
 
 /// Allocates one string containing `left` followed by `right`.

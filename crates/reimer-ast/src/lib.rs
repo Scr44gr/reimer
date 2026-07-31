@@ -627,6 +627,8 @@ pub enum Expression {
     Character(CharacterLiteral),
     /// An immutable UTF-8 string literal.
     String(StringLiteral),
+    /// An interpolated UTF-8 string literal.
+    FormattedString(FormattedStringExpression),
     /// An immutable NUL-terminated UTF-8 C string literal.
     CString(StringLiteral),
     /// A boolean literal.
@@ -683,6 +685,7 @@ impl Expression {
             Self::Float(literal) => literal.span,
             Self::Character(literal) => literal.span,
             Self::String(literal) | Self::CString(literal) => literal.span,
+            Self::FormattedString(expression) => expression.span,
             Self::Boolean(literal) => literal.span,
             Self::Unit(span) | Self::Try { span, .. } => *span,
             Self::Tuple(expression) => expression.span,
@@ -702,6 +705,24 @@ impl Expression {
             Self::Index(expression) => expression.span,
         }
     }
+}
+
+/// A sequence of literal text and typed interpolation expressions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormattedStringExpression {
+    /// Fragments in source order.
+    pub fragments: Vec<FormattedStringFragment>,
+    /// Complete `f"..."` source range.
+    pub span: Span,
+}
+
+/// One fragment of an interpolated string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormattedStringFragment {
+    /// Decoded literal UTF-8.
+    Text(StringLiteral),
+    /// An expression written between braces.
+    Expression(Expression),
 }
 
 /// A pattern-based branch expression.

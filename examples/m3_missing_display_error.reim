@@ -1,0 +1,22 @@
+from std::alloc import AllocError, general_allocator;
+from std::string import String;
+
+struct Undisplayable {
+    value: i32,
+}
+
+fn build_message() -> Result<i32, AllocError> {
+    let allocator = general_allocator();
+    let value = Undisplayable { value: 42 };
+    let mut message = String::with_capacity(&allocator, 32)?;
+    message.push_format(f"value={value}")?;
+    message.deinit();
+    Ok(0)
+}
+
+fn main() -> i32 {
+    match build_message() {
+        Ok(value) => value,
+        Err(_) => 1,
+    }
+}

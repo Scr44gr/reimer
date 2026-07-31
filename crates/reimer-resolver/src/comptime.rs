@@ -364,6 +364,12 @@ impl<'ast, 'metadata, M: Metadata> Evaluator<'ast, 'metadata, M> {
             Expression::String(literal) | Expression::CString(literal) => {
                 Ok(Value::String(literal.value.clone()))
             }
+            Expression::FormattedString(formatted) => self.fail(
+                "E7012",
+                "formatted strings are not available during compile-time evaluation",
+                formatted.span,
+                "format runtime text into an allocator-owned String",
+            ),
             Expression::Boolean(literal) => Ok(Value::Boolean(literal.value)),
             Expression::Unit(_) => Ok(Value::Unit),
             Expression::Tuple(tuple) => self

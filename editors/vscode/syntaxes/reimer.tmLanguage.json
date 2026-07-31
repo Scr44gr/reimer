@@ -82,6 +82,53 @@
     "strings": {
       "patterns": [
         {
+          "name": "string.quoted.double.interpolated.reimer",
+          "begin": "\\b(f)(\")",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.type.string.reimer"
+            },
+            "2": {
+              "name": "punctuation.definition.string.begin.reimer"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.reimer"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escapes"
+            },
+            {
+              "name": "constant.character.escape.reimer",
+              "match": "\\{\\{|\\}\\}"
+            },
+            {
+              "name": "meta.interpolation.reimer",
+              "begin": "(?<!\\{)\\{(?!\\{)",
+              "beginCaptures": {
+                "0": {
+                  "name": "punctuation.section.interpolation.begin.reimer"
+                }
+              },
+              "end": "(?<!\\})\\}(?!\\})",
+              "endCaptures": {
+                "0": {
+                  "name": "punctuation.section.interpolation.end.reimer"
+                }
+              },
+              "patterns": [
+                {
+                  "include": "$self"
+                }
+              ]
+            }
+          ]
+        },
+        {
           "name": "string.quoted.double.c.reimer",
           "begin": "\\bc\"",
           "beginCaptures": {

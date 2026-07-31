@@ -11,6 +11,25 @@ pub struct Token {
     pub span: Span,
 }
 
+/// One literal or expression fragment inside an interpolated string token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormattedStringFragment {
+    /// Decoded UTF-8 text between interpolations.
+    Text {
+        /// Decoded text.
+        value: String,
+        /// Source range occupied by the raw fragment.
+        span: Span,
+    },
+    /// A complete token stream parsed from one `{ expression }` placeholder.
+    Expression {
+        /// Tokens with spans shifted into the containing source file.
+        tokens: Vec<Token>,
+        /// Source range inside the braces.
+        span: Span,
+    },
+}
+
 /// Token categories recognized by the current lexer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
@@ -86,6 +105,8 @@ pub enum TokenKind {
     Character(char),
     /// One decoded UTF-8 string literal.
     String(String),
+    /// An interpolated UTF-8 string literal beginning with `f"`.
+    FormattedString(Vec<FormattedStringFragment>),
     /// One decoded UTF-8 C string literal without its implicit terminator.
     CString(String),
     /// `->`
@@ -280,6 +301,7 @@ impl<'source> Lexer<'source> {
                 '\'' => self.character(start),
                 '"' => self.string(start),
                 'c' if self.take_char('"') => self.c_string(start),
+                'f' if self.take_char('"') => self.formatted_string(start),
                 character if is_identifier_start(character) => self.identifier(start),
                 character if character.is_ascii_digit() => self.number(start),
                 character => self.diagnostics.push(
@@ -495,6 +517,163 @@ impl<'source> Lexer<'source> {
         self.quoted_string(start, true);
     }
 
+    fn formatted_string(&mut self, start: usize) {
+        let mut fragments = Vec::new();
+        let mut text = String::new();
+        let mut text_start = self.cursor;
+        let mut closed = false;
+
+        while self.cursor < self.source.len() {
+            let character_start = self.cursor;
+            let Some(character) = self.advance_char() else {
+                break;
+            };
+            match character {
+                '"' => {
+                    Self::flush_formatted_text(
+                        &mut fragments,
+                        &mut text,
+                        text_start,
+                        character_start,
+                    );
+                    closed = true;
+                    break;
+                }
+                '\r' | '\n' => break,
+                '\\' => {
+                    if let Some(character) = self.character_escape(start) {
+                        text.push(character);
+                    } else {
+                        break;
+                    }
+                }
+                '{' if self.take_char('{') => text.push('{'),
+                '}' if self.take_char('}') => text.push('}'),
+                '{' => {
+                    Self::flush_formatted_text(
+                        &mut fragments,
+                        &mut text,
+                        text_start,
+                        character_start,
+                    );
+                    let expression_start = self.cursor;
+                    let Some(expression_end) = self.scan_interpolation_end(start) else {
+                        return;
+                    };
+                    let expression_source = &self.source[expression_start..expression_end];
+                    if expression_source.trim().is_empty() {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "E0008",
+                                "formatted string placeholder is empty",
+                                Span::new(expression_start, expression_end),
+                            )
+                            .with_help("write an expression between the braces"),
+                        );
+                    } else {
+                        match lex(expression_source) {
+                            Ok(tokens) => fragments.push(FormattedStringFragment::Expression {
+                                tokens: shift_tokens(tokens, expression_start),
+                                span: Span::new(expression_start, expression_end),
+                            }),
+                            Err(diagnostics) => {
+                                self.diagnostics.extend(diagnostics.into_iter().map(
+                                    |diagnostic| shift_diagnostic(diagnostic, expression_start),
+                                ));
+                            }
+                        }
+                    }
+                    text_start = self.cursor;
+                }
+                '}' => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "E0009",
+                            "unmatched `}` in formatted string",
+                            Span::new(character_start, self.cursor),
+                        )
+                        .with_help("write `}}` to include a literal closing brace"),
+                    );
+                    return;
+                }
+                character => text.push(character),
+            }
+        }
+
+        if closed {
+            self.tokens.push(Token {
+                kind: TokenKind::FormattedString(fragments),
+                span: Span::new(start, self.cursor),
+            });
+        } else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E0006",
+                    "invalid or unterminated formatted string literal",
+                    Span::new(start, self.cursor),
+                )
+                .with_help("close the UTF-8 string with `\"`"),
+            );
+        }
+    }
+
+    fn flush_formatted_text(
+        fragments: &mut Vec<FormattedStringFragment>,
+        text: &mut String,
+        start: usize,
+        end: usize,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        fragments.push(FormattedStringFragment::Text {
+            value: std::mem::take(text),
+            span: Span::new(start, end),
+        });
+    }
+
+    fn scan_interpolation_end(&mut self, formatted_start: usize) -> Option<usize> {
+        let mut brace_depth = 0_usize;
+        while self.cursor < self.source.len() {
+            let character_start = self.cursor;
+            let character = self.advance_char()?;
+            match character {
+                '"' | '\'' => self.skip_interpolation_quote(character),
+                '/' if self.take_char('/') => self.skip_line_comment(),
+                '/' if self.take_char('*') => self.skip_block_comment(character_start),
+                '{' => brace_depth = brace_depth.saturating_add(1),
+                '}' if brace_depth == 0 => return Some(character_start),
+                '}' => brace_depth = brace_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E0010",
+                "unterminated formatted string placeholder",
+                Span::new(formatted_start, self.cursor),
+            )
+            .with_help("close the placeholder with `}`"),
+        );
+        None
+    }
+
+    fn skip_interpolation_quote(&mut self, delimiter: char) {
+        while self.cursor < self.source.len() {
+            let Some(character) = self.advance_char() else {
+                return;
+            };
+            match character {
+                '\\' => {
+                    let _ = self.advance_char();
+                }
+                character if character == delimiter => return,
+                '\r' | '\n' if delimiter == '"' => return,
+                _ => {}
+            }
+        }
+    }
+
     fn quoted_string(&mut self, start: usize, nul_terminated: bool) {
         let mut value = String::new();
         let mut closed = false;
@@ -621,11 +800,46 @@ fn is_identifier_continue(character: char) -> bool {
     is_identifier_start(character) || character.is_ascii_digit()
 }
 
+fn shift_tokens(tokens: Vec<Token>, offset: usize) -> Vec<Token> {
+    tokens
+        .into_iter()
+        .map(|mut token| {
+            token.span = shift_span(token.span, offset);
+            if let TokenKind::FormattedString(fragments) = &mut token.kind {
+                for fragment in fragments {
+                    match fragment {
+                        FormattedStringFragment::Text { span, .. } => {
+                            *span = shift_span(*span, offset);
+                        }
+                        FormattedStringFragment::Expression { tokens, span } => {
+                            *span = shift_span(*span, offset);
+                            *tokens = shift_tokens(std::mem::take(tokens), offset);
+                        }
+                    }
+                }
+            }
+            token
+        })
+        .collect()
+}
+
+fn shift_diagnostic(mut diagnostic: Diagnostic, offset: usize) -> Diagnostic {
+    diagnostic.span = shift_span(diagnostic.span, offset);
+    diagnostic
+}
+
+const fn shift_span(span: Span, offset: usize) -> Span {
+    Span::new(
+        span.start.saturating_add(offset),
+        span.end.saturating_add(offset),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use reimer_diagnostics::Span;
 
-    use super::{TokenKind, lex};
+    use super::{FormattedStringFragment, TokenKind, lex};
 
     #[test]
     fn lex_should_tokenize_m0_program() {
@@ -643,6 +857,47 @@ mod tests {
         let tokens = lex(source).expect("fixture should lex");
 
         assert_eq!(tokens[1].span, Span::new(3, 8));
+    }
+
+    #[test]
+    fn lex_should_preserve_formatted_text_and_expression_tokens() {
+        let source = "let message = f\"hello {{user}} {player.name}\";";
+
+        let tokens = lex(source).expect("fixture should lex");
+        let TokenKind::FormattedString(fragments) = &tokens[3].kind else {
+            panic!("fourth token should be a formatted string");
+        };
+
+        assert!(matches!(
+            &fragments[0],
+            FormattedStringFragment::Text { value, .. } if value == "hello {user} "
+        ));
+        let FormattedStringFragment::Expression {
+            tokens: expression,
+            span,
+        } = &fragments[1]
+        else {
+            panic!("second fragment should be an expression");
+        };
+        assert_eq!(*span, Span::new(32, 43));
+        assert_eq!(
+            expression[0].kind,
+            TokenKind::Identifier("player".to_owned())
+        );
+        assert_eq!(expression[0].span, Span::new(32, 38));
+    }
+
+    #[test]
+    fn lex_should_reject_empty_and_unmatched_formatted_placeholders() {
+        let empty = lex("f\"value: {}\"").expect_err("empty placeholder should fail");
+        let unmatched = lex("f\"value: }\"").expect_err("unmatched brace should fail");
+
+        assert!(empty.iter().any(|diagnostic| diagnostic.code == "E0008"));
+        assert!(
+            unmatched
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0009")
+        );
     }
 
     #[test]

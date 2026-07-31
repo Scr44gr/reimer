@@ -76,8 +76,15 @@ struct AllocatorIdentity {
     label: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AllocationSource {
+    Argument(usize),
+    CallerFixedBuffer,
+    Destination,
+}
+
 struct AllocationSpecification {
-    allocator_index: usize,
+    source: AllocationSource,
     amount: Option<u128>,
     upper_bound: bool,
     explanation: &'static str,
@@ -193,6 +200,13 @@ impl<'function> Estimator<'function> {
                     self.scan_expression(&field.value, loop_depth);
                 }
             }
+            Expression::FormattedString(formatted) => {
+                for fragment in &formatted.fragments {
+                    if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                        self.scan_expression(expression, loop_depth);
+                    }
+                }
+            }
             Expression::Unary(unary) => self.scan_expression(&unary.operand, loop_depth),
             Expression::Binary(binary) => {
                 self.scan_expression(&binary.left, loop_depth);
@@ -285,15 +299,16 @@ impl<'function> Estimator<'function> {
             (Some(bytes), _) => AllocationQuantity::PerIteration(bytes),
             (None, _) => AllocationQuantity::Dynamic,
         };
-        let allocator = if specification.allocator_index == usize::MAX {
-            "caller-provided fixed buffer".to_owned()
-        } else {
-            call.arguments
-                .get(specification.allocator_index)
-                .map_or_else(
-                    || "implicit allocator".to_owned(),
-                    |argument| self.allocator_label(argument),
-                )
+        let allocator = match specification.source {
+            AllocationSource::Argument(index) => call.arguments.get(index).map_or_else(
+                || "implicit allocator".to_owned(),
+                |argument| self.allocator_label(argument),
+            ),
+            AllocationSource::CallerFixedBuffer => "caller-provided fixed buffer".to_owned(),
+            AllocationSource::Destination => root_name(&call.callee).map_or_else(
+                || "allocator retained by destination String".to_owned(),
+                |destination| format!("allocator retained by String `{destination}`"),
+            ),
         };
         let explanation = if loop_depth == 0 {
             format!(
@@ -341,7 +356,7 @@ fn allocation_specification(
     operation: &str,
 ) -> Option<AllocationSpecification> {
     let exact = |allocator_index, amount, explanation| AllocationSpecification {
-        allocator_index,
+        source: AllocationSource::Argument(allocator_index),
         amount,
         upper_bound: false,
         explanation,
@@ -355,7 +370,7 @@ fn allocation_specification(
         )),
         "init" if callee_contains_name(&call.callee, "FixedBufferAllocator") => {
             Some(AllocationSpecification {
-                allocator_index: usize::MAX,
+                source: AllocationSource::CallerFixedBuffer,
                 amount: argument_bytes(call, 1),
                 upper_bound: true,
                 explanation: "fixed backing-store capacity",
@@ -392,10 +407,16 @@ fn allocation_specification(
         )),
         "join_strings" => Some(exact(0, None, "joined UTF-8 bytes")),
         "to_lowercase" | "to_uppercase" => Some(AllocationSpecification {
-            allocator_index: 0,
+            source: AllocationSource::Argument(0),
             amount: Some(12),
             upper_bound: true,
             explanation: "full Unicode case mapping",
+        }),
+        "push_format" => Some(AllocationSpecification {
+            source: AllocationSource::Destination,
+            amount: None,
+            upper_bound: false,
+            explanation: "destination String growth; available spare capacity is unknown",
         }),
         _ => None,
     }
@@ -572,5 +593,20 @@ mod tests {
         let (allocations, _) = estimate(&syntax);
 
         assert_eq!(allocations[0].quantity, AllocationQuantity::AtMost(12));
+    }
+
+    #[test]
+    fn estimate_should_attribute_interpolation_growth_to_the_destination_string() {
+        let source = r#"fn main() { message.push_format(f"hello {name}")?; }"#;
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let (allocations, _) = estimate(&syntax);
+
+        assert_eq!(allocations[0].quantity, AllocationQuantity::Dynamic);
+        assert_eq!(
+            allocations[0].allocator,
+            "allocator retained by String `message`"
+        );
     }
 }

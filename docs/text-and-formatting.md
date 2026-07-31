@@ -52,6 +52,44 @@ base-ten formatting. Floating-point methods use the shortest round-trippable
 display representation. Float formatting and 128-bit integer conversion use
 bounded runtime buffers; they do not allocate behind the source program.
 
+## Interpolated strings and `Display`
+
+An `f"..."` expression is a typed list of text and value placeholders. It is
+appended to an existing owned string so the allocator and failure path remain
+explicit:
+
+```reimer
+let mut message = String::with_capacity(&allocator, 64)?;
+message.push_format(f"score={score}, ready={ready}")?;
+```
+
+Primitive values, `str`, and `String` use compiler-selected standard writes.
+A user-defined nominal type must implement `std::fmt::Display`:
+
+```reimer
+from std::fmt import Display, FormatError, Formatter;
+
+struct Player {
+    score: u32,
+}
+
+impl Display for Player {
+    fn fmt(
+        &self,
+        formatter: &mut Formatter,
+    ) -> Result<(), FormatError> {
+        formatter.write_str("Player(")?;
+        formatter.write_u128(self.score as u128)?;
+        formatter.write_char(')')
+    }
+}
+```
+
+`f"{player}"` is then resolved to that implementation at compile time. Missing
+implementations are type errors. `Formatter` writes directly into the
+destination `String`, so a custom implementation cannot hide a second
+allocation. Write `{{` or `}}` for a literal brace.
+
 ## UTF-8 queries
 
 `byte_len` reports storage size, while `char_count` counts Unicode scalar

@@ -177,6 +177,13 @@ pub(crate) fn expression(visitor: &mut impl Visitor, expression: &Expression) {
         | Expression::Boolean(_)
         | Expression::Unit(_)
         | Expression::Path(_) => {}
+        Expression::FormattedString(formatted) => {
+            for fragment in &formatted.fragments {
+                if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                    self::expression(visitor, expression);
+                }
+            }
+        }
         Expression::Tuple(tuple) => {
             for element in &tuple.elements {
                 self::expression(visitor, element);

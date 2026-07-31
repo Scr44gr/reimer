@@ -8,16 +8,16 @@ use reimer_ast::{
     CastExpression, CharacterLiteral, ComptimeBlock, ConstantDeclaration, DeferStatement,
     EnumDeclaration, EnumVariant, EnumVariantPayload, Expression, ExpressionStatement,
     ExternFunction, FieldExpression, FieldInitializer, FieldName, FloatLiteral, ForStatement,
-    Function, GenericArgument, GenericParameter, Identifier, IfExpression, ImplDeclaration,
-    ImportDeclaration, ImportKind, ImportedName, IndexExpression, IntegerLiteral, Item,
-    LetStatement, LoopExpression, MatchArm, MatchExpression, Parameter, Path, Pattern,
-    PatternField, Program, ReturnStatement, Statement, StaticDeclaration, StringLiteral,
-    StructDeclaration, StructExpression, StructField, TraitDeclaration, TraitMethod,
-    TupleExpression, TypeAliasDeclaration, TypeName, TypeNameKind, UnaryExpression, UnaryOperator,
-    WherePredicate, WhileStatement,
+    FormattedStringExpression, FormattedStringFragment, Function, GenericArgument,
+    GenericParameter, Identifier, IfExpression, ImplDeclaration, ImportDeclaration, ImportKind,
+    ImportedName, IndexExpression, IntegerLiteral, Item, LetStatement, LoopExpression, MatchArm,
+    MatchExpression, Parameter, Path, Pattern, PatternField, Program, ReturnStatement, Statement,
+    StaticDeclaration, StringLiteral, StructDeclaration, StructExpression, StructField,
+    TraitDeclaration, TraitMethod, TupleExpression, TypeAliasDeclaration, TypeName, TypeNameKind,
+    UnaryExpression, UnaryOperator, WherePredicate, WhileStatement,
 };
 use reimer_diagnostics::{Diagnostic, Span};
-use reimer_lexer::{Token, TokenKind};
+use reimer_lexer::{FormattedStringFragment as LexicalFormattedFragment, Token, TokenKind};
 
 /// Parses a token stream into a Reimer syntax tree.
 ///
@@ -62,6 +62,24 @@ impl<'tokens> Parser<'tokens> {
             Ok(Program { items })
         } else {
             Err(self.diagnostics)
+        }
+    }
+
+    fn parse_complete_expression(mut self) -> Result<Expression, Vec<Diagnostic>> {
+        let expression = self.parse_expression();
+        if expression.is_some() && !self.at(&TokenKind::Eof) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E1021",
+                    "unexpected tokens after formatted string expression",
+                    self.current().span,
+                )
+                .with_help("keep one complete expression inside each placeholder"),
+            );
+        }
+        match (expression, self.diagnostics.is_empty()) {
+            (Some(expression), true) => Ok(expression),
+            _ => Err(self.diagnostics),
         }
     }
 
@@ -1768,6 +1786,10 @@ impl<'tokens> Parser<'tokens> {
                     span: token.span,
                 }))
             }
+            TokenKind::FormattedString(fragments) => {
+                self.advance();
+                self.parse_formatted_string(fragments, token.span)
+            }
             TokenKind::CString(value) => {
                 self.advance();
                 Some(Expression::CString(StringLiteral {
@@ -1835,6 +1857,36 @@ impl<'tokens> Parser<'tokens> {
                 None
             }
         }
+    }
+
+    fn parse_formatted_string(
+        &mut self,
+        fragments: Vec<LexicalFormattedFragment>,
+        span: Span,
+    ) -> Option<Expression> {
+        let mut parsed = Vec::with_capacity(fragments.len());
+        for fragment in fragments {
+            match fragment {
+                LexicalFormattedFragment::Text { value, span } => {
+                    parsed.push(FormattedStringFragment::Text(StringLiteral { value, span }));
+                }
+                LexicalFormattedFragment::Expression { tokens, .. } => {
+                    match Parser::new(&tokens).parse_complete_expression() {
+                        Ok(expression) => {
+                            parsed.push(FormattedStringFragment::Expression(expression));
+                        }
+                        Err(diagnostics) => {
+                            self.diagnostics.extend(diagnostics);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        Some(Expression::FormattedString(FormattedStringExpression {
+            fragments: parsed,
+            span,
+        }))
     }
 
     fn parse_match_expression(&mut self) -> Option<Expression> {
@@ -2290,8 +2342,8 @@ fn binary_expression(operator: BinaryOperator, left: Expression, right: Expressi
 #[cfg(test)]
 mod tests {
     use reimer_ast::{
-        AssignmentOperator, BinaryOperator, Expression, GenericArgument, ImportKind, Item,
-        Statement, TypeName, TypeNameKind,
+        AssignmentOperator, BinaryOperator, Expression, FormattedStringFragment, GenericArgument,
+        ImportKind, Item, Statement, TypeName, TypeNameKind,
     };
     use reimer_lexer::lex;
 
@@ -2312,6 +2364,33 @@ mod tests {
         assert!(matches!(
             return_statement.value,
             Some(Expression::Integer(integer)) if integer.value == 42
+        ));
+    }
+
+    #[test]
+    fn parse_should_build_formatted_string_expressions() {
+        let tokens =
+            lex("fn message(name: str) { f\"hello {name}\"; }").expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected function");
+        };
+        let Statement::Expression(statement) = &function.body.statements[0] else {
+            panic!("expected expression statement");
+        };
+        let Expression::FormattedString(formatted) = &statement.expression else {
+            panic!("expected formatted string");
+        };
+
+        assert!(matches!(
+            &formatted.fragments[0],
+            FormattedStringFragment::Text(literal) if literal.value == "hello "
+        ));
+        assert!(matches!(
+            &formatted.fragments[1],
+            FormattedStringFragment::Expression(Expression::Path(path))
+                if path.display() == "name"
         ));
     }
 

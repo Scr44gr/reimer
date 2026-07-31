@@ -84,6 +84,18 @@ assertScope(
 );
 assertScope(
   grammar,
+  'let text = f"value={score}";',
+  "f",
+  "storage.type.string.reimer",
+);
+assertScope(
+  grammar,
+  'let text = f"value={score}";',
+  "score",
+  "meta.interpolation.reimer",
+);
+assertScope(
+  grammar,
   "comptime fn factorial(value: usize) -> usize { value }",
   "comptime",
   "storage.modifier.reimer",

@@ -18,6 +18,10 @@ use reimer_hir::{
 use reimer_layout::Layouts;
 use reimer_types::{Type, TypeId};
 
+const STANDARD_STRING_TYPE: &str = "__module_3_std_6_string$String";
+const STANDARD_DISPLAY_TRAIT: &str = "__module_3_std_6_string$Display";
+const STANDARD_APPEND_DISPLAY: &str = "__module_3_std_6_string$append_display";
+
 /// Resolves names and checks the types of one parsed compilation unit.
 ///
 /// # Errors
@@ -108,6 +112,7 @@ struct GenericFunctionTemplate {
     resolved_name: String,
     module_identity: Option<String>,
     explicit_parameter_start: usize,
+    is_public: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3613,6 +3618,7 @@ impl Resolver {
                         &mut declarations,
                         function,
                         function.name.name.clone(),
+                        function.is_public,
                     );
                 }
                 Item::ExternFunction(function) => {
@@ -3640,6 +3646,7 @@ impl Resolver {
         declarations: &mut Vec<Declaration<'ast>>,
         function: &'ast ast::Function,
         resolved_name: String,
+        is_public: bool,
     ) {
         if !function.generic_parameters.is_empty() {
             self.register_generic_function_template(
@@ -3648,6 +3655,7 @@ impl Resolver {
                 function.where_predicates.clone(),
                 resolved_name,
                 0,
+                is_public,
             );
             return;
         }
@@ -3658,7 +3666,7 @@ impl Resolver {
             return_type: function.return_type.as_ref(),
             span: function.span,
             requires_unsafe: false,
-            is_public: function.is_public,
+            is_public,
         };
         let Some(signature) = self.build_signature(declarations.len(), &source) else {
             return;
@@ -3679,6 +3687,7 @@ impl Resolver {
         where_predicates: Vec<ast::WherePredicate>,
         resolved_name: String,
         explicit_parameter_start: usize,
+        is_public: bool,
     ) {
         validate_generic_parameter_names(&parameters, &mut self.diagnostics);
         if self.signatures.contains_key(&resolved_name)
@@ -3706,6 +3715,7 @@ impl Resolver {
                 module_identity: symbol_module_identity(&resolved_name).map(str::to_owned),
                 resolved_name,
                 explicit_parameter_start,
+                is_public,
             },
         );
     }
@@ -3784,6 +3794,7 @@ impl Resolver {
                     where_predicates,
                     resolved_name,
                     implementation.generic_parameters.len(),
+                    method.is_public || implementation.trait_type.is_some(),
                 );
             }
             return;
@@ -3814,7 +3825,12 @@ impl Resolver {
                 continue;
             }
             let resolved_name = format!("{owner}::{}", method.name.name);
-            self.collect_source_declaration(declarations, method, resolved_name);
+            self.collect_source_declaration(
+                declarations,
+                method,
+                resolved_name,
+                method.is_public || implementation.trait_type.is_some(),
+            );
         }
     }
 
@@ -4191,7 +4207,7 @@ impl<'context> FunctionAnalyzer<'context> {
         hir::Function {
             id: self.signature.id,
             name: resolved_name,
-            is_public: function.is_public,
+            is_public: self.signature.is_public,
             attributes: function_attributes(function),
             parameters,
             return_type: self.signature.return_type,
@@ -4621,6 +4637,26 @@ impl<'context> FunctionAnalyzer<'context> {
                     kind: ExpressionKind::String(literal.value.clone()),
                     ty: Type::Str,
                     span: literal.span,
+                }
+            }
+            AstExpression::FormattedString(formatted) => {
+                for fragment in &formatted.fragments {
+                    if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                        self.analyze_expression(expression);
+                    }
+                }
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3160",
+                        "formatted string requires a formatting destination",
+                        formatted.span,
+                    )
+                    .with_help("append it with `string.push_format(f\"...\")`"),
+                );
+                Expression {
+                    kind: ExpressionKind::Unit,
+                    ty: Type::Unit,
+                    span: formatted.span,
                 }
             }
             AstExpression::CString(literal) => {
@@ -5860,6 +5896,11 @@ impl<'context> FunctionAnalyzer<'context> {
             return invalid_composite_expression(call.span);
         };
         if let Some(expression) =
+            self.analyze_format_push_method(call, field, method, expected_return)
+        {
+            return expression;
+        }
+        if let Some(expression) =
             self.analyze_string_iteration_method(call, field, method, expected_return)
         {
             return expression;
@@ -5951,6 +5992,254 @@ impl<'context> FunctionAnalyzer<'context> {
             return invalid_composite_expression(call.span);
         };
         self.analyze_resolved_method_call(call, field, receiver_type, &resolved_name, &signature)
+    }
+
+    fn analyze_format_push_method(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        _expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        if method.name != "push_format" {
+            return None;
+        }
+        let receiver_type = self.place_expression_type(&field.base)?;
+        if self.types.nominal_name(receiver_type) != Some(STANDARD_STRING_TYPE) {
+            return None;
+        }
+        let resolved_name = format!("{STANDARD_STRING_TYPE}::push_format");
+        let signature = self.signatures.get(&resolved_name).cloned()?;
+        if !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    "`push_format` does not accept generic arguments",
+                    call.span,
+                )
+                .with_help("remove the arguments between `<` and `>`"),
+            );
+        }
+        let [AstExpression::FormattedString(formatted)] = call.arguments.as_slice() else {
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3160",
+                    "`push_format` expects one `f\"...\"` expression",
+                    call.span,
+                )
+                .with_help("write `string.push_format(f\"value: {value}\")`"),
+            );
+            return Some(invalid_composite_expression(call.span));
+        };
+
+        let mut calls = Vec::with_capacity(formatted.fragments.len().max(1));
+        for fragment in &formatted.fragments {
+            match fragment {
+                ast::FormattedStringFragment::Text(literal) => {
+                    calls.push(self.analyze_string_push_call(
+                        field,
+                        receiver_type,
+                        "push_str",
+                        &AstExpression::String(literal.clone()),
+                        signature.return_type,
+                        literal.span,
+                    ));
+                }
+                ast::FormattedStringFragment::Expression(value) => {
+                    if let Some(expression) = self.analyze_formatted_value(
+                        field,
+                        receiver_type,
+                        value,
+                        signature.return_type,
+                    ) {
+                        calls.push(expression);
+                    }
+                }
+            }
+        }
+        if calls.is_empty() {
+            calls.push(self.analyze_string_push_call(
+                field,
+                receiver_type,
+                "push_str",
+                &AstExpression::String(ast::StringLiteral {
+                    value: String::new(),
+                    span: formatted.span,
+                }),
+                signature.return_type,
+                formatted.span,
+            ));
+        }
+        let success_variant = self
+            .enum_variant(signature.return_type, "Ok")
+            .map_or(0, |(variant, _)| variant);
+        Some(Expression {
+            kind: ExpressionKind::FormatPush {
+                function: signature.id,
+                calls,
+                success_variant,
+            },
+            ty: signature.return_type,
+            span: call.span,
+        })
+    }
+
+    fn analyze_formatted_value(
+        &mut self,
+        field: &ast::FieldExpression,
+        receiver_type: Type,
+        value: &AstExpression,
+        result_type: Type,
+    ) -> Option<Expression> {
+        let place_type = self.place_expression_type(value);
+        let mut analyzed = None;
+        let value_type = place_type.unwrap_or_else(|| {
+            let expression = self.analyze_expression_non_consuming(value);
+            let ty = expression.ty;
+            analyzed = Some(expression);
+            ty
+        });
+        let method = if self.types.nominal_name(value_type) == Some(STANDARD_STRING_TYPE) {
+            Some("push_string")
+        } else {
+            string_format_method(value_type)
+        };
+        if let Some(method) = method {
+            let argument = if value_type == Type::Str
+                || value_type.is_numeric()
+                || matches!(value_type, Type::Bool | Type::Char)
+            {
+                analyzed.unwrap_or_else(|| self.analyze_expression(value))
+            } else {
+                let borrow = ast::UnaryExpression {
+                    operator: AstUnaryOperator::Borrow,
+                    operand: value.clone(),
+                    span: value.span(),
+                };
+                self.analyze_borrow(&borrow, None)
+            };
+            return Some(self.build_string_push_call(
+                field,
+                receiver_type,
+                method,
+                argument,
+                result_type,
+                value.span(),
+            ));
+        }
+
+        if self
+            .types
+            .satisfies_trait(value_type, STANDARD_DISPLAY_TRAIT)
+        {
+            if place_type.is_none() {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E3162",
+                        "formatted owned values must be bound before borrowing",
+                        value.span(),
+                    )
+                    .with_help("bind the value to a local, then interpolate that local"),
+                );
+                return None;
+            }
+            return Some(self.analyze_display_append_call(field, value, result_type));
+        }
+
+        let value_type_name = self.types.reflection_type_name(value_type);
+        self.diagnostics.push(
+            Diagnostic::error(
+                "E3161",
+                format!("type `{value_type_name}` cannot be interpolated"),
+                value.span(),
+            )
+            .with_help("implement `std::fmt::Display` for this nominal type"),
+        );
+        None
+    }
+
+    fn analyze_string_push_call(
+        &mut self,
+        field: &ast::FieldExpression,
+        receiver_type: Type,
+        method: &str,
+        value: &AstExpression,
+        result_type: Type,
+        span: Span,
+    ) -> Expression {
+        let analyzed = self.analyze_expression(value);
+        self.build_string_push_call(field, receiver_type, method, analyzed, result_type, span)
+    }
+
+    fn build_string_push_call(
+        &mut self,
+        field: &ast::FieldExpression,
+        receiver_type: Type,
+        method: &str,
+        value: Expression,
+        result_type: Type,
+        span: Span,
+    ) -> Expression {
+        let resolved_name = format!("{STANDARD_STRING_TYPE}::{method}");
+        let Some(signature) = self.signatures.get(&resolved_name).cloned() else {
+            self.diagnostics.push(Diagnostic::error(
+                "E3163",
+                format!("standard formatting method `{method}` is unavailable"),
+                span,
+            ));
+            return invalid_composite_expression(span);
+        };
+        let Some(expected_receiver) = signature.parameter_types.first().copied() else {
+            return invalid_composite_expression(span);
+        };
+        let receiver = self.analyze_method_receiver(&field.base, receiver_type, expected_receiver);
+        let arguments = vec![receiver, value];
+        self.validate_call_arguments(&resolved_name, span, &signature, &arguments);
+        self.require_type(result_type, signature.return_type, span, "format write");
+        Expression {
+            kind: ExpressionKind::Call {
+                function: signature.id,
+                arguments,
+            },
+            ty: signature.return_type,
+            span,
+        }
+    }
+
+    fn analyze_display_append_call(
+        &mut self,
+        field: &ast::FieldExpression,
+        value: &AstExpression,
+        result_type: Type,
+    ) -> Expression {
+        let span = Span::new(field.base.span().start, value.span().end);
+        let call = ast::CallExpression {
+            callee: AstExpression::Path(ast::Path {
+                segments: vec![ast::Identifier {
+                    name: STANDARD_APPEND_DISPLAY.to_owned(),
+                    span,
+                }],
+                span,
+            }),
+            generic_arguments: Vec::new(),
+            arguments: vec![
+                AstExpression::Unary(Box::new(ast::UnaryExpression {
+                    operator: AstUnaryOperator::BorrowMut,
+                    operand: field.base.clone(),
+                    span: field.base.span(),
+                })),
+                AstExpression::Unary(Box::new(ast::UnaryExpression {
+                    operator: AstUnaryOperator::Borrow,
+                    operand: value.clone(),
+                    span: value.span(),
+                })),
+            ],
+            span,
+        };
+        self.analyze_call(&call, Some(result_type))
     }
 
     fn analyze_integer_addition_method(
@@ -6355,7 +6644,7 @@ impl<'context> FunctionAnalyzer<'context> {
             .templates
             .get(&template_name)
             .cloned()?;
-        if !template.function.is_public && self.type_is_external(receiver_type) {
+        if !template.is_public && self.type_is_external(receiver_type) {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E4005",
@@ -6426,6 +6715,21 @@ impl<'context> FunctionAnalyzer<'context> {
         receiver_type: Type,
         expected: Type,
     ) -> Expression {
+        if receiver_type == expected
+            && let Some((_, true, false)) = self.types.pointer_shape(expected)
+        {
+            let dereference = AstExpression::Unary(Box::new(ast::UnaryExpression {
+                operator: AstUnaryOperator::Dereference,
+                operand: receiver.clone(),
+                span: receiver.span(),
+            }));
+            let reborrow = ast::UnaryExpression {
+                operator: AstUnaryOperator::BorrowMut,
+                operand: dereference,
+                span: receiver.span(),
+            };
+            return self.analyze_borrow(&reborrow, Some(expected));
+        }
         if let Some((target, mutable, false)) = self.types.pointer_shape(expected)
             && target == receiver_type
         {
@@ -8687,7 +8991,7 @@ impl<'context> FunctionAnalyzer<'context> {
             parameter_types,
             return_type,
             requires_unsafe: false,
-            is_public: template.function.is_public,
+            is_public: template.is_public,
         };
         self.generic_functions
             .instances
@@ -10363,6 +10667,9 @@ fn validate_comptime_expression(
         | AstExpression::Boolean(_)
         | AstExpression::Unit(_)
         | AstExpression::Path(_) => {}
+        AstExpression::FormattedString(formatted) => {
+            validate_comptime_formatted_string(formatted, comptime_functions, diagnostics);
+        }
         AstExpression::Tuple(tuple) => {
             for element in &tuple.elements {
                 validate_comptime_expression(element, comptime_functions, diagnostics);
@@ -10448,6 +10755,26 @@ fn validate_comptime_expression(
                 .with_help("match the value explicitly before entering `comptime`"),
             );
             validate_comptime_expression(value, comptime_functions, diagnostics);
+        }
+    }
+}
+
+fn validate_comptime_formatted_string(
+    formatted: &ast::FormattedStringExpression,
+    comptime_functions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(
+        Diagnostic::error(
+            "E7012",
+            "formatted strings are not available during compile-time evaluation",
+            formatted.span,
+        )
+        .with_help("format runtime text into an allocator-owned String"),
+    );
+    for fragment in &formatted.fragments {
+        if let ast::FormattedStringFragment::Expression(expression) = fragment {
+            validate_comptime_expression(expression, comptime_functions, diagnostics);
         }
     }
 }
@@ -10939,6 +11266,39 @@ fn function_path_name(path: &ast::Path) -> Option<String> {
         [name] => Some(name.name.clone()),
         [owner, method] => Some(format!("{}::{}", owner.name, method.name)),
         _ => None,
+    }
+}
+
+const fn string_format_method(ty: Type) -> Option<&'static str> {
+    match ty {
+        Type::Str => Some("push_str"),
+        Type::Bool => Some("push_bool"),
+        Type::Char => Some("push_char"),
+        Type::I8 => Some("push_i8"),
+        Type::I16 => Some("push_i16"),
+        Type::I32 => Some("push_i32"),
+        Type::I64 => Some("push_i64"),
+        Type::I128 => Some("push_i128"),
+        Type::Isize => Some("push_isize"),
+        Type::U8 => Some("push_u8"),
+        Type::U16 => Some("push_u16"),
+        Type::U32 => Some("push_u32"),
+        Type::U64 => Some("push_u64"),
+        Type::U128 => Some("push_u128"),
+        Type::Usize => Some("push_usize"),
+        Type::F32 => Some("push_f32"),
+        Type::F64 => Some("push_f64"),
+        Type::Unit
+        | Type::Never
+        | Type::CStr
+        | Type::Struct(_)
+        | Type::Enum(_)
+        | Type::Tuple(_)
+        | Type::Array(_)
+        | Type::Reference(_)
+        | Type::RawPointer(_)
+        | Type::Slice(_)
+        | Type::Function(_) => None,
     }
 }
 
@@ -12305,6 +12665,26 @@ mod tests {
             }";
 
         resolve_fixture(source).expect("fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_automatically_reborrow_mutable_method_receivers() {
+        let source = "
+            struct Counter { value: i32 }
+            impl Counter {
+                fn increment(&mut self) { self.value += 1; }
+            }
+            fn increment_twice(counter: &mut Counter) {
+                counter.increment();
+                counter.increment();
+            }
+            fn main() -> i32 {
+                let mut counter = Counter { value: 40 };
+                increment_twice(&mut counter);
+                counter.value
+            }";
+
+        resolve_fixture(source).expect("mutable method receiver should be reborrowed");
     }
 
     #[test]

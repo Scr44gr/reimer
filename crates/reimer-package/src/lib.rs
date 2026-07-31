@@ -89,6 +89,8 @@ impl Package {
     }
 
     fn map_diagnostic(&self, mut diagnostic: Diagnostic) -> FileDiagnostic {
+        diagnostic.message = display_symbol_name(&diagnostic.message);
+        diagnostic.help = diagnostic.help.map(|help| display_symbol_name(&help));
         let source = self
             .sources
             .iter()
@@ -1446,6 +1448,13 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
         | Expression::CString(_)
         | Expression::Boolean(_)
         | Expression::Unit(_) => {}
+        Expression::FormattedString(formatted) => {
+            for fragment in &formatted.fragments {
+                if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                    visit_expression_paths(expression, paths);
+                }
+            }
+        }
         Expression::Tuple(tuple) => {
             for element in &tuple.elements {
                 visit_expression_paths(element, paths);
@@ -1871,6 +1880,13 @@ fn rewrite_expression(
         | Expression::CString(_)
         | Expression::Boolean(_)
         | Expression::Unit(_) => {}
+        Expression::FormattedString(formatted) => {
+            for fragment in &mut formatted.fragments {
+                if let ast::FormattedStringFragment::Expression(expression) = fragment {
+                    rewrite_expression(expression, scope, apis, diagnostics);
+                }
+            }
+        }
         Expression::Tuple(tuple) => {
             for element in &mut tuple.elements {
                 rewrite_expression(element, scope, apis, diagnostics);
@@ -2567,6 +2583,35 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "E4005")
         );
+    }
+
+    #[test]
+    fn resolver_should_expose_public_trait_methods_across_modules() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.reim",
+            "from metrics import make;
+             fn main() -> i32 {
+                 let counter = make();
+                 counter.measure()
+             }",
+        );
+        fixture.write(
+            "metrics.reim",
+            "pub trait Measure {
+                 fn measure(&self) -> i32;
+             }
+             pub struct Counter { value: i32 }
+             impl Measure for Counter {
+                 fn measure(&self) -> i32 { self.value }
+             }
+             pub fn make() -> Counter { Counter { value: 42 } }",
+        );
+
+        let package = load(&fixture.path("main.reim")).expect("package should load");
+
+        reimer_resolver::resolve(&package.program)
+            .expect("a public trait method should be callable across modules");
     }
 
     #[test]

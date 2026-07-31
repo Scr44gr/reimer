@@ -2484,21 +2484,15 @@ fn emit_expression<M: Module>(
         | ExpressionKind::IndirectCall { .. } => {
             emit_callable_expression(builder, module, functions, state, expression)
         }
-        ExpressionKind::If(expression) => {
-            emit_if(builder, module, functions, state, expression, result_type)
+        ExpressionKind::FormatPush { .. } => {
+            emit_format_push(builder, module, functions, state, expression)
         }
-        ExpressionKind::Match(expression) => {
-            emit_match(builder, module, functions, state, expression, result_type)
+        ExpressionKind::If(_)
+        | ExpressionKind::Match(_)
+        | ExpressionKind::Loop(_)
+        | ExpressionKind::Block(_) => {
+            emit_control_expression(builder, module, functions, state, expression, result_type)
         }
-        ExpressionKind::Loop(expression) => emit_loop(
-            builder,
-            module,
-            functions,
-            state,
-            &expression.body,
-            result_type,
-        ),
-        ExpressionKind::Block(block) => emit_block(builder, module, functions, state, block),
         ExpressionKind::Assign {
             target,
             operator,
@@ -2546,6 +2540,34 @@ fn emit_expression<M: Module>(
         | ExpressionKind::SliceGet { .. } => {
             emit_access_expression(builder, module, functions, state, expression)
         }
+    }
+}
+
+fn emit_control_expression<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    expression: &Expression,
+    result_type: Type,
+) -> Result<Emitted, String> {
+    match &expression.kind {
+        ExpressionKind::If(conditional) => {
+            emit_if(builder, module, functions, state, conditional, result_type)
+        }
+        ExpressionKind::Match(matching) => {
+            emit_match(builder, module, functions, state, matching, result_type)
+        }
+        ExpressionKind::Loop(looping) => emit_loop(
+            builder,
+            module,
+            functions,
+            state,
+            &looping.body,
+            result_type,
+        ),
+        ExpressionKind::Block(block) => emit_block(builder, module, functions, state, block),
+        _ => Err("non-control expression reached control-flow code generation".to_owned()),
     }
 }
 
@@ -2611,6 +2633,57 @@ fn emit_callable_expression<M: Module>(
         ),
         _ => Err("non-callable expression reached callable code generation".to_owned()),
     }
+}
+
+fn emit_format_push<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    expression: &Expression,
+) -> Result<Emitted, String> {
+    let ExpressionKind::FormatPush {
+        calls,
+        success_variant,
+        ..
+    } = &expression.kind
+    else {
+        return Err("format lowering received an incompatible expression".to_owned());
+    };
+    let merge = builder.create_block();
+    builder.append_block_param(merge, pointer_type());
+    let mut last_result = None;
+
+    for call in calls {
+        let emitted = emit_expression(builder, module, functions, state, call)?;
+        if emitted.terminated {
+            return Ok(emitted);
+        }
+        let result = require_value(emitted, "formatted string write")?;
+        last_result = Some(result);
+        let discriminant = builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), result, 0);
+        let succeeded =
+            builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, discriminant, i64::from(*success_variant));
+        let next = builder.create_block();
+        builder
+            .ins()
+            .brif(succeeded, next, &[], merge, &[BlockArg::from(result)]);
+        builder.switch_to_block(next);
+    }
+
+    let result = last_result.ok_or_else(|| "formatted string has no writes".to_owned())?;
+    builder.ins().jump(merge, &[BlockArg::from(result)]);
+    builder.switch_to_block(merge);
+    let result = builder
+        .block_params(merge)
+        .first()
+        .copied()
+        .ok_or_else(|| "formatted string merge has no result".to_owned())?;
+    Ok(Emitted::value(result))
 }
 
 fn emit_access_expression<M: Module>(

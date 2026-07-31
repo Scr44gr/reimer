@@ -489,6 +489,15 @@ pub enum ExpressionKind {
         /// Arguments in source order.
         arguments: Vec<Expression>,
     },
+    /// Sequential typed writes produced by one `f"..."` expression.
+    FormatPush {
+        /// Source-level `String::push_format` method.
+        function: FunctionId,
+        /// Calls to `String::push_*` or `Display` in source fragment order.
+        calls: Vec<Expression>,
+        /// Success discriminant shared by every formatting result.
+        success_variant: u32,
+    },
     /// Conditional expression.
     If(Box<IfExpression>),
     /// Pattern-based branch selection.

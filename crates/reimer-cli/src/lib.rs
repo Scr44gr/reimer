@@ -500,6 +500,37 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_should_complete_interpolated_string_vertical_slice() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_interpolation.reim");
+
+        let result = execute_file(&path).expect("interpolation program should execute");
+        let object = compile_file_to_object(&path).expect("interpolation program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn check_file_should_require_display_for_interpolated_structs() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/m3_missing_display_error.reim");
+
+        let diagnostics = check_file(&path).expect_err("missing Display should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.diagnostic.code == "E3161"
+                && diagnostic.diagnostic.message.contains("Undisplayable")
+                && !diagnostic.diagnostic.message.contains("__module_")
+                && diagnostic
+                    .diagnostic
+                    .help
+                    .as_deref()
+                    .is_some_and(|help| help.contains("std::fmt::Display"))
+        }));
+    }
+
+    #[test]
     fn execute_file_should_complete_owned_vector_vertical_slice() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m3_vec.reim");
 
