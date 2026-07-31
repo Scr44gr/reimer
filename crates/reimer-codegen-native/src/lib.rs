@@ -1,6 +1,7 @@
 //! Cranelift object generation and host JIT execution for typed Reimer HIR.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -189,6 +190,28 @@ pub fn execute_with_options(
     program: &Program,
     optimization: OptimizationLevel,
 ) -> Result<i32, Vec<Diagnostic>> {
+    execute_internal(program, optimization, None)
+}
+
+/// Compiles and executes the validated entry point with explicit process-style arguments.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when Cranelift rejects the program or JIT
+/// memory cannot be finalized.
+pub fn execute_with_arguments(
+    program: &Program,
+    optimization: OptimizationLevel,
+    arguments: Vec<OsString>,
+) -> Result<i32, Vec<Diagnostic>> {
+    execute_internal(program, optimization, Some(arguments))
+}
+
+fn execute_internal(
+    program: &Program,
+    optimization: OptimizationLevel,
+    arguments: Option<Vec<OsString>>,
+) -> Result<i32, Vec<Diagnostic>> {
     let flags = [
         ("enable_llvm_abi_extensions", "true"),
         ("opt_level", optimization.setting()),
@@ -213,10 +236,14 @@ pub fn execute_with_options(
         .copied()
         .ok_or_else(|| backend_error("typed HIR entry function is missing"))?;
     let pointer = module.get_finalized_function(entry);
-    let session = reimer_runtime::ExecutionSession::begin();
+    let session = arguments.map_or_else(
+        reimer_runtime::ExecutionSession::begin,
+        reimer_runtime::ExecutionSession::begin_with_arguments,
+    );
     let result = call_jit_entry(pointer);
     reimer_runtime::shutdown_job_pools(session.id());
     reimer_runtime::join_session_threads(session.id());
+    reimer_runtime::shutdown_processes(session.id());
     result
 }
 
@@ -285,6 +312,7 @@ pub fn execute_test_with_options(
     let result = call_jit_unit(pointer);
     reimer_runtime::shutdown_job_pools(session.id());
     reimer_runtime::join_session_threads(session.id());
+    reimer_runtime::shutdown_processes(session.id());
     result
 }
 
@@ -295,8 +323,114 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_mathematics_symbols(builder);
     register_text_symbols(builder);
     register_filesystem_symbols(builder);
+    register_environment_symbols(builder);
+    register_process_symbols(builder);
     register_storage_symbols(builder);
     register_coordination_symbols(builder);
+}
+
+fn register_environment_symbols(builder: &mut JITBuilder) {
+    let symbols = [
+        (
+            reimer_runtime::ENVIRONMENT_ARGUMENT_COUNT_SYMBOL,
+            reimer_runtime::environment_argument_count as *const u8,
+        ),
+        (
+            reimer_runtime::ENVIRONMENT_ARGUMENT_OPEN_SYMBOL,
+            reimer_runtime::environment_argument_open as *const u8,
+        ),
+        (
+            reimer_runtime::ENVIRONMENT_VARIABLE_OPEN_SYMBOL,
+            reimer_runtime::environment_variable_open as *const u8,
+        ),
+        (
+            reimer_runtime::ENVIRONMENT_CURRENT_DIR_OPEN_SYMBOL,
+            reimer_runtime::environment_current_dir_open as *const u8,
+        ),
+        (
+            reimer_runtime::ENVIRONMENT_CURRENT_EXE_OPEN_SYMBOL,
+            reimer_runtime::environment_current_exe_open as *const u8,
+        ),
+        (
+            reimer_runtime::ENVIRONMENT_SNAPSHOT_LEN_SYMBOL,
+            reimer_runtime::environment_snapshot_len as *const u8,
+        ),
+        (
+            reimer_runtime::ENVIRONMENT_SNAPSHOT_COPY_SYMBOL,
+            reimer_runtime::environment_snapshot_copy as *const u8,
+        ),
+        (
+            reimer_runtime::ENVIRONMENT_SNAPSHOT_CLOSE_SYMBOL,
+            reimer_runtime::environment_snapshot_close as *const u8,
+        ),
+    ];
+    register_symbol_group(builder, symbols);
+}
+
+fn register_process_symbols(builder: &mut JITBuilder) {
+    let symbols = [
+        (
+            reimer_runtime::PROCESS_ID_SYMBOL,
+            reimer_runtime::process_id as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_EXIT_SYMBOL,
+            reimer_runtime::process_exit as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_NEW_SYMBOL,
+            reimer_runtime::process_command_new as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_ARG_SYMBOL,
+            reimer_runtime::process_command_arg as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_ENV_SYMBOL,
+            reimer_runtime::process_command_env as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_ENV_REMOVE_SYMBOL,
+            reimer_runtime::process_command_env_remove as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_ENV_CLEAR_SYMBOL,
+            reimer_runtime::process_command_env_clear as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_CURRENT_DIR_SYMBOL,
+            reimer_runtime::process_command_current_dir as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_SPAWN_SYMBOL,
+            reimer_runtime::process_command_spawn as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_STATUS_SYMBOL,
+            reimer_runtime::process_command_status as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_COMMAND_CLOSE_SYMBOL,
+            reimer_runtime::process_command_close as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_CHILD_ID_SYMBOL,
+            reimer_runtime::process_child_id as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_CHILD_KILL_SYMBOL,
+            reimer_runtime::process_child_kill as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_CHILD_WAIT_SYMBOL,
+            reimer_runtime::process_child_wait as *const u8,
+        ),
+        (
+            reimer_runtime::PROCESS_CHILD_CLOSE_SYMBOL,
+            reimer_runtime::process_child_close as *const u8,
+        ),
+    ];
+    register_symbol_group(builder, symbols);
 }
 
 type RuntimeSymbol = (&'static str, *const u8);

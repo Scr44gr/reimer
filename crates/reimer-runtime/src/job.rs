@@ -518,12 +518,21 @@ unsafe fn copy_argument(source: *const u8, size: usize) -> Option<AlignedBytes> 
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
+    use std::sync::{Mutex, MutexGuard};
 
     use super::{
         JOB_JOIN_OK, ParallelForRequest, job_parallel_for, job_pool_create, job_pool_destroy,
         job_submit, job_wait, shutdown_all_job_pools, shutdown_job_pools,
     };
     use crate::ExecutionSession;
+
+    static JOB_TESTS: Mutex<()> = Mutex::new(());
+
+    fn lock_job_tests() -> MutexGuard<'static, ()> {
+        JOB_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     unsafe extern "C" fn increment_thunk(callback: usize, argument: *const u8, result: *mut u8) {
         // SAFETY: The test submits this exact callback signature.
@@ -569,6 +578,7 @@ mod tests {
         reason = "the test supplies exact compiler-style job buffers and callback addresses"
     )]
     fn workers_should_complete_jobs_from_local_and_stolen_queues() {
+        let _test = lock_job_tests();
         let pool = job_pool_create(3);
         let mut handles = Vec::new();
         for value in 0_i32..24 {
@@ -601,6 +611,7 @@ mod tests {
         reason = "the test supplies exact compiler-style slice descriptors"
     )]
     fn parallel_for_should_partition_one_exclusive_mutable_slice() {
+        let _test = lock_job_tests();
         let pool = job_pool_create(4);
         let mut values = [1_i32; 64];
         let request = ParallelForRequest {
@@ -630,6 +641,7 @@ mod tests {
         reason = "the test supplies exact compiler-style job buffers and callback addresses"
     )]
     fn session_cleanup_should_leave_other_execution_pools_running() {
+        let _test = lock_job_tests();
         let first_session = ExecutionSession::begin();
         let first_id = first_session.id();
         let first_pool = job_pool_create(1);

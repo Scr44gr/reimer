@@ -1,0 +1,428 @@
+/// Recoverable child-process failures.
+pub enum ProcessError {
+    /// A command, argument, environment name, value, or path is invalid.
+    InvalidInput,
+    /// The owned native process handle is no longer live.
+    InvalidHandle,
+    /// The operating system could not complete the process operation.
+    Failed,
+    /// Direct execution of `.bat` and `.cmd` scripts is intentionally blocked.
+    UnsupportedScript,
+}
+
+/// The termination status returned by a child process.
+@derive(Copy, Clone, Debug, Eq)
+pub struct ExitStatus {
+    code: i32,
+    has_code: bool,
+    succeeded: bool,
+}
+
+/// An owned, configurable direct child-process command.
+///
+/// Arguments are passed directly to the executable without a command shell.
+/// Call `deinit` if the command will not be consumed by `status` or `spawn`.
+pub struct Command {
+    raw: usize,
+}
+
+/// An owned running child process.
+///
+/// `wait` consumes and collects the child. `deinit` forcefully terminates a
+/// still-running child and then collects it, making scoped cleanup explicit.
+pub struct Child {
+    raw: usize,
+}
+
+const OK: i32 = 0;
+const INVALID_HANDLE: i32 = 1;
+const INVALID_INPUT: i32 = 2;
+const UNSUPPORTED_SCRIPT: i32 = 4;
+const CREATE_INVALID_INPUT: isize = -2;
+const CREATE_UNSUPPORTED_SCRIPT: isize = -4;
+
+@link("runtime")
+extern "C" {
+    fn process_id() -> u64;
+    fn process_exit(code: i32);
+    fn process_command_new(program: *const u8, len: usize) -> isize;
+    fn process_command_arg(
+        handle: usize,
+        argument: *const u8,
+        len: usize,
+    ) -> i32;
+    fn process_command_env(
+        handle: usize,
+        name: *const u8,
+        name_len: usize,
+        value: *const u8,
+        value_len: usize,
+    ) -> i32;
+    fn process_command_env_remove(
+        handle: usize,
+        name: *const u8,
+        name_len: usize,
+    ) -> i32;
+    fn process_command_env_clear(handle: usize) -> i32;
+    fn process_command_current_dir(
+        handle: usize,
+        path: *const u8,
+        path_len: usize,
+    ) -> i32;
+    fn process_command_spawn(handle: usize) -> isize;
+    fn process_command_status(
+        handle: usize,
+        code: *mut i32,
+        has_code: *mut bool,
+        succeeded: *mut bool,
+    ) -> i32;
+    fn process_command_close(handle: usize) -> i32;
+    fn process_child_id(handle: usize) -> u64;
+    fn process_child_kill(handle: usize) -> i32;
+    fn process_child_wait(
+        handle: usize,
+        code: *mut i32,
+        has_code: *mut bool,
+        succeeded: *mut bool,
+    ) -> i32;
+    fn process_child_close(handle: usize) -> i32;
+}
+
+fn error_from_status(status: i32) -> ProcessError {
+    if status == INVALID_HANDLE {
+        ProcessError::InvalidHandle
+    } else if status == INVALID_INPUT {
+        ProcessError::InvalidInput
+    } else if status == UNSUPPORTED_SCRIPT {
+        ProcessError::UnsupportedScript
+    } else {
+        ProcessError::Failed
+    }
+}
+
+fn error_from_created(handle: isize) -> ProcessError {
+    if handle == CREATE_INVALID_INPUT {
+        ProcessError::InvalidInput
+    } else if handle == CREATE_UNSUPPORTED_SCRIPT {
+        ProcessError::UnsupportedScript
+    } else if handle == -(INVALID_HANDLE as isize) {
+        ProcessError::InvalidHandle
+    } else {
+        ProcessError::Failed
+    }
+}
+
+fn status_result(
+    status: i32,
+    code: i32,
+    has_code: bool,
+    succeeded: bool,
+) -> Result<ExitStatus, ProcessError> {
+    if status == OK {
+        Ok(ExitStatus {
+            code: code,
+            has_code: has_code,
+            succeeded: succeeded,
+        })
+    } else {
+        Err(error_from_status(status))
+    }
+}
+
+impl ExitStatus {
+    /// Returns whether the child reported successful termination.
+    pub fn success(&self) -> bool {
+        self.succeeded
+    }
+
+    /// Returns the numeric exit code, or `None` for signal-style termination.
+    pub fn code(&self) -> Option<i32> {
+        if self.has_code {
+            Some(self.code)
+        } else {
+            None
+        }
+    }
+}
+
+impl Command {
+    /// Creates a command that invokes one executable directly.
+    ///
+    /// On Windows, `.bat` and `.cmd` scripts are rejected because they require
+    /// shell-specific argument escaping. Invoke an executable instead.
+    pub fn new(program: str) -> Result<Command, ProcessError> {
+        let handle = unsafe {
+            process_command_new(
+                __string_data(program),
+                __string_length(program),
+            )
+        };
+        if handle > 0 {
+            Ok(Command { raw: handle as usize })
+        } else {
+            Err(error_from_created(handle))
+        }
+    }
+
+    /// Appends one direct executable argument.
+    pub fn arg(&mut self, argument: str) -> Result<(), ProcessError> {
+        let status = unsafe {
+            process_command_arg(
+                (*self).raw,
+                __string_data(argument),
+                __string_length(argument),
+            )
+        };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Appends one argument and returns the command for fallible chaining.
+    ///
+    /// If validation fails, this method releases the command before returning
+    /// the error, so a `?` chain cannot leak its native handle.
+    pub fn with_arg(self, argument: str) -> Result<Command, ProcessError> {
+        let status = unsafe {
+            process_command_arg(
+                self.raw,
+                __string_data(argument),
+                __string_length(argument),
+            )
+        };
+        if status == OK {
+            Ok(self)
+        } else {
+            self.deinit();
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Sets one environment variable only for this child.
+    pub fn env(
+        &mut self,
+        name: str,
+        value: str,
+    ) -> Result<(), ProcessError> {
+        let status = unsafe {
+            process_command_env(
+                (*self).raw,
+                __string_data(name),
+                __string_length(name),
+                __string_data(value),
+                __string_length(value),
+            )
+        };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Sets one child-only environment value and returns the command.
+    ///
+    /// Invalid input releases the command before returning an error.
+    pub fn with_env(
+        self,
+        name: str,
+        value: str,
+    ) -> Result<Command, ProcessError> {
+        let status = unsafe {
+            process_command_env(
+                self.raw,
+                __string_data(name),
+                __string_length(name),
+                __string_data(value),
+                __string_length(value),
+            )
+        };
+        if status == OK {
+            Ok(self)
+        } else {
+            self.deinit();
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Removes one inherited environment variable from this child.
+    pub fn env_remove(&mut self, name: str) -> Result<(), ProcessError> {
+        let status = unsafe {
+            process_command_env_remove(
+                (*self).raw,
+                __string_data(name),
+                __string_length(name),
+            )
+        };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Removes one inherited environment value and returns the command.
+    pub fn without_env(self, name: str) -> Result<Command, ProcessError> {
+        let status = unsafe {
+            process_command_env_remove(
+                self.raw,
+                __string_data(name),
+                __string_length(name),
+            )
+        };
+        if status == OK {
+            Ok(self)
+        } else {
+            self.deinit();
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Clears the inherited environment for this child.
+    pub fn env_clear(&mut self) -> Result<(), ProcessError> {
+        let status = unsafe { process_command_env_clear((*self).raw) };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Clears inherited environment values and returns the command.
+    pub fn with_cleared_env(self) -> Result<Command, ProcessError> {
+        let status = unsafe { process_command_env_clear(self.raw) };
+        if status == OK {
+            Ok(self)
+        } else {
+            self.deinit();
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Sets this child's working directory.
+    pub fn current_dir(&mut self, path: str) -> Result<(), ProcessError> {
+        let status = unsafe {
+            process_command_current_dir(
+                (*self).raw,
+                __string_data(path),
+                __string_length(path),
+            )
+        };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Sets the child directory and returns the command for fallible chaining.
+    pub fn with_current_dir(self, path: str) -> Result<Command, ProcessError> {
+        let status = unsafe {
+            process_command_current_dir(
+                self.raw,
+                __string_data(path),
+                __string_length(path),
+            )
+        };
+        if status == OK {
+            Ok(self)
+        } else {
+            self.deinit();
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Runs the configured command and waits for termination.
+    ///
+    /// Standard input, output, and error are inherited from the parent process.
+    pub fn status(self) -> Result<ExitStatus, ProcessError> {
+        let mut code: i32 = 0;
+        let mut has_code = false;
+        let mut succeeded = false;
+        let status = unsafe {
+            process_command_status(
+                self.raw,
+                &mut code as *mut i32,
+                &mut has_code as *mut bool,
+                &mut succeeded as *mut bool,
+            )
+        };
+        status_result(status, code, has_code, succeeded)
+    }
+
+    /// Spawns the configured command and returns an owned running child.
+    ///
+    /// Standard input, output, and error are inherited from the parent process.
+    pub fn spawn(self) -> Result<Child, ProcessError> {
+        let handle = unsafe { process_command_spawn(self.raw) };
+        if handle > 0 {
+            Ok(Child { raw: handle as usize })
+        } else {
+            Err(error_from_created(handle))
+        }
+    }
+
+    /// Releases this command without spawning it.
+    pub fn deinit(self) {
+        unsafe {
+            process_command_close(self.raw);
+        }
+    }
+}
+
+impl Child {
+    /// Returns the operating-system process identifier.
+    pub fn id(&self) -> u64 {
+        unsafe { process_child_id((*self).raw) }
+    }
+
+    /// Requests forceful termination. Call `wait` afterwards to collect it.
+    pub fn kill(&mut self) -> Result<(), ProcessError> {
+        let status = unsafe { process_child_kill((*self).raw) };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error_from_status(status))
+        }
+    }
+
+    /// Waits for termination, collects native resources, and returns status.
+    pub fn wait(self) -> Result<ExitStatus, ProcessError> {
+        let mut code: i32 = 0;
+        let mut has_code = false;
+        let mut succeeded = false;
+        let status = unsafe {
+            process_child_wait(
+                self.raw,
+                &mut code as *mut i32,
+                &mut has_code as *mut bool,
+                &mut succeeded as *mut bool,
+            )
+        };
+        status_result(status, code, has_code, succeeded)
+    }
+
+    /// Terminates a still-running child, waits for it, and releases its handle.
+    pub fn deinit(self) {
+        unsafe {
+            process_child_close(self.raw);
+        }
+    }
+}
+
+/// Returns the current native process identifier.
+pub fn id() -> u64 {
+    unsafe { process_id() }
+}
+
+/// Terminates the process immediately with the supplied exit code.
+///
+/// Deferred cleanup does not run. Prefer returning from `main` when possible.
+pub fn exit(code: i32) -> never {
+    unsafe {
+        process_exit(code);
+    }
+    loop {}
+}

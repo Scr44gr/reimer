@@ -15,7 +15,8 @@ failure messages, and `std::target::os()` exposes the host as a typed enum. The
 standard library includes explicit allocators, safe I/O, owned files with
 explicit allocator-backed reads, recoverable slice access, allocation-free
 UTF-8 byte and character iteration, wall and monotonic clocks, blocking
-CPU-idle sleep, scalar and vector math, allocator-aware
+CPU-idle sleep, command-line arguments, environment inspection, current paths,
+process identity, scoped direct child processes, scalar and vector math, allocator-aware
 concatenation and primitive formatting, Unicode text queries, `String`, `Vec`,
 typed `f"..."` interpolation with statically dispatched `Display` and `Debug`,
 `HashMap`, `HashSet`, `RingBuffer`, contiguous tensors with safe views, threads,
@@ -62,6 +63,8 @@ cargo run -p reimer-cli -- run examples/m3_assertions.reim
 cargo run -p reimer-cli -- run examples/m3_filesystem.reim
 cargo run -p reimer-cli -- run examples/m3_math.reim
 cargo run -p reimer-cli -- run examples/m3_time.reim
+cargo run -p reimer-cli -- run examples/platform_environment.reim -- hello
+cargo run -p reimer-cli -- run examples/platform_process.reim
 cargo run -p reimer-cli -- run examples/m3_text.reim
 cargo run -p reimer-cli -- run examples/m3_interpolation.reim
 cargo run -p reimer-cli -- run examples/m5_ffi.reim
@@ -99,6 +102,9 @@ attributes, and reflection are specified in
 [`docs/metaprogramming.md`](docs/metaprogramming.md).
 Safe owned file handles, UTF-8 paths, and explicit reads are documented in
 [`docs/filesystem.md`](docs/filesystem.md).
+Arguments, environment values, process identity, exit status, and scoped child
+processes are documented in
+[`docs/environment-and-processes.md`](docs/environment-and-processes.md).
 Scalar functions and `Vec2`/`Vec3`/`Vec4` are documented in
 [`docs/mathematics.md`](docs/mathematics.md).
 Target-correct C aliases and raw-pointer helpers are documented in

@@ -7,8 +7,8 @@ use std::process::{Command, ExitCode};
 
 use reimer_cli::{
     check_file, check_graph, compile_file_to_object, compile_file_to_object_with_options,
-    compile_graph_to_object, execute_file_test, execute_file_with_options, execute_graph,
-    execute_graph_test, file_test_names, graph_test_names,
+    compile_graph_to_object, execute_file_test, execute_file_with_arguments, execute_graph,
+    execute_graph_test, execute_graph_with_arguments, file_test_names, graph_test_names,
 };
 use reimer_codegen_native::OptimizationLevel;
 use reimer_project::{BuildProfile, LockMode, Project};
@@ -35,7 +35,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         Invocation::Check(options) => check(&options),
         Invocation::EmitObject { source, output } => emit_object(&source, output.as_deref()),
         Invocation::Build { options, output } => build(&options, output.as_deref()),
-        Invocation::Run(options) => execute(&options),
+        Invocation::Run { options, arguments } => execute(&options, &arguments),
         Invocation::Test(options) => test(&options),
         Invocation::Document { options, output } => document(&options, output.as_deref()),
         Invocation::RunUnitTest {
@@ -214,12 +214,15 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
     Ok(())
 }
 
-fn execute(options: &ProjectOptions) -> Result<(), String> {
+fn execute(options: &ProjectOptions, arguments: &[OsString]) -> Result<(), String> {
     if is_source_file(&options.path) {
         validate_source_path(&options.path)?;
-        let result =
-            execute_file_with_options(&options.path, profile_optimization(options.profile))
-                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+        let result = execute_file_with_arguments(
+            &options.path,
+            profile_optimization(options.profile),
+            runtime_arguments(&options.path, arguments),
+        )
+        .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
         println!("program returned {result}");
         return Ok(());
     }
@@ -227,10 +230,21 @@ fn execute(options: &ProjectOptions) -> Result<(), String> {
     let project = open_project(options)?;
     let entry = project.entry().map_err(|error| error.to_string())?;
     let optimization = selected_optimization(&project, options.profile)?;
-    let result = execute_graph(&project.source_graph(&entry), optimization)
-        .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+    let result = execute_graph_with_arguments(
+        &project.source_graph(&entry),
+        optimization,
+        runtime_arguments(&entry, arguments),
+    )
+    .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
     println!("program returned {result}");
     Ok(())
+}
+
+fn runtime_arguments(entry: &Path, arguments: &[OsString]) -> Vec<OsString> {
+    let mut runtime_arguments = Vec::with_capacity(arguments.len() + 1);
+    runtime_arguments.push(entry.as_os_str().to_owned());
+    runtime_arguments.extend_from_slice(arguments);
+    runtime_arguments
 }
 
 fn test(options: &ProjectOptions) -> Result<(), String> {
@@ -897,7 +911,10 @@ enum Invocation {
         options: ProjectOptions,
         output: Option<PathBuf>,
     },
-    Run(ProjectOptions),
+    Run {
+        options: ProjectOptions,
+        arguments: Vec<OsString>,
+    },
     Test(ProjectOptions),
     Document {
         options: ProjectOptions,
@@ -946,7 +963,7 @@ impl Invocation {
                 let (options, output) = parse_project_options(arguments, true)?;
                 Ok(Self::Build { options, output })
             }
-            "run" => Ok(Self::Run(parse_project_options(arguments, false)?.0)),
+            "run" => parse_run(arguments),
             "test" => Ok(Self::Test(parse_project_options(arguments, false)?.0)),
             "doc" => {
                 let (options, output) = parse_project_options(arguments, true)?;
@@ -962,6 +979,26 @@ impl Invocation {
             _ => Err(format!("unknown command `{command}`\n\n{}", usage())),
         }
     }
+}
+
+fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
+    let mut compiler_arguments = Vec::new();
+    let mut program_arguments = Vec::new();
+    let mut after_separator = false;
+    for argument in arguments {
+        if !after_separator && argument == "--" {
+            after_separator = true;
+        } else if after_separator {
+            program_arguments.push(argument);
+        } else {
+            compiler_arguments.push(argument);
+        }
+    }
+    let (options, _) = parse_project_options(compiler_arguments.into_iter(), false)?;
+    Ok(Invocation::Run {
+        options,
+        arguments: program_arguments,
+    })
 }
 
 fn parse_unit_test(mut arguments: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
@@ -1300,7 +1337,7 @@ fn usage() -> &'static str {
      reimer init [path]\n  \
      reimer check [path] [--locked|--refresh]\n  \
      reimer build [path] [--release] [--locked|--refresh] [-o <executable>]\n  \
-     reimer run [path] [--release] [--locked|--refresh]\n  \
+     reimer run [path] [--release] [--locked|--refresh] [-- <arguments>...]\n  \
      reimer test [path] [--release] [--locked|--refresh]\n  \
      reimer doc [path] [--locked|--refresh] [-o <file.md>]\n  \
      reimer fmt [path] [--check]\n  \
@@ -1334,6 +1371,22 @@ mod tests {
         assert_eq!(options.profile, BuildProfile::Release);
         assert_eq!(options.lock_mode, LockMode::Locked);
         assert_eq!(output, Some(PathBuf::from("demo.exe")));
+    }
+
+    #[test]
+    fn invocation_should_forward_run_arguments_after_separator() {
+        let arguments = ["run", "demo", "--release", "--", "--name", "Ada"]
+            .map(OsString::from)
+            .to_vec();
+
+        let invocation = Invocation::parse(arguments).expect("run invocation should parse");
+
+        let Invocation::Run { options, arguments } = invocation else {
+            panic!("expected run invocation");
+        };
+        assert_eq!(options.path, Path::new("demo"));
+        assert_eq!(options.profile, BuildProfile::Release);
+        assert_eq!(arguments, [OsString::from("--name"), OsString::from("Ada")]);
     }
 
     #[test]

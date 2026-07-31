@@ -10,5 +10,6 @@ fn main() {
     let exit_code = unsafe { program_main() };
     reimer_runtime::shutdown_job_pools(session.id());
     reimer_runtime::join_session_threads(session.id());
+    reimer_runtime::shutdown_processes(session.id());
     std::process::exit(exit_code);
 }

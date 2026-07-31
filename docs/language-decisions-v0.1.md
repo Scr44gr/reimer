@@ -389,3 +389,27 @@ underflow.
 system. It is a blocking operation, not an active polling loop, and therefore
 does not consume a CPU core while waiting. Async timers remain outside v0.1.
 The safe standard-library wrapper contains the private runtime ABI call.
+
+## D-018: UTF-8 process context and scoped children
+
+`std::env` exposes command-line arguments, environment lookup, the current
+directory, and the current executable through explicit UTF-8 conversion.
+Native strings that cannot be represented as Reimer `String` return
+`EnvError::NotUnicode`. JIT execution receives arguments after the CLI's `--`
+separator; standalone executables use their native argument list.
+
+Process-global environment mutation is not part of the safe API because it is
+not safely portable in multithreaded programs. `std::process::Command` instead
+supports child-specific `env`, `env_remove`, and `env_clear` configuration.
+
+Commands invoke executables directly and do not pass arguments through a
+shell. Windows `.bat` and `.cmd` scripts are rejected because their escaping
+rules require a command interpreter. Standard streams are inherited by
+default.
+
+`Command::status` consumes and waits for a command. `Command::spawn` transfers
+ownership to a move-only `Child`; `wait` consumes and collects it, while
+`deinit` terminates and collects a still-running child for deterministic scoped
+cleanup. Exit codes are optional because signal-style termination does not
+always have a numeric code. All public APIs are safe; raw buffers and native
+handles remain private to the runtime boundary.

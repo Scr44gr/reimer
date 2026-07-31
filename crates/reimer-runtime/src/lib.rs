@@ -16,6 +16,11 @@ use std::thread::JoinHandle;
 mod concurrency;
 #[expect(
     unsafe_code,
+    reason = "the environment ABI validates raw buffers at the generated-code boundary"
+)]
+mod environment;
+#[expect(
+    unsafe_code,
     reason = "the file-system ABI validates raw buffers at the generated-code boundary"
 )]
 mod filesystem;
@@ -29,6 +34,11 @@ mod job;
     reason = "scalar math helpers expose stable symbols to generated native code"
 )]
 mod mathematics;
+#[expect(
+    unsafe_code,
+    reason = "the process ABI validates raw buffers and scalar outputs at the generated-code boundary"
+)]
+mod process;
 #[expect(
     unsafe_code,
     reason = "clock and sleep helpers expose stable symbols to generated native code"
@@ -61,6 +71,16 @@ pub use concurrency::{
     semaphore_destroy, semaphore_release, semaphore_try_acquire, thread_local_clone,
     thread_local_create, thread_local_destroy, thread_local_get, thread_local_set,
 };
+pub use environment::{
+    ENVIRONMENT_ARGUMENT_COUNT_SYMBOL, ENVIRONMENT_ARGUMENT_OPEN_SYMBOL,
+    ENVIRONMENT_CURRENT_DIR_OPEN_SYMBOL, ENVIRONMENT_CURRENT_EXE_OPEN_SYMBOL, ENVIRONMENT_FAILED,
+    ENVIRONMENT_INVALID_HANDLE, ENVIRONMENT_INVALID_NAME, ENVIRONMENT_NOT_FOUND,
+    ENVIRONMENT_NOT_UNICODE, ENVIRONMENT_SNAPSHOT_CLOSE_SYMBOL, ENVIRONMENT_SNAPSHOT_COPY_SYMBOL,
+    ENVIRONMENT_SNAPSHOT_LEN_SYMBOL, ENVIRONMENT_VARIABLE_OPEN_SYMBOL, environment_argument_count,
+    environment_argument_open, environment_current_dir_open, environment_current_exe_open,
+    environment_snapshot_close, environment_snapshot_copy, environment_snapshot_len,
+    environment_variable_open,
+};
 pub use filesystem::{
     FILE_APPEND_SYMBOL, FILE_CLOSE_SYMBOL, FILE_CREATE_SYMBOL, FILE_FLUSH_SYMBOL, FILE_OPEN_SYMBOL,
     FILE_READ_EXACT_SYMBOL, FILE_READ_SYMBOL, FILE_REMAINING_LEN_SYMBOL, FILE_UNEXPECTED_EOF,
@@ -87,6 +107,19 @@ pub use mathematics::{
     math_floor_f64, math_ln_f32, math_ln_f64, math_pow_f32, math_pow_f64, math_round_f32,
     math_round_f64, math_sin_f32, math_sin_f64, math_sqrt_f32, math_sqrt_f64, math_tan_f32,
     math_tan_f64,
+};
+pub use process::{
+    PROCESS_CHILD_CLOSE_SYMBOL, PROCESS_CHILD_ID_SYMBOL, PROCESS_CHILD_KILL_SYMBOL,
+    PROCESS_CHILD_WAIT_SYMBOL, PROCESS_COMMAND_ARG_SYMBOL, PROCESS_COMMAND_CLOSE_SYMBOL,
+    PROCESS_COMMAND_CURRENT_DIR_SYMBOL, PROCESS_COMMAND_ENV_CLEAR_SYMBOL,
+    PROCESS_COMMAND_ENV_REMOVE_SYMBOL, PROCESS_COMMAND_ENV_SYMBOL, PROCESS_COMMAND_NEW_SYMBOL,
+    PROCESS_COMMAND_SPAWN_SYMBOL, PROCESS_COMMAND_STATUS_SYMBOL, PROCESS_EXIT_SYMBOL,
+    PROCESS_FAILED, PROCESS_ID_SYMBOL, PROCESS_INVALID_HANDLE, PROCESS_INVALID_INPUT, PROCESS_OK,
+    PROCESS_UNSUPPORTED_SCRIPT, process_child_close, process_child_id, process_child_kill,
+    process_child_wait, process_command_arg, process_command_close, process_command_current_dir,
+    process_command_env, process_command_env_clear, process_command_env_remove,
+    process_command_new, process_command_spawn, process_command_status, process_exit, process_id,
+    shutdown_processes,
 };
 pub use temporal::{
     TIME_MONOTONIC_NANOS_SYMBOL, TIME_SLEEP_SYMBOL, TIME_UNIX_SECONDS_SYMBOL,
@@ -241,6 +274,7 @@ struct ThreadRecord {
 pub struct ExecutionSession {
     id: usize,
     previous: usize,
+    owns_arguments: bool,
 }
 
 impl ExecutionSession {
@@ -254,6 +288,17 @@ impl ExecutionSession {
         Self::activate(id)
     }
 
+    /// Starts an execution session with an explicit process-style argument list.
+    ///
+    /// The first value conventionally identifies the source or executable.
+    #[must_use]
+    pub fn begin_with_arguments(arguments: Vec<std::ffi::OsString>) -> Self {
+        let mut session = Self::begin();
+        environment::register_execution_arguments(session.id, arguments);
+        session.owns_arguments = true;
+        session
+    }
+
     /// Returns the stable nonzero identity assigned to this execution.
     #[must_use]
     pub const fn id(&self) -> usize {
@@ -262,12 +307,19 @@ impl ExecutionSession {
 
     fn activate(id: usize) -> Self {
         let previous = ACTIVE_EXECUTION_SESSION.replace(id);
-        Self { id, previous }
+        Self {
+            id,
+            previous,
+            owns_arguments: false,
+        }
     }
 }
 
 impl Drop for ExecutionSession {
     fn drop(&mut self) {
+        if self.owns_arguments {
+            environment::remove_execution_arguments(self.id);
+        }
         ACTIVE_EXECUTION_SESSION.set(self.previous);
     }
 }

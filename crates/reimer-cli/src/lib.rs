@@ -1,5 +1,6 @@
 //! End-to-end native compiler operations used by the `reimer` command.
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use reimer_codegen_native::OptimizationLevel;
@@ -90,6 +91,21 @@ pub fn execute_file_with_options(
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
+/// JIT-compiles and executes an entry file with explicit process-style arguments.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, or backend diagnostics.
+pub fn execute_file_with_arguments(
+    path: &Path,
+    optimization: OptimizationLevel,
+    arguments: Vec<OsString>,
+) -> Result<i32, Vec<FileDiagnostic>> {
+    let (package, program) = analyze_file(path)?;
+    reimer_codegen_native::execute_with_arguments(&program, optimization, arguments)
+        .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
 /// Checks every source reachable through a resolved package graph.
 ///
 /// # Errors
@@ -124,6 +140,21 @@ pub fn execute_graph(
 ) -> Result<i32, Vec<FileDiagnostic>> {
     let (package, program) = analyze_graph(graph)?;
     reimer_codegen_native::execute_with_options(&program, optimization)
+        .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
+/// JIT-compiles and executes a resolved source graph with explicit arguments.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, or backend diagnostics.
+pub fn execute_graph_with_arguments(
+    graph: &SourceGraph,
+    optimization: OptimizationLevel,
+    arguments: Vec<OsString>,
+) -> Result<i32, Vec<FileDiagnostic>> {
+    let (package, program) = analyze_graph(graph)?;
+    reimer_codegen_native::execute_with_arguments(&program, optimization, arguments)
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
@@ -266,12 +297,14 @@ fn is_library_entry(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::Path;
 
     use super::{
         check_file, check_source, compile_file_to_object, compile_to_object, execute_file,
-        execute_source,
+        execute_file_with_arguments, execute_source,
     };
+    use reimer_codegen_native::OptimizationLevel;
 
     #[test]
     fn compile_to_object_should_complete_m0_vertical_slice() {
@@ -437,6 +470,30 @@ mod tests {
 
         let result = execute_file(&path).expect("time program should execute");
         let object = compile_file_to_object(&path).expect("time program should compile");
+
+        assert_eq!(result, 42);
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn execute_file_should_receive_explicit_environment_arguments() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/platform_environment.reim");
+        let arguments = [path.as_os_str().to_owned(), OsString::from("hello")].to_vec();
+
+        let result = execute_file_with_arguments(&path, OptimizationLevel::None, arguments)
+            .expect("environment program should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_file_should_complete_process_vertical_slice() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/platform_process.reim");
+
+        let result = execute_file(&path).expect("process program should execute");
+        let object = compile_file_to_object(&path).expect("process program should compile");
 
         assert_eq!(result, 42);
         assert!(!object.is_empty());

@@ -1,0 +1,90 @@
+from std::process import Command, ProcessError, id;
+from std::target import OperatingSystem, os;
+
+fn run_command(command: Command) -> i32 {
+    let mut command = command;
+    let configured: Result<(), ProcessError> = if os() == OperatingSystem::Windows {
+        match command.arg("/c") {
+            Ok(_) => command.arg("exit 0"),
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(())
+    };
+    match configured {
+        Ok(_) => {
+            match command.status() {
+                Ok(status) => {
+                    if status.success() { 42 } else { 5 }
+                },
+                Err(_) => 6,
+            }
+        },
+        Err(_) => {
+            command.deinit();
+            3
+        },
+    }
+}
+
+fn run_child(command: Command) -> i32 {
+    let mut command = command;
+    let configured: Result<(), ProcessError> = if os() == OperatingSystem::Windows {
+        match command.arg("/c") {
+            Ok(_) => command.arg("exit 0"),
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(())
+    };
+    match configured {
+        Ok(_) => {
+            match command.spawn() {
+                Ok(child) => {
+                    if child.id() == 0 {
+                        child.deinit();
+                        7
+                    } else {
+                        match child.wait() {
+                            Ok(status) => {
+                                if status.success() { 42 } else { 8 }
+                            },
+                            Err(_) => 9,
+                        }
+                    }
+                },
+                Err(_) => 10,
+            }
+        },
+        Err(_) => {
+            command.deinit();
+            11
+        },
+    }
+}
+
+fn create_command() -> Result<Command, ProcessError> {
+    match os() {
+        OperatingSystem::Windows => Command::new("cmd.exe"),
+        _ => Command::new("true"),
+    }
+}
+
+fn main() -> i32 {
+    if id() == 0 {
+        return 1;
+    }
+
+    let command = match create_command() {
+        Ok(command) => command,
+        Err(_) => {
+            return 2;
+        },
+    };
+    let status_result = run_command(command);
+    let child = match create_command() {
+        Ok(command) => run_child(command),
+        Err(_) => 12,
+    };
+    if status_result == 42 && child == 42 { 42 } else { 13 }
+}

@@ -1,0 +1,46 @@
+from std::alloc import general_allocator;
+from std::env import args, current_dir, current_exe, var;
+
+fn main() -> i32 {
+    let allocator = general_allocator();
+    let arguments = args();
+
+    let directory = match current_dir(&allocator) {
+        Ok(directory) => directory,
+        Err(_) => {
+            return 2;
+        },
+    };
+    defer directory.deinit();
+
+    let executable = match current_exe(&allocator) {
+        Ok(executable) => executable,
+        Err(_) => {
+            return 3;
+        },
+    };
+    defer executable.deinit();
+
+    let missing = match var(&allocator, "REIMER_EXPECTED_MISSING_VARIABLE") {
+        Ok(value) => value,
+        Err(_) => {
+            return 4;
+        },
+    };
+    match missing {
+        Some(value) => {
+            value.deinit();
+            5
+        },
+        None => {
+            if arguments.len() >= 2
+                && !directory.is_empty()
+                && !executable.is_empty()
+            {
+                42
+            } else {
+                6
+            }
+        },
+    }
+}

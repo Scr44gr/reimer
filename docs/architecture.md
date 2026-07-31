@@ -67,6 +67,15 @@ process-local nanosecond counter, and park the current native thread through
 the operating system. `Duration` and `Instant` remain safe source-level value
 types. See [`time.md`](time.md).
 
+`std::env` converts native argument, environment, and path values explicitly
+to UTF-8 through stable snapshots. JIT sessions receive an isolated argument
+list from the CLI, while standalone executables read their native process
+arguments. `std::process` stores commands and children behind opaque runtime
+handles, invokes executables without a shell, and makes wait or terminating
+cleanup explicit. Child-only environment configuration avoids unsafe global
+mutation. See
+[`environment-and-processes.md`](environment-and-processes.md).
+
 `std::string` keeps allocation decisions in safe source APIs. Concatenation
 precomputes its UTF-8 capacity, incremental formatting reuses an owned
 `String`, typed interpolation selects statically dispatched `Display` or

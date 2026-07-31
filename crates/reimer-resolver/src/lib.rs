@@ -8240,7 +8240,9 @@ impl<'context> FunctionAnalyzer<'context> {
     fn require_standard_io_intrinsic(&mut self, span: Span) {
         if matches!(
             self.module_identity.as_deref(),
-            Some("3_std_2_fs" | "3_std_2_io" | "3_std_6_string")
+            Some(
+                "3_std_2_fs" | "3_std_2_io" | "3_std_3_env" | "3_std_6_string" | "3_std_7_process"
+            )
         ) {
             return;
         }
