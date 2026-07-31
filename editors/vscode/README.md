@@ -14,7 +14,8 @@ similar quality of experience through an original TextMate grammar and LSP.
   standard-library descriptions, and no internal compiler symbol names;
 - Markdown documentation from `///` comments on declarations, direct calls,
   imported functions, and local completion items;
-- local go-to-definition, document symbols, and completion;
+- local go-to-definition, compiler-linked rename, document symbols, and
+  completion;
 - quick fixes for close typos and antipatterns;
 - `source.organizeImports` to place `std` first and normalize selective imports
   without deleting comments;
@@ -25,8 +26,8 @@ similar quality of experience through an original TextMate grammar and LSP.
 - highlighting and completion for `comptime`, constants, reflection, and M10
   attributes; `*` and `->` share the same operator scope;
 - HIR-backed `@must_use` warnings, including saved multi-file packages;
-- package-aware inference for the active in-memory document, including unsaved
-  changes in files with imports;
+- package-aware inference using every open in-memory document, with targeted
+  reanalysis of importers after unsaved dependency changes;
 - reliable matching and colorization for `{}`, `[]`, and `()` without adding
   active-block guide lines. Angle brackets remain operators so `->` and
   comparisons are not mistaken for bracket pairs.
@@ -80,6 +81,6 @@ fn greet() -> Result<(), IoError> {
 
 ## Current limitations
 
-Imported dependency files are read from disk while the active document uses its
-latest in-memory snapshot. Changes in another open module become visible after
-that module is saved. Go-to-definition is currently intradocument.
+Go-to-definition and rename are currently intradocument. Rename follows
+compiler-resolved identity, so it safely handles shadowed locals and nominal
+types, but it does not yet edit declarations or imports in another file.

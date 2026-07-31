@@ -25,11 +25,12 @@ tests, and an executable `.reim` program.
 HIR to produce diagnostics, typo quick fixes, inferred types, antipatterns, and
 static allocator estimates. `reimer-lsp` publishes them through LSP together
 with hover, inlay hints, completion, definitions, symbols, CodeLens, and import
-organization. Changes to `reimer.toml` or `reimer.lock` reanalyze open
-documents. `editors/vscode` provides TextMate highlighting and bundles the
-server and client so `.reim` files work without a Rust or Pylance extension.
-The active in-memory document participates in full package resolution before
-it is saved.
+organization. Compiler-linked rename follows declaration identity without
+touching shadowed names. Changes to an open module rebuild only that module and
+open importers while resolving every unsaved buffer as an overlay; changes to
+`reimer.toml` or `reimer.lock` reanalyze all open documents.
+`editors/vscode` provides TextMate highlighting and bundles the server and
+client so `.reim` files work without a Rust or Pylance extension.
 
 ## Full LDD surface audit
 
@@ -44,7 +45,7 @@ reported as implemented:
 | Integer literals and overflow APIs | Decimal, hexadecimal, binary, and octal forms; checked `_` separators; contextual range validation through `u128`; checked operators panic in every profile; constant overflow is rejected; every integer type provides `wrapping_add`, `checked_add`, and `saturating_add` | - |
 | Slices and UTF-8 views | Checked `[]`; recoverable `get`/`get_mut`; slice iteration; validated `str`; zero-copy `bytes()`; allocation-free `chars()` with `next()` and `for` | - |
 | Standard library plan | `alloc`, `c`, `collections`, `fmt`, `fs`, `io`, `math`, `string`, `target`, `thread`, `job`, and `tensor`; allocator-aware concatenation, primitive formatting, typed interpolated strings with `Display`, Unicode queries, and full scalar case mappings | `Debug` formatting for interpolated values |
-| Tooling | Formatter, checker, tests, generated `///` Markdown, hover, completion, definitions, CodeLens, and diagnostics | Rename and dependency-aware incremental analysis |
+| Tooling | Formatter, checker, tests, generated `///` Markdown, hover, completion, definitions, compiler-linked intradocument rename, dependency-aware incremental snapshots, CodeLens, and diagnostics | - |
 | First integrated demo | SDL/OpenGL, tensor, allocator, `Result`, and `defer` are each exercised | One program combining the complete LDD section 22.1 scenario |
 
 ## Deliberate differences from the draft

@@ -14,3 +14,5 @@
 - Source-level type names, type-specific hover documentation, and `///`
   documentation on declarations, calls, imports, and completion items.
 - Bracket matching without intrusive active-block guide lines.
+- Compiler-linked intradocument rename and dependency-aware incremental
+  analysis across all unsaved open modules.

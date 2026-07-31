@@ -46,6 +46,10 @@ fn server_should_serve_editor_intelligence_over_stdio() {
     assert_eq!(initialize["result"]["capabilities"]["hoverProvider"], true);
     assert!(initialize["result"]["capabilities"]["completionProvider"].is_object());
     assert!(initialize["result"]["capabilities"]["inlayHintProvider"].is_object());
+    assert_eq!(
+        initialize["result"]["capabilities"]["renameProvider"]["prepareProvider"],
+        true
+    );
 
     server.notify("initialized", &json!({}));
     server.notify(
@@ -113,7 +117,37 @@ fn server_should_serve_editor_intelligence_over_stdio() {
             .any(|hint| hint["label"] == ": i32")
     );
 
-    server.shutdown(5);
+    assert_rename_support(&mut server, uri);
+    server.shutdown(7);
+}
+
+fn assert_rename_support(server: &mut TestServer, uri: &str) {
+    let prepared = server.request(
+        5,
+        "textDocument/prepareRename",
+        &json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 25 }
+        }),
+    );
+    assert_eq!(prepared["result"]["placeholder"], "answer");
+
+    let rename = server.request(
+        6,
+        "textDocument/rename",
+        &json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 25 },
+            "newName": "result"
+        }),
+    );
+    assert_eq!(
+        rename["result"]["changes"][uri]
+            .as_array()
+            .expect("rename should return edits")
+            .len(),
+        2
+    );
 }
 
 struct TestServer {

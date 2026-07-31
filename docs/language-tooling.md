@@ -8,11 +8,11 @@ decides whether a program is valid.
 ## Components
 
 - `crates/reimer-lint`: compiler diagnostics, antipattern lints, quick fixes,
-  import organization, resolved-type indexes, local definition links, and
-  allocator estimates.
+  import organization, resolved-type indexes, semantic definition/rename
+  links, and allocator estimates.
 - `crates/reimer-lsp`: stdin/stdout server with full synchronization, pushed
-  diagnostics, hover, intradocument go-to-definition, symbols, completion,
-  code actions, inlay hints, and CodeLens.
+  diagnostics, hover, intradocument go-to-definition and rename, symbols,
+  completion, code actions, inlay hints, and CodeLens.
 - `editors/vscode`: `.reim` recognition, original TextMate grammar,
   pair/indentation configuration, snippets, and the LSP client.
 
@@ -32,6 +32,11 @@ The `source.organizeImports` action:
 Typo detection compares symbols, bindings, fields, imports, primitive types,
 and core names visible in the document. A replacement is offered only for a
 small edit distance; final validation still belongs to the resolver.
+
+Rename is based on compiler-resolved symbol identity rather than matching
+text. Renaming a local, parameter, function, static, or nominal type updates
+its declaration and linked uses without changing an identically spelled symbol
+from another scope. The replacement must be a valid non-keyword identifier.
 
 Built-in integer methods are completed and carry semantic hover information.
 For example, hovering `checked_add` shows its exact integer signature, explains
@@ -120,10 +125,13 @@ details are not exposed. Without `-o`, the output is written to
 
 ## Packages and snapshots
 
-The active document is always resolved from its in-memory snapshot. When it has
-imports, the package loader overlays that snapshot onto the package graph and
-reads dependency modules from disk before rebuilding the canonical program.
-Changes in another open module become visible after that module is saved.
+Every open `.reim` document participates in one in-memory package snapshot.
+When a module changes, the language server overlays all open buffers onto the
+package graph and rebuilds only that module and open documents that imported
+it in their previous snapshot. Consequently, an unsaved return-type change in
+a dependency immediately updates diagnostics and hover information in an open
+importer. Manifest and lockfile changes conservatively rebuild all open
+documents.
 
 ## Installation and verification
 

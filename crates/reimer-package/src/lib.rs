@@ -88,6 +88,11 @@ impl Package {
         source.text.get(local.start..local.end)
     }
 
+    /// Returns every source file loaded into this package snapshot.
+    pub fn source_paths(&self) -> impl Iterator<Item = &Path> {
+        self.sources.iter().map(|source| source.path.as_path())
+    }
+
     fn map_diagnostic(&self, mut diagnostic: Diagnostic) -> FileDiagnostic {
         diagnostic.message = display_symbol_name(&diagnostic.message);
         diagnostic.help = diagnostic.help.map(|help| display_symbol_name(&help));
@@ -248,6 +253,20 @@ pub fn load_with_overlay(entry: &Path, source: &str) -> Result<Package, Vec<File
     Loader::single(entry).with_overlay(entry, source).load()
 }
 
+/// Loads an entry file while replacing any matching files with in-memory
+/// source snapshots.
+///
+/// # Errors
+///
+/// Returns the same file-aware diagnostics as [`load`], including diagnostics
+/// produced from any in-memory source.
+pub fn load_with_overlays(
+    entry: &Path,
+    overlays: &[(PathBuf, String)],
+) -> Result<Package, Vec<FileDiagnostic>> {
+    Loader::single(entry).with_overlays(overlays).load()
+}
+
 /// Loads a resolved package graph and enforces dependency visibility per edge.
 ///
 /// # Errors
@@ -271,6 +290,20 @@ pub fn load_graph_with_overlay(
     source: &str,
 ) -> Result<Package, Vec<FileDiagnostic>> {
     Loader::from_graph(graph)?.with_overlay(path, source).load()
+}
+
+/// Loads a resolved package graph while replacing any matching files with
+/// in-memory source snapshots.
+///
+/// # Errors
+///
+/// Returns the same file-aware diagnostics as [`load_graph`], including
+/// diagnostics produced from any in-memory source.
+pub fn load_graph_with_overlays(
+    graph: &SourceGraph,
+    overlays: &[(PathBuf, String)],
+) -> Result<Package, Vec<FileDiagnostic>> {
+    Loader::from_graph(graph)?.with_overlays(overlays).load()
 }
 
 struct Loader {
@@ -374,6 +407,11 @@ impl Loader {
 
     fn with_overlay(mut self, path: &Path, source: &str) -> Self {
         self.overlays.insert(path.to_path_buf(), source.to_owned());
+        self
+    }
+
+    fn with_overlays(mut self, overlays: &[(PathBuf, String)]) -> Self {
+        self.overlays.extend(overlays.iter().cloned());
         self
     }
 
@@ -2225,7 +2263,7 @@ mod tests {
 
     use super::{
         SourceDependency, SourceGraph, SourcePackage, canonical_name, display_symbol_name,
-        documentation_before, load, load_graph, load_with_overlay,
+        documentation_before, load, load_graph, load_with_overlay, load_with_overlays,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -2335,6 +2373,42 @@ mod tests {
         let package = load_with_overlay(&path, overlay).expect("in-memory source should load");
 
         assert_eq!(package.sources[0].text, overlay);
+    }
+
+    #[test]
+    fn load_with_overlays_should_analyze_unsaved_imports() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.reim",
+            "from values import answer; fn main() -> i32 { answer() }",
+        );
+        fixture.write("values.reim", "pub fn answer() -> bool { false }");
+        let entry = fixture.path("main.reim");
+        let dependency = fixture.path("values.reim");
+        let main_overlay =
+            "from values import answer; fn main() -> i32 { answer() + 0 }".to_owned();
+        let dependency_overlay = "pub fn answer() -> i32 { 42 }".to_owned();
+        let overlays = vec![
+            (entry.clone(), main_overlay.clone()),
+            (dependency.clone(), dependency_overlay.clone()),
+        ];
+
+        let package =
+            load_with_overlays(&entry, &overlays).expect("all in-memory sources should load");
+        reimer_resolver::resolve(&package.program)
+            .expect("the matching unsaved signatures should resolve");
+        assert!(
+            package
+                .sources
+                .iter()
+                .any(|source| source.path == entry && source.text == main_overlay)
+        );
+        assert!(
+            package
+                .sources
+                .iter()
+                .any(|source| source.path == dependency && source.text == dependency_overlay)
+        );
     }
 
     #[test]

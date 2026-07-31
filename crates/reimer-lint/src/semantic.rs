@@ -90,6 +90,13 @@ pub(crate) fn index_with_documentation(
     let function_targets = function_targets(typed, &syntax_index);
     let static_targets = static_targets(typed, &syntax_index);
     let callable_hints = callable_hints(typed, documentation);
+    definitions.extend(
+        function_targets
+            .values()
+            .chain(static_targets.values())
+            .copied()
+            .map(self_definition_link),
+    );
 
     for value in &typed.statics {
         let Some(name_span) = syntax_index.static_name(value.span) else {
@@ -136,6 +143,7 @@ pub(crate) fn index_with_documentation(
             &mut local_types,
             &mut type_hints,
         );
+        definitions.extend(local_targets.values().copied().map(self_definition_link));
         let mut indexer = HirIndexer {
             typed,
             syntax_index: &syntax_index,
@@ -276,6 +284,13 @@ fn sort_and_deduplicate(type_hints: &mut Vec<TypeHint>, definitions: &mut Vec<De
     definitions.dedup();
 }
 
+fn self_definition_link(span: Span) -> DefinitionLink {
+    DefinitionLink {
+        use_span: span,
+        target_span: span,
+    }
+}
+
 struct SyntaxIndex<'ast> {
     functions: HashMap<(usize, usize), &'ast ast::Function>,
     function_names: HashMap<(usize, usize), Span>,
@@ -363,9 +378,11 @@ impl<'ast> SyntaxIndex<'ast> {
     }
 
     fn type_definition_links(&self) -> Vec<DefinitionLink> {
-        self.type_uses
-            .iter()
-            .filter_map(|(name, use_span)| {
+        self.type_targets
+            .values()
+            .copied()
+            .map(self_definition_link)
+            .chain(self.type_uses.iter().filter_map(|(name, use_span)| {
                 self.type_targets
                     .get(name)
                     .copied()
@@ -373,7 +390,7 @@ impl<'ast> SyntaxIndex<'ast> {
                         use_span: *use_span,
                         target_span,
                     })
-            })
+            }))
             .collect()
     }
 }

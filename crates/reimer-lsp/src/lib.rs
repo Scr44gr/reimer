@@ -2,6 +2,7 @@
 //! server binary.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use reimer_ast::Item;
@@ -14,7 +15,8 @@ use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeLens, Command, CompletionItem,
     CompletionItemKind, Diagnostic, DiagnosticSeverity, DocumentSymbol, Documentation, Hover,
     HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkupContent, MarkupKind,
-    NumberOrString, Position, Range, SymbolKind, TextEdit, Url, WorkspaceEdit,
+    NumberOrString, Position, PrepareRenameResponse, Range, SymbolKind, TextEdit, Url,
+    WorkspaceEdit,
 };
 
 /// One immutable source snapshot and all indexes derived from it.
@@ -24,12 +26,18 @@ pub struct Document {
     text: Arc<str>,
     lines: LineIndex,
     analysis: Analysis,
+    source_paths: HashSet<PathBuf>,
+    package_loaded: bool,
 }
 
 impl Document {
     /// Analyzes a newly opened or changed document.
     #[must_use]
     pub fn new(uri: Url, text: String) -> Self {
+        Self::new_with_overlays(uri, text, &[])
+    }
+
+    fn new_with_overlays(uri: Url, text: String, overlays: &[(PathBuf, String)]) -> Self {
         let text: Arc<str> = text.into();
         let lines = LineIndex::new(Arc::clone(&text));
         let mut analysis = analyze(&text);
@@ -38,13 +46,16 @@ impl Document {
                 .findings
                 .retain(|finding| finding.severity != Severity::Error);
         }
+        let source_paths = uri.to_file_path().ok().into_iter().collect::<HashSet<_>>();
         let mut document = Self {
             uri,
             text,
             lines,
             analysis,
+            source_paths,
+            package_loaded: false,
         };
-        document.refresh_package();
+        document.refresh_package(overlays);
         document
     }
 
@@ -139,6 +150,50 @@ impl Document {
         Some(Location {
             uri: self.uri.clone(),
             range: self.lines.range(link.target_span),
+        })
+    }
+
+    /// Returns the declaration range and current spelling for a semantic rename.
+    #[must_use]
+    pub fn prepare_rename(&self, position: Position) -> Option<PrepareRenameResponse> {
+        let target = self.rename_target(position)?;
+        let placeholder = self.text.get(target.start..target.end)?.to_owned();
+        Some(PrepareRenameResponse::RangeWithPlaceholder {
+            range: self.lines.range(target),
+            placeholder,
+        })
+    }
+
+    /// Renames one compiler-resolved symbol and all of its uses in this document.
+    #[must_use]
+    pub fn rename(&self, position: Position, new_name: &str) -> Option<WorkspaceEdit> {
+        if !is_identifier(new_name) {
+            return None;
+        }
+        let target = self.rename_target(position)?;
+        let mut spans = self
+            .analysis
+            .definitions
+            .iter()
+            .filter(|link| link.target_span == target)
+            .map(|link| link.use_span)
+            .chain(std::iter::once(target))
+            .collect::<Vec<_>>();
+        spans.sort_by_key(|span| (span.start, span.end));
+        spans.dedup();
+        let edits = spans
+            .into_iter()
+            .map(|span| TextEdit {
+                range: self.lines.range(span),
+                new_text: new_name.to_owned(),
+            })
+            .collect();
+        let mut changes = HashMap::new();
+        changes.insert(self.uri.clone(), edits);
+        Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
         })
     }
 
@@ -388,18 +443,17 @@ impl Document {
         lenses
     }
 
-    fn refresh_package(&mut self) {
+    fn refresh_package(&mut self, overlays: &[(PathBuf, String)]) {
         let Ok(path) = self.uri.to_file_path() else {
             return;
         };
+        let overlays = overlays_with_document(&path, &self.text, overlays);
         let package = match Project::open(&path, LockMode::Use) {
-            Ok(project) => reimer_package::load_graph_with_overlay(
-                &project.source_graph(&path),
-                &path,
-                &self.text,
-            ),
+            Ok(project) => {
+                reimer_package::load_graph_with_overlays(&project.source_graph(&path), &overlays)
+            }
             Err(ProjectError::ManifestNotFound { .. }) => {
-                reimer_package::load_with_overlay(&path, &self.text)
+                reimer_package::load_with_overlays(&path, &overlays)
             }
             Err(error) => {
                 self.analysis
@@ -419,6 +473,8 @@ impl Document {
         let package = match package {
             Ok(package) => package,
             Err(diagnostics) => {
+                self.source_paths
+                    .extend(diagnostics.iter().map(|diagnostic| diagnostic.path.clone()));
                 self.analysis
                     .findings
                     .retain(|finding| finding.severity != Severity::Error);
@@ -431,6 +487,9 @@ impl Document {
                 return;
             }
         };
+        self.package_loaded = true;
+        self.source_paths
+            .extend(package.source_paths().map(Path::to_path_buf));
         let resolved = if syntax_has_main(&self.analysis) {
             reimer_resolver::resolve(&package.program)
         } else {
@@ -483,6 +542,13 @@ impl Document {
                 }
             }
         }
+    }
+
+    fn rename_target(&self, position: Position) -> Option<reimer_diagnostics::Span> {
+        let byte = self.lines.byte(position)?;
+        narrowest_containing(&self.analysis.definitions, byte, |link| link.use_span)
+            .map(|link| link.target_span)
+            .filter(|span| span.end <= self.text.len())
     }
 
     fn action_from_fix(
@@ -707,6 +773,115 @@ impl Document {
     }
 }
 
+/// Compiler snapshots for every open editor document.
+///
+/// Changes rebuild only the changed document and open documents whose last
+/// package snapshot loaded that source path.
+#[derive(Debug, Default)]
+pub struct Workspace {
+    documents: HashMap<Url, Document>,
+}
+
+impl Workspace {
+    /// Returns one currently open document.
+    #[must_use]
+    pub fn get(&self, uri: &Url) -> Option<&Document> {
+        self.documents.get(uri)
+    }
+
+    /// Replaces one open source snapshot and rebuilds its open dependants.
+    pub fn update(&mut self, uri: Url, text: String) -> Vec<Url> {
+        let changed_path = uri.to_file_path().ok();
+        let mut affected = self
+            .documents
+            .iter()
+            .filter(|(candidate, document)| {
+                *candidate == &uri
+                    || changed_path
+                        .as_deref()
+                        .is_some_and(|path| document.source_paths.contains(path))
+            })
+            .map(|(candidate, _)| candidate.clone())
+            .collect::<HashSet<_>>();
+        affected.insert(uri.clone());
+
+        let mut snapshots = self.snapshots();
+        snapshots.insert(uri, text);
+        self.rebuild(affected, &snapshots)
+    }
+
+    /// Rebuilds documents affected by files changed outside the editor.
+    pub fn refresh_paths(&mut self, paths: &[PathBuf]) -> Vec<Url> {
+        let refresh_all = paths
+            .iter()
+            .any(|path| path.extension().and_then(|extension| extension.to_str()) != Some("reim"));
+        let affected = self
+            .documents
+            .iter()
+            .filter(|(_, document)| {
+                refresh_all
+                    || paths
+                        .iter()
+                        .any(|path| document.source_paths.contains(path))
+            })
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        let snapshots = self.snapshots();
+        self.rebuild(affected, &snapshots)
+    }
+
+    /// Removes one editor overlay and refreshes open dependants from disk.
+    pub fn close(&mut self, uri: &Url) -> Vec<Url> {
+        let closed_path = uri.to_file_path().ok();
+        self.documents.remove(uri);
+        let affected = self
+            .documents
+            .iter()
+            .filter(|(_, document)| {
+                closed_path
+                    .as_deref()
+                    .is_some_and(|path| document.source_paths.contains(path))
+            })
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        let snapshots = self.snapshots();
+        self.rebuild(affected, &snapshots)
+    }
+
+    fn snapshots(&self) -> HashMap<Url, String> {
+        self.documents
+            .iter()
+            .map(|(uri, document)| (uri.clone(), document.text().to_owned()))
+            .collect()
+    }
+
+    fn rebuild(&mut self, affected: HashSet<Url>, snapshots: &HashMap<Url, String>) -> Vec<Url> {
+        let overlays = snapshots
+            .iter()
+            .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
+            .collect::<Vec<_>>();
+        let mut affected = affected.into_iter().collect::<Vec<_>>();
+        affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+        for uri in &affected {
+            let Some(text) = snapshots.get(uri) else {
+                continue;
+            };
+            let previous_paths = self
+                .documents
+                .get(uri)
+                .map(|document| document.source_paths.clone())
+                .unwrap_or_default();
+            let mut document = Document::new_with_overlays(uri.clone(), text.clone(), &overlays);
+            if !document.package_loaded {
+                document.source_paths.extend(previous_paths);
+            }
+            self.documents.insert(uri.clone(), document);
+        }
+        affected
+    }
+}
+
 fn attach_package_documentation(
     typed: &mut reimer_hir::Program,
     package: &reimer_package::Package,
@@ -719,6 +894,23 @@ fn attach_package_documentation(
     for value in &mut typed.statics {
         value.documentation = package.documentation(value.span);
     }
+}
+
+fn overlays_with_document(
+    path: &Path,
+    text: &str,
+    overlays: &[(PathBuf, String)],
+) -> Vec<(PathBuf, String)> {
+    let mut overlays = overlays.to_vec();
+    if let Some((_, source)) = overlays
+        .iter_mut()
+        .find(|(overlay_path, _)| overlay_path == path)
+    {
+        text.clone_into(source);
+    } else {
+        overlays.push((path.to_path_buf(), text.to_owned()));
+    }
+    overlays
 }
 
 fn syntax_has_imports(analysis: &Analysis) -> bool {
@@ -748,6 +940,25 @@ fn compiler_finding(diagnostic: reimer_diagnostics::Diagnostic) -> Finding {
         help: diagnostic.help,
         fixes: Vec::new(),
     }
+}
+
+fn is_identifier(name: &str) -> bool {
+    let Ok(tokens) = reimer_lexer::lex(name) else {
+        return false;
+    };
+    matches!(
+        tokens.as_slice(),
+        [
+            reimer_lexer::Token {
+                kind: reimer_lexer::TokenKind::Identifier(_),
+                span,
+            },
+            reimer_lexer::Token {
+                kind: reimer_lexer::TokenKind::Eof,
+                ..
+            }
+        ] if span.start == 0 && span.end == name.len()
+    )
 }
 
 fn narrowest_containing<T>(
@@ -1274,7 +1485,7 @@ mod tests {
 
     use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Url};
 
-    use super::{Document, LineIndex};
+    use super::{Document, LineIndex, Workspace};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -1434,6 +1645,144 @@ mod tests {
         let definition = document.definition(Position::new(0, 42));
 
         assert!(definition.is_some());
+    }
+
+    #[test]
+    fn document_should_rename_only_the_resolved_symbol() {
+        let source = "fn first() -> i32 { let value = 1; value }\n\
+                      fn second() -> i32 { let value = 2; value }\n\
+                      fn main() -> i32 { first() + second() }\n"
+            .to_owned();
+        let lines = LineIndex::new(Arc::from(source.as_str()));
+        let declaration = source.find("value = 1").expect("declaration should exist");
+        let document = Document::new(
+            Url::parse("untitled:rename.reim").expect("URL should parse"),
+            source.clone(),
+        );
+
+        let prepared = document
+            .prepare_rename(lines.position(declaration))
+            .expect("local declaration should be renameable");
+        let tower_lsp::lsp_types::PrepareRenameResponse::RangeWithPlaceholder {
+            placeholder, ..
+        } = prepared
+        else {
+            panic!("prepare rename should include the current spelling");
+        };
+        assert_eq!(placeholder, "value");
+
+        let edit = document
+            .rename(lines.position(declaration), "answer")
+            .expect("valid rename should produce an edit");
+        let edits = edit
+            .changes
+            .expect("rename should contain document changes")
+            .remove(&Url::parse("untitled:rename.reim").expect("URL should parse"))
+            .expect("the active document should be edited");
+        let changed_offsets = edits
+            .iter()
+            .map(|edit| {
+                document
+                    .lines
+                    .byte(edit.range.start)
+                    .expect("edit position should map to a byte")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|edit| edit.new_text == "answer"));
+        assert!(changed_offsets.iter().all(|offset| {
+            source
+                .get(*offset..)
+                .is_some_and(|tail| tail.starts_with("value"))
+        }));
+        assert!(
+            changed_offsets
+                .iter()
+                .all(|offset| *offset < source.find("fn second").expect("function should exist"))
+        );
+        assert!(document.rename(lines.position(declaration), "fn").is_none());
+    }
+
+    #[test]
+    fn document_should_rename_a_nominal_type_and_its_uses() {
+        let source = "struct Player { score: i32 }\n\
+                      fn keep(player: Player) -> Player { player }\n"
+            .to_owned();
+        let lines = LineIndex::new(Arc::from(source.as_str()));
+        let declaration = source.find("Player").expect("type should exist");
+        let document = Document::new(
+            Url::parse("untitled:type-rename.reim").expect("URL should parse"),
+            source,
+        );
+
+        let edit = document
+            .rename(lines.position(declaration), "Competitor")
+            .expect("nominal type should be renameable");
+        let edits = edit
+            .changes
+            .expect("rename should contain document changes")
+            .remove(&Url::parse("untitled:type-rename.reim").expect("URL should parse"))
+            .expect("the active document should be edited");
+
+        assert_eq!(edits.len(), 3);
+        assert!(edits.iter().all(|edit| edit.new_text == "Competitor"));
+    }
+
+    #[test]
+    fn workspace_should_propagate_unsaved_dependency_types() {
+        let fixture = Fixture::new();
+        let main_source = "from values import answer;\nfn main() -> i32 { answer() }\n";
+        let values_source = "pub fn answer() -> i32 { 42 }\n";
+        let main_path = fixture.write("main.reim", main_source);
+        let values_path = fixture.write("values.reim", values_source);
+        let unrelated_path = fixture.write("unrelated.reim", "pub fn unrelated() -> i32 { 7 }\n");
+        let main_uri = Url::from_file_path(&main_path).expect("main path should become a URL");
+        let values_uri =
+            Url::from_file_path(&values_path).expect("dependency path should become a URL");
+        let unrelated_uri =
+            Url::from_file_path(&unrelated_path).expect("unrelated path should become a URL");
+        let mut workspace = Workspace::default();
+
+        workspace.update(main_uri.clone(), main_source.to_owned());
+        workspace.update(
+            unrelated_uri.clone(),
+            "pub fn unrelated() -> i32 { 7 }\n".to_owned(),
+        );
+        assert!(
+            workspace
+                .get(&main_uri)
+                .expect("main document should be open")
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR))
+        );
+
+        let affected = workspace.update(
+            values_uri.clone(),
+            "pub fn answer() -> bool { true }\n".to_owned(),
+        );
+        assert!(affected.contains(&main_uri));
+        assert!(affected.contains(&values_uri));
+        assert!(!affected.contains(&unrelated_uri));
+        assert!(
+            workspace
+                .get(&main_uri)
+                .expect("main document should remain open")
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+        );
+
+        workspace.update(values_uri, values_source.to_owned());
+        assert!(
+            workspace
+                .get(&main_uri)
+                .expect("main document should remain open")
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR))
+        );
     }
 
     #[test]

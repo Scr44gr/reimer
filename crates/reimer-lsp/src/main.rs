@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
@@ -9,34 +7,54 @@ use tower_lsp::lsp_types::{
     DidSaveTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
     GotoDefinitionResponse, HoverParams, HoverProviderCapability, InitializeParams,
     InitializeResult, InitializedParams, InlayHintOptions, InlayHintParams,
-    InlayHintServerCapabilities, MessageType, OneOf, ServerCapabilities, ServerInfo,
+    InlayHintServerCapabilities, MessageType, OneOf, PrepareRenameResponse, RenameOptions,
+    RenameParams, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, Url,
-    WorkDoneProgressOptions,
+    WorkDoneProgressOptions, WorkspaceEdit,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use reimer_lsp::Document;
+use reimer_lsp::Workspace;
 
 struct Backend {
     client: Client,
-    documents: RwLock<HashMap<Url, Document>>,
+    workspace: RwLock<Workspace>,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
         Self {
             client,
-            documents: RwLock::new(HashMap::new()),
+            workspace: RwLock::new(Workspace::default()),
         }
     }
 
     async fn publish(&self, uri: Url, text: String, version: Option<i32>) {
-        let document = Document::new(uri.clone(), text);
-        let diagnostics = document.diagnostics();
-        self.documents.write().await.insert(uri.clone(), document);
-        self.client
-            .publish_diagnostics(uri, diagnostics, version)
-            .await;
+        let affected = self.workspace.write().await.update(uri.clone(), text);
+        self.publish_updates(affected, Some((uri, version))).await;
+    }
+
+    async fn publish_updates(&self, affected: Vec<Url>, current: Option<(Url, Option<i32>)>) {
+        let updates = {
+            let workspace = self.workspace.read().await;
+            affected
+                .into_iter()
+                .filter_map(|uri| {
+                    workspace
+                        .get(&uri)
+                        .map(|document| (uri, document.diagnostics()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (uri, diagnostics) in updates {
+            let version = current
+                .as_ref()
+                .filter(|(current_uri, _)| current_uri == &uri)
+                .and_then(|(_, version)| *version);
+            self.client
+                .publish_diagnostics(uri, diagnostics, version)
+                .await;
+        }
     }
 }
 
@@ -58,6 +76,12 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: None,
+                    },
+                })),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
@@ -138,7 +162,7 @@ impl LanguageServer for Backend {
         let text = if let Some(text) = params.text {
             Some(text)
         } else {
-            self.documents
+            self.workspace
                 .read()
                 .await
                 .get(&params.text_document.uri)
@@ -149,33 +173,27 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_change_watched_files(&self, _: DidChangeWatchedFilesParams) {
-        let snapshots = self
-            .documents
-            .read()
-            .await
-            .iter()
-            .map(|(uri, document)| (uri.clone(), document.text().to_owned()))
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let paths = params
+            .changes
+            .into_iter()
+            .filter_map(|change| change.uri.to_file_path().ok())
             .collect::<Vec<_>>();
-        for (uri, text) in snapshots {
-            self.publish(uri, text, None).await;
-        }
+        let affected = self.workspace.write().await.refresh_paths(&paths);
+        self.publish_updates(affected, None).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents
-            .write()
-            .await
-            .remove(&params.text_document.uri);
-        self.client
-            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
-            .await;
+        let uri = params.text_document.uri;
+        let affected = self.workspace.write().await.close(&uri);
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        self.publish_updates(affected, None).await;
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<tower_lsp::lsp_types::Hover>> {
         let text_document = params.text_document_position_params;
         Ok(self
-            .documents
+            .workspace
             .read()
             .await
             .get(&text_document.text_document.uri)
@@ -188,7 +206,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let text_document = params.text_document_position_params;
         Ok(self
-            .documents
+            .workspace
             .read()
             .await
             .get(&text_document.text_document.uri)
@@ -196,12 +214,34 @@ impl LanguageServer for Backend {
             .map(GotoDefinitionResponse::Scalar))
     }
 
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        Ok(self
+            .workspace
+            .read()
+            .await
+            .get(&params.text_document.uri)
+            .and_then(|document| document.prepare_rename(params.position)))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let text_document = params.text_document_position;
+        Ok(self
+            .workspace
+            .read()
+            .await
+            .get(&text_document.text_document.uri)
+            .and_then(|document| document.rename(text_document.position, &params.new_name)))
+    }
+
     async fn document_symbol(
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         Ok(self
-            .documents
+            .workspace
             .read()
             .await
             .get(&params.text_document.uri)
@@ -210,7 +250,7 @@ impl LanguageServer for Backend {
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         Ok(self
-            .documents
+            .workspace
             .read()
             .await
             .get(&params.text_document_position.text_document.uri)
@@ -222,7 +262,7 @@ impl LanguageServer for Backend {
         params: CodeActionParams,
     ) -> Result<Option<tower_lsp::lsp_types::CodeActionResponse>> {
         Ok(self
-            .documents
+            .workspace
             .read()
             .await
             .get(&params.text_document.uri)
@@ -234,7 +274,7 @@ impl LanguageServer for Backend {
         params: InlayHintParams,
     ) -> Result<Option<Vec<tower_lsp::lsp_types::InlayHint>>> {
         Ok(self
-            .documents
+            .workspace
             .read()
             .await
             .get(&params.text_document.uri)
@@ -246,11 +286,11 @@ impl LanguageServer for Backend {
         params: tower_lsp::lsp_types::CodeLensParams,
     ) -> Result<Option<Vec<tower_lsp::lsp_types::CodeLens>>> {
         Ok(self
-            .documents
+            .workspace
             .read()
             .await
             .get(&params.text_document.uri)
-            .map(Document::code_lenses))
+            .map(reimer_lsp::Document::code_lenses))
     }
 }
 

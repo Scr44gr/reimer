@@ -114,7 +114,8 @@ startup runtime and LLD is the next backend increment.
 
 `editors/vscode` contains TextMate highlighting and an extension connected to
 `reimer-lsp`. The server publishes diagnostics, inferred types, hover,
-completion, definitions, import organization, quick fixes for typos and
+completion, definitions, compiler-linked rename, dependency-aware analysis of
+unsaved open modules, import organization, quick fixes for typos and
 antipatterns, and static allocator reservation estimates. Installation and
 packaging are described in
 [`editors/vscode/README.md`](editors/vscode/README.md).
