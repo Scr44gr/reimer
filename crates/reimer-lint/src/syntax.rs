@@ -295,6 +295,14 @@ impl Visitor for FunctionLinter<'_, '_> {
                 }
             }
             Expression::Binary(binary) => self.lint_boolean_comparison(binary),
+            Expression::Match(matching) => {
+                if let Expression::Path(path) = &matching.scrutinee
+                    && path.segments.len() == 1
+                    && let Some(name) = path.segments.first()
+                {
+                    self.transferred.insert(name.name.clone());
+                }
+            }
             Expression::Unsafe(block) if block.statements.is_empty() && block.tail.is_none() => {
                 self.findings.push(Finding {
                     code: "L2004".to_owned(),
@@ -628,6 +636,44 @@ mod tests {
         let findings = lint(source, &syntax);
 
         assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_treat_match_scrutinee_as_ownership_transfer() {
+        let source = "
+            fn main() -> i32 {
+                let allocation = allocate_bytes(&allocator, 64);
+                let bytes = match allocation {
+                    Ok(value) => value,
+                    Err(_) => { return 1; },
+                };
+                defer bytes.deinit();
+                0
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_keep_resource_warning_for_borrowed_match_scrutinee() {
+        let source = "
+            fn main() -> i32 {
+                let allocation = allocate_bytes(&allocator, 64);
+                match &allocation { _ => () }
+                0
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(findings.iter().any(|finding| finding.code == "L2010"));
     }
 
     #[test]
