@@ -1,0 +1,10 @@
+format = 1
+
+[[package]]
+id = "505790b50185d3bff7cf2deb"
+name = "vulkan"
+version = "1.4.357"
+source = "path+."
+checksum = "4df3a42d760d1910d8b0dafabb70543543f9e0e4934695f8d746864785033c89"
+dependencies = []
+

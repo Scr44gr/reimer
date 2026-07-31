@@ -1,0 +1,17 @@
+import self::raw;
+
+@link("vulkan-1")
+extern "C" {
+    fn vkGetInstanceProcAddr(
+        instance: raw::Instance,
+        name: cstr,
+    ) -> *const u8;
+}
+
+/// Resolves a command through the Windows Vulkan loader.
+pub fn get_instance_proc_addr(
+    instance: raw::Instance,
+    name: cstr,
+) -> *const u8 {
+    unsafe { vkGetInstanceProcAddr(instance, name) }
+}

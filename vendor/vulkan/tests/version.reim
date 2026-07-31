@@ -1,0 +1,16 @@
+from self::facade import Version;
+import self::raw;
+
+fn main() -> i32 {
+    let version = Version::new(1, 4, 357);
+    if version.major() != 1 || version.minor() != 4 || version.patch() != 357 {
+        return 1;
+    }
+    if version.raw() != raw::API_VERSION_1_4 + 357 {
+        return 2;
+    }
+    if raw::CORE_FUNCTION_COUNT < 200 {
+        return 3;
+    }
+    0
+}

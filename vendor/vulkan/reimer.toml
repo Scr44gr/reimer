@@ -1,0 +1,12 @@
+[package]
+name = "vulkan"
+version = "1.4.357"
+edition = "2026"
+
+[dependencies]
+
+[profile.debug]
+optimization = 0
+
+[profile.release]
+optimization = 3

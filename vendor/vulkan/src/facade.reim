@@ -1,0 +1,186 @@
+import std::c;
+
+import self::raw;
+
+/// A packed Vulkan API version.
+@derive(Copy, Clone, Debug, Eq)
+pub struct Version {
+    packed: u32,
+}
+
+impl Version {
+    /// Packs a Vulkan API version with variant zero.
+    pub fn new(major: u32, minor: u32, patch: u32) -> Version {
+        Version {
+            packed: (major << 22) | (minor << 12) | patch,
+        }
+    }
+
+    /// Creates a version from its Vulkan representation.
+    pub fn from_raw(packed: u32) -> Version {
+        Version { packed: packed }
+    }
+
+    /// Returns the Vulkan representation.
+    pub fn raw(&self) -> u32 {
+        self.packed
+    }
+
+    /// Returns the major component.
+    pub fn major(&self) -> u32 {
+        (self.packed >> 22) & 0x7f
+    }
+
+    /// Returns the minor component.
+    pub fn minor(&self) -> u32 {
+        (self.packed >> 12) & 0x3ff
+    }
+
+    /// Returns the patch component.
+    pub fn patch(&self) -> u32 {
+        self.packed & 0xfff
+    }
+}
+
+/// Errors produced by the checked bootstrap facade.
+@derive(Copy, Clone, Debug, Eq)
+pub enum Error {
+    FunctionUnavailable,
+    OutOfHostMemory,
+    OutOfDeviceMemory,
+    InitializationFailed,
+    LayerNotPresent,
+    ExtensionNotPresent,
+    IncompatibleDriver,
+    Unknown(i32),
+}
+
+/// Global Vulkan commands resolved from a platform loader.
+pub struct Loader {
+    resolve: raw::GetInstanceProcAddr,
+    functions: raw::GlobalFunctions,
+}
+
+impl Loader {
+    /// Resolves the global Vulkan command table.
+    ///
+    /// `resolve` must implement the `vkGetInstanceProcAddr` contract.
+    pub fn load(resolve: raw::GetInstanceProcAddr) -> Loader {
+        Loader {
+            resolve: resolve,
+            functions: raw::GlobalFunctions::load(resolve),
+        }
+    }
+
+    /// Creates an instance without layers or extensions.
+    pub fn create_instance(
+        &self,
+        application_name: cstr,
+        application_version: Version,
+        engine_name: cstr,
+        engine_version: Version,
+        api_version: Version,
+    ) -> Result<Instance, Error> {
+        let application = raw::ApplicationInfo {
+            structure_type: raw::VK_STRUCTURE_TYPE_APPLICATION_INFO,
+            next: c::null_const<()>(),
+            application_name: application_name,
+            application_version: application_version.raw(),
+            engine_name: engine_name,
+            engine_version: engine_version.raw(),
+            api_version: api_version.raw(),
+        };
+        let create_info = raw::InstanceCreateInfo {
+            structure_type: raw::VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            next: c::null_const<()>(),
+            flags: 0,
+            application_info: &application as *const raw::ApplicationInfo,
+            enabled_layer_count: 0,
+            enabled_layer_names: c::null_const<*const u8>(),
+            enabled_extension_count: 0,
+            enabled_extension_names: c::null_const<*const u8>(),
+        };
+        let mut handle: raw::Instance = c::null<()>();
+        let create = match self.functions.vkCreateInstance {
+            Some(call) => call,
+            None => {
+                return Err(Error::FunctionUnavailable);
+            },
+        };
+        let result = create(
+            &create_info as *const raw::InstanceCreateInfo,
+            c::null_const<raw::AllocationCallbacks>(),
+            &mut handle as *mut raw::Instance,
+        );
+        if result != raw::VK_SUCCESS {
+            return Err(error_from_result(result));
+        }
+        Ok(Instance {
+            handle: handle,
+            functions: raw::InstanceFunctions::load(handle, self.resolve),
+        })
+    }
+}
+
+/// An owning Vulkan instance and its dispatch table.
+pub struct Instance {
+    handle: raw::Instance,
+    functions: raw::InstanceFunctions,
+}
+
+impl Instance {
+    /// Returns the number of physical devices visible to this instance.
+    pub fn physical_device_count(&self) -> Result<u32, Error> {
+        let enumerate = match self.functions.vkEnumeratePhysicalDevices {
+            Some(call) => call,
+            None => {
+                return Err(Error::FunctionUnavailable);
+            },
+        };
+        let mut count: u32 = 0;
+        let result = enumerate(
+            self.handle,
+            &mut count as *mut u32,
+            c::null<raw::PhysicalDevice>(),
+        );
+        if result == raw::VK_SUCCESS {
+            Ok(count)
+        } else {
+            Err(error_from_result(result))
+        }
+    }
+
+    /// Returns the non-owning raw instance handle.
+    pub fn raw(&self) -> raw::Instance {
+        self.handle
+    }
+
+    /// Destroys the instance. Objects created from it must already be closed.
+    pub fn close(self) {
+        match self.functions.vkDestroyInstance {
+            Some(destroy) => destroy(
+                self.handle,
+                c::null_const<raw::AllocationCallbacks>(),
+            ),
+            None => (),
+        }
+    }
+}
+
+fn error_from_result(result: raw::ResultCode) -> Error {
+    if result == raw::VK_ERROR_OUT_OF_HOST_MEMORY {
+        Error::OutOfHostMemory
+    } else if result == raw::VK_ERROR_OUT_OF_DEVICE_MEMORY {
+        Error::OutOfDeviceMemory
+    } else if result == raw::VK_ERROR_INITIALIZATION_FAILED {
+        Error::InitializationFailed
+    } else if result == raw::VK_ERROR_LAYER_NOT_PRESENT {
+        Error::LayerNotPresent
+    } else if result == raw::VK_ERROR_EXTENSION_NOT_PRESENT {
+        Error::ExtensionNotPresent
+    } else if result == raw::VK_ERROR_INCOMPATIBLE_DRIVER {
+        Error::IncompatibleDriver
+    } else {
+        Error::Unknown(result)
+    }
+}
