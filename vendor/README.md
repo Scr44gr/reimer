@@ -10,5 +10,9 @@ private whenever a safe, focused facade can represent the supported API.
 
 Available packages:
 
+- [`opengl`](opengl/README.md): generated OpenGL 4.6 core constants,
+  signatures, context-local dispatch, and a Windows WGL resolver.
 - [`sdl3`](sdl3/README.md): SDL3 windows, input, software frame buffers, and
   presentation for Windows x64.
+- [`vulkan`](vulkan/README.md): generated Vulkan 1.4 core constants, typed
+  global/instance/device dispatch, and extension-free instance bootstrap.
