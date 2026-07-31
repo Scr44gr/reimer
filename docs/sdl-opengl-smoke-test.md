@@ -1,16 +1,23 @@
-# SDL3 and OpenGL smoke test
+# SDL3, OpenGL, and tensor integration test
 
-`examples/m5_sdl_opengl.reim` validates the smallest native graphics path:
+`examples/m5_sdl_opengl.reim` validates the first complete native graphics
+path from LDD section 22.1:
 
-1. initialize the SDL3 video subsystem;
-2. create a window flagged for OpenGL;
-3. create and activate the associated OpenGL context;
-4. clear the framebuffer to blue;
-5. swap buffers and keep the window visible for 1.2 seconds;
-6. destroy the context before the window and stop SDL through `defer`.
+1. obtain the general allocator and create an allocator-backed
+   `tensor<f32, 2>`;
+2. store the RGBA clear color in that tensor and register its cleanup with
+   `defer`;
+3. initialize the SDL3 video subsystem;
+4. create a window flagged for OpenGL and activate its context;
+5. pass tensor elements to OpenGL, clear the framebuffer, and swap buffers;
+6. propagate allocation, initialization, and presentation failures through
+   `Result`;
+7. destroy the context before the window, stop SDL, and release the tensor
+   through LIFO `defer` actions.
 
 The example's public API is safe. `unsafe` blocks are limited to FFI calls and
-use opaque handles returned by SDL.
+use opaque handles returned by SDL. Tensor allocation, indexing, borrowing,
+and cleanup remain safe source-language operations.
 
 ## Run on Windows x64
 

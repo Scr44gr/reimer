@@ -1,7 +1,11 @@
+from std::alloc import general_allocator;
+from std::tensor import tensor;
+
 pub enum GraphicsError {
     InitializationFailed,
     WindowCreationFailed,
     ContextCreationFailed,
+    ColorAllocationFailed,
     FramePresentationFailed,
 }
 
@@ -71,10 +75,16 @@ pub fn open_graphics(
 }
 
 impl Graphics {
-    pub fn draw_frame(&self) -> Result<(), GraphicsError> {
+    pub fn draw_frame(
+        &self,
+        red: f32,
+        green: f32,
+        blue: f32,
+        alpha: f32,
+    ) -> Result<(), GraphicsError> {
         let color_buffer: u32 = 16384;
         unsafe {
-            glClearColor(0.08, 0.20, 0.38, 1.0);
+            glClearColor(red, green, blue, alpha);
             glClear(color_buffer);
         }
 
@@ -101,9 +111,29 @@ impl Graphics {
 }
 
 fn run() -> Result<i32, GraphicsError> {
+    let allocator = general_allocator();
+    let color_shape: [usize; 2] = [1, 4];
+    let mut clear_color: tensor<f32, 2> =
+        match tensor::zeros(&allocator, color_shape) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(GraphicsError::ColorAllocationFailed);
+            },
+        };
+    defer clear_color.deinit();
+    clear_color[0, 0] = 0.08;
+    clear_color[0, 1] = 0.20;
+    clear_color[0, 2] = 0.38;
+    clear_color[0, 3] = 1.0;
+
     let graphics = open_graphics(800, 450, c"SDL3 + OpenGL")?;
     defer graphics.close();
-    graphics.draw_frame()?;
+    graphics.draw_frame(
+        clear_color[0, 0],
+        clear_color[0, 1],
+        clear_color[0, 2],
+        clear_color[0, 3],
+    )?;
     graphics.show_for(1200);
 
     Ok(42)

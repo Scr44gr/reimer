@@ -605,6 +605,16 @@ mod tests {
     }
 
     #[test]
+    fn compile_file_should_emit_the_integrated_graphics_demo_object() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m5_sdl_opengl.reim");
+
+        let object =
+            compile_file_to_object(&path).expect("integrated graphics demo should compile");
+
+        assert!(!object.is_empty());
+    }
+
+    #[test]
     fn execute_file_should_complete_m6_method_dispatch() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/m6_methods.reim");
 
