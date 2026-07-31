@@ -30,6 +30,14 @@ fn main() -> ExitCode {
 
 fn run(arguments: Vec<OsString>) -> Result<(), String> {
     match Invocation::parse(arguments)? {
+        Invocation::Help => {
+            println!("{}", usage());
+            Ok(())
+        }
+        Invocation::Version => {
+            println!("reimer {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Invocation::New { path } => create_project(&path, CreationMode::New),
         Invocation::Init { path } => create_project(&path, CreationMode::Init),
         Invocation::Check(options) => check(&options),
@@ -896,6 +904,8 @@ enum CreationMode {
 
 #[derive(Debug)]
 enum Invocation {
+    Help,
+    Version,
     New {
         path: PathBuf,
     },
@@ -942,12 +952,14 @@ impl Invocation {
     fn parse(arguments: Vec<OsString>) -> Result<Self, String> {
         let mut arguments = arguments.into_iter();
         let Some(command) = arguments.next() else {
-            return Err(usage().to_owned());
+            return Ok(Self::Help);
         };
         let command = command
             .into_string()
             .map_err(|_| format!("command is not valid Unicode\n\n{}", usage()))?;
         match command.as_str() {
+            "help" | "-h" | "--help" => Ok(Self::Help),
+            "-V" | "--version" => Ok(Self::Version),
             "new" => Ok(Self::New {
                 path: parse_required_path(arguments, "destination")?,
             }),
@@ -1333,6 +1345,7 @@ fn next_string(
 
 fn usage() -> &'static str {
     "usage:\n  \
+     reimer [--help|--version]\n  \
      reimer new <path>\n  \
      reimer init [path]\n  \
      reimer check [path] [--locked|--refresh]\n  \
@@ -1355,6 +1368,22 @@ mod tests {
     use super::{
         AddSource, BuildProfile, Invocation, LockMode, dependency_section, insert_dependency,
     };
+
+    #[test]
+    fn invocation_should_parse_help_flag() {
+        let invocation =
+            Invocation::parse(vec![OsString::from("--help")]).expect("help flag should parse");
+
+        assert!(matches!(invocation, Invocation::Help));
+    }
+
+    #[test]
+    fn invocation_should_parse_version_flag() {
+        let invocation = Invocation::parse(vec![OsString::from("--version")])
+            .expect("version flag should parse");
+
+        assert!(matches!(invocation, Invocation::Version));
+    }
 
     #[test]
     fn invocation_should_parse_project_build_options() {
