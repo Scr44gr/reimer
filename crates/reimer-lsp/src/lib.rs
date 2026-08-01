@@ -2294,6 +2294,53 @@ mod tests {
     }
 
     #[test]
+    fn nested_package_modules_should_keep_their_real_module_identity() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "graphics/reimer.toml",
+            "[package]\nname = \"graphics\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+        );
+        fixture.write("graphics/src/package.reim", "pub import self::raw as raw;\n");
+        fixture.write(
+            "graphics/src/raw/package.reim",
+            "pub import self::types as types;\n\
+             pub import self::functions as functions;\n\
+             pub import self::dispatch as dispatch;\n",
+        );
+        let types_source = "import std::c;\n\
+                            pub type SDL_AsyncIOTaskType = c::Int;\n\
+                            @repr(C) pub struct Task { pub kind: SDL_AsyncIOTaskType }\n";
+        let types = fixture.write("graphics/src/raw/types.reim", types_source);
+        let functions_source = "import self::types as types;\n\
+                                @link(\"native\") extern \"C\" {\n\
+                                    pub fn submit(value: types::SDL_AsyncIOTaskType);\n\
+                                }\n";
+        let functions = fixture.write("graphics/src/raw/functions.reim", functions_source);
+        let dispatch_source = "pub fn load(address: usize) -> fn(i32) -> i32 {\n\
+                                    unsafe { address as fn(i32) -> i32 }\n\
+                               }\n";
+        let dispatch = fixture.write("graphics/src/raw/dispatch.reim", dispatch_source);
+
+        for (path, source) in [
+            (types, types_source),
+            (functions, functions_source),
+            (dispatch, dispatch_source),
+        ] {
+            let document = Document::new(
+                Url::from_file_path(path).expect("file URL should be created"),
+                source.to_owned(),
+            );
+            let errors = document
+                .diagnostics()
+                .into_iter()
+                .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|diagnostic| diagnostic.message)
+                .collect::<Vec<_>>();
+            assert!(errors.is_empty(), "unexpected diagnostics: {errors:#?}");
+        }
+    }
+
+    #[test]
     fn document_should_show_documentation_for_imported_function_calls() {
         let fixture = Fixture::new();
         fixture.write(

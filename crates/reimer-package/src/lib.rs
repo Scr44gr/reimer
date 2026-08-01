@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use reimer_ast::{
     self as ast, Expression, ImportKind, Item, Pattern, Statement, TypeName, TypeNameKind,
@@ -309,6 +309,7 @@ pub fn load_graph_with_overlays(
 
 struct Loader {
     root_package: String,
+    root_module: ModuleName,
     packages: HashMap<String, SourcePackage>,
     overlays: HashMap<PathBuf, String>,
     modules: Vec<Module>,
@@ -334,6 +335,7 @@ impl Loader {
         };
         Self {
             root_package: root_package.clone(),
+            root_module: Vec::new(),
             packages: HashMap::from([(root_package, package)]),
             overlays: HashMap::new(),
             modules: Vec::new(),
@@ -388,6 +390,7 @@ impl Loader {
         let root_entry = root.entry.clone();
         Ok(Self {
             root_package: graph.root.clone(),
+            root_module: Vec::new(),
             packages,
             overlays: HashMap::new(),
             modules: Vec::new(),
@@ -401,6 +404,7 @@ impl Loader {
 
     fn with_root_entry(mut self, entry: PathBuf) -> Self {
         if let Some(root) = self.packages.get_mut(&self.root_package) {
+            self.root_module = entry_module_name(&root.source_root, &entry);
             root.entry = entry;
         }
         self
@@ -421,7 +425,8 @@ impl Loader {
             || PathBuf::from("src/main.reim"),
             |package| package.entry.clone(),
         );
-        self.load_module(&Vec::new(), entry, None);
+        let root_module = self.root_module.clone();
+        self.load_module(&root_module, entry, None);
         if self.diagnostics.is_empty() {
             self.validate_cycles();
         }
@@ -2161,6 +2166,33 @@ fn installed_standard_library_root(executable: &Path) -> Option<PathBuf> {
 
 fn is_facade_path(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("package.reim")
+}
+
+fn entry_module_name(source_root: &Path, entry: &Path) -> ModuleName {
+    let Ok(relative) = entry.strip_prefix(source_root) else {
+        return Vec::new();
+    };
+    let mut segments = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => segment.to_str().map(str::to_owned),
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(file) = segments.pop() else {
+        return Vec::new();
+    };
+    let stem = Path::new(&file)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !matches!(stem, "main" | "package") {
+        segments.push(stem.to_owned());
+    }
+    segments
 }
 
 fn canonical_name(module: &ModuleName, local: &str) -> String {

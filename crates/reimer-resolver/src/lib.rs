@@ -3102,6 +3102,8 @@ impl Resolver {
     }
 
     fn collect_type_aliases(&mut self, program: &ast::Program) {
+        let mut pending = Vec::new();
+        let mut seen = BTreeSet::new();
         for item in &program.items {
             let Item::TypeAlias(declaration) = item else {
                 continue;
@@ -3110,6 +3112,7 @@ impl Resolver {
             if primitive_type(name).is_some()
                 || self.types.names.contains_key(name)
                 || self.types.generic_templates.contains_key(name)
+                || !seen.insert(name.to_owned())
             {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -3121,13 +3124,35 @@ impl Resolver {
                 );
                 continue;
             }
-            let Some(target) = self
-                .types
-                .resolve_type_name(&declaration.target, &mut self.diagnostics)
-            else {
-                continue;
-            };
-            self.types.names.insert(name.to_owned(), target);
+            pending.push(declaration);
+        }
+
+        while !pending.is_empty() {
+            let mut unresolved = Vec::new();
+            let mut progress = false;
+            for declaration in pending {
+                let mut attempt_diagnostics = Vec::new();
+                if let Some(target) = self
+                    .types
+                    .resolve_type_name(&declaration.target, &mut attempt_diagnostics)
+                {
+                    self.types
+                        .names
+                        .insert(declaration.name.name.clone(), target);
+                    progress = true;
+                } else {
+                    unresolved.push(declaration);
+                }
+            }
+            if !progress {
+                for declaration in unresolved {
+                    let _ = self
+                        .types
+                        .resolve_type_name(&declaration.target, &mut self.diagnostics);
+                }
+                break;
+            }
+            pending = unresolved;
         }
     }
 
@@ -12573,6 +12598,26 @@ mod tests {
         let program = resolve_fixture(source).expect("fixture should resolve");
 
         assert_eq!(program.extern_functions.len(), 1);
+    }
+
+    #[test]
+    fn resolve_should_allow_type_aliases_to_reference_later_aliases() {
+        let source = "
+            pub type TaskKind = NativeInt;
+            @repr(C) pub struct Task { pub kind: TaskKind }
+            pub type NativeInt = c_int;
+            fn main() -> i32 { 42 }";
+
+        let program = resolve_fixture(source).expect("fixture should resolve");
+        let task = program
+            .types
+            .iter()
+            .find(|definition| definition.name.as_deref() == Some("Task"))
+            .expect("task type should exist");
+        let reimer_hir::TypeDefinitionKind::Struct { fields } = &task.kind else {
+            panic!("task should remain a struct");
+        };
+        assert_eq!(fields[0].ty, Type::I32);
     }
 
     #[test]
