@@ -64,6 +64,11 @@ impl GlContext {
         self.raw
     }
 
+    /// Returns the SDL window borrowed by this OpenGL context.
+    pub fn window(&self) -> &Window {
+        self.window
+    }
+
     /// Destroys the context and releases its borrow of the window.
     pub fn deinit(self) -> Result<(), GlError> {
         if unsafe { sdl::SDL_GL_DestroyContext(self.raw) } {

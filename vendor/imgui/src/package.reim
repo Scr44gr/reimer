@@ -1,0 +1,4 @@
+/// Safe Dear ImGui context and SDL3/OpenGL3 backend lifecycle.
+pub from self::facade import Error, FrameError, SdlOpenGl;
+/// Complete generated Dear ImGui C ABI and backend declarations.
+pub import self::raw as raw;

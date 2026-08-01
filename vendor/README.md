@@ -10,6 +10,8 @@ private whenever a safe, focused facade can represent the supported API.
 
 Available packages:
 
+- [`imgui`](imgui/README.md): generated Dear ImGui 1.92.8 C ABI plus a safe
+  SDL3/OpenGL3 context and frame lifecycle for Windows x64.
 - [`opengl`](opengl/README.md): generated OpenGL 4.6 core constants,
   signatures, context-local dispatch, and a Windows WGL resolver.
 - [`sdl3`](sdl3/README.md): generated SDL 3.4.12 ABI bindings and clean safe

@@ -15,6 +15,7 @@ members = [
     "crates/reimer-resolver",
     "crates/reimer-runtime",
     "crates/reimer-types",
+    "tools/imgui-api-gen",
     "tools/sdl-api-gen",
 ]
 resolver = "3"
