@@ -4442,7 +4442,7 @@ impl<'context> FunctionAnalyzer<'context> {
         match expression {
             AstExpression::Match(expression) => {
                 for arm in &expression.arms {
-                    if !scoped_return_is_empty(&arm.body) {
+                    if !self.scoped_return_is_empty(&arm.body) {
                         self.validate_scoped_return(&arm.body, arm.span);
                     }
                 }
@@ -4450,12 +4450,12 @@ impl<'context> FunctionAnalyzer<'context> {
             }
             AstExpression::If(expression) => {
                 if let Some(tail) = expression.then_branch.tail.as_deref()
-                    && !scoped_return_is_empty(tail)
+                    && !self.scoped_return_is_empty(tail)
                 {
                     self.validate_scoped_return(tail, tail.span());
                 }
                 if let Some(else_branch) = expression.else_branch.as_ref()
-                    && !scoped_return_is_empty(else_branch)
+                    && !self.scoped_return_is_empty(else_branch)
                 {
                     self.validate_scoped_return(else_branch, else_branch.span());
                 }
@@ -4463,13 +4463,13 @@ impl<'context> FunctionAnalyzer<'context> {
             }
             AstExpression::Block(block) => {
                 if let Some(tail) = block.tail.as_deref()
-                    && !scoped_return_is_empty(tail)
+                    && !self.scoped_return_is_empty(tail)
                 {
                     self.validate_scoped_return(tail, tail.span());
                 }
                 return;
             }
-            _ if scoped_return_is_empty(expression) => return,
+            _ if self.scoped_return_is_empty(expression) => return,
             _ => {}
         }
         let rooted_in_static = scoped_return_root(expression)
@@ -4521,6 +4521,32 @@ impl<'context> FunctionAnalyzer<'context> {
                 )
                 .with_help("return data rooted in the first scoped parameter or return owned data"),
             );
+        }
+    }
+
+    fn scoped_return_is_empty(&self, expression: &AstExpression) -> bool {
+        if matches!(expression, AstExpression::Path(path) if single_path_name(path) == Some("None"))
+        {
+            return true;
+        }
+        let AstExpression::Call(call) = expression else {
+            return false;
+        };
+        let AstExpression::Path(path) = &call.callee else {
+            return false;
+        };
+        match (
+            single_path_name(path),
+            self.types.intrinsic(self.signature.return_type),
+        ) {
+            (Some("Some"), Some(IntrinsicType::Option { value })) => !self.types.is_scoped(value),
+            (Some("Ok"), Some(IntrinsicType::Result { success, .. })) => {
+                !self.types.is_scoped(success)
+            }
+            (Some("Err"), Some(IntrinsicType::Result { error, .. })) => {
+                !self.types.is_scoped(error)
+            }
+            _ => false,
         }
     }
 
@@ -11465,11 +11491,18 @@ fn scoped_return_root(expression: &AstExpression) -> Option<&ast::Path> {
             view_source_root_path(&unary.operand)
         }
         AstExpression::Path(path) => Some(path),
+        AstExpression::Field(field) => view_source_root_path(&field.base),
+        AstExpression::Index(index) => view_source_root_path(&index.base),
         AstExpression::Call(call) => match &call.callee {
             AstExpression::Field(field) => view_source_root_path(&field.base),
-            AstExpression::Path(_) => call.arguments.first().and_then(view_source_root_path),
+            AstExpression::Path(_) => call.arguments.first().and_then(scoped_return_root),
             _ => None,
         },
+        AstExpression::Cast(cast) => scoped_return_root(&cast.value),
+        AstExpression::Unsafe(block) | AstExpression::Block(block) => {
+            block.tail.as_deref().and_then(scoped_return_root)
+        }
+        AstExpression::Try { value, .. } => scoped_return_root(value),
         AstExpression::Struct(structure) => structure
             .fields
             .iter()
@@ -11478,13 +11511,6 @@ fn scoped_return_root(expression: &AstExpression) -> Option<&ast::Path> {
         AstExpression::Array(array) => array.elements.iter().find_map(scoped_return_root),
         _ => None,
     }
-}
-
-fn scoped_return_is_empty(expression: &AstExpression) -> bool {
-    matches!(
-        expression,
-        AstExpression::Path(path) if single_path_name(path) == Some("None")
-    )
 }
 
 fn initializer_stores_borrow(expression: &AstExpression) -> bool {
@@ -12771,6 +12797,25 @@ mod tests {
             fn main() -> i32 { 42 }";
 
         resolve_fixture(source).expect("unsafe raw pointer cast should resolve");
+    }
+
+    #[test]
+    fn scoped_return_should_follow_owner_through_raw_pointer_casts() {
+        let source = "
+            struct Text { data: *const c_char }
+            impl Text {
+                fn as_cstr(&self) -> cstr { self.data as cstr }
+            }
+            extern \"C\" fn native_title(owner: *const u8) -> *const c_char;
+            struct Window { raw: *const u8 }
+            impl Window {
+                fn title(&self) -> cstr {
+                    unsafe { native_title(self.raw) } as cstr
+                }
+            }
+            fn main() -> i32 { 42 }";
+
+        resolve_fixture(source).expect("returned views should remain rooted in their owner");
     }
 
     #[test]
