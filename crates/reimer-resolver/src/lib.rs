@@ -10056,10 +10056,12 @@ impl<'context> FunctionAnalyzer<'context> {
             );
         }
         if value.ty != Type::Never && !is_valid_cast(value.ty, target) {
+            let source_name = self.types.reflection_type_name(value.ty);
+            let target_name = self.types.reflection_type_name(target);
             self.diagnostics.push(
                 Diagnostic::error(
                     "E3113",
-                    format!("cannot cast `{}` to `{target}`", value.ty),
+                    format!("cannot cast `{source_name}` to `{target_name}`"),
                     cast.span,
                 )
                 .with_help(
@@ -12757,6 +12759,35 @@ mod tests {
             }";
 
         resolve_fixture(source).expect("unsafe function cast should resolve");
+    }
+
+    #[test]
+    fn resolve_should_accept_unsafe_raw_pointer_to_function_casts() {
+        let source = "
+            type Callback = fn(i32) -> i32;
+            fn load(address: *const u8) -> Callback {
+                unsafe { address as Callback }
+            }
+            fn main() -> i32 { 42 }";
+
+        resolve_fixture(source).expect("unsafe raw pointer cast should resolve");
+    }
+
+    #[test]
+    fn invalid_cast_diagnostic_should_render_structural_type_names() {
+        let source = "
+            fn main() -> i32 {
+                let callback = unsafe { true as fn(i32) -> i32 };
+                callback(41)
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "E3113")
+            .expect("invalid cast diagnostic should be emitted");
+
+        assert_eq!(diagnostic.message, "cannot cast `bool` to `fn(i32) -> i32`");
     }
 
     #[test]

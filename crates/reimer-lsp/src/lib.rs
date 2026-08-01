@@ -2300,7 +2300,10 @@ mod tests {
             "graphics/reimer.toml",
             "[package]\nname = \"graphics\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
         );
-        fixture.write("graphics/src/package.reim", "pub import self::raw as raw;\n");
+        fixture.write(
+            "graphics/src/package.reim",
+            "pub import self::raw as raw;\n",
+        );
         fixture.write(
             "graphics/src/raw/package.reim",
             "pub import self::types as types;\n\
@@ -2316,8 +2319,9 @@ mod tests {
                                     pub fn submit(value: types::SDL_AsyncIOTaskType);\n\
                                 }\n";
         let functions = fixture.write("graphics/src/raw/functions.reim", functions_source);
-        let dispatch_source = "pub fn load(address: usize) -> fn(i32) -> i32 {\n\
-                                    unsafe { address as fn(i32) -> i32 }\n\
+        let dispatch_source = "pub type Callback = fn(i32) -> i32;\n\
+                               pub fn load(address: *const u8) -> Callback {\n\
+                                    unsafe { address as Callback }\n\
                                }\n";
         let dispatch = fixture.write("graphics/src/raw/dispatch.reim", dispatch_source);
 
