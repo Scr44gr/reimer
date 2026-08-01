@@ -1,5 +1,7 @@
 //! Cranelift object generation and host JIT execution for typed Reimer HIR.
 
+mod c_abi;
+
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -7,8 +9,8 @@ use std::fmt::Write as _;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::{
-    self, AbiParam, BlockArg, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, TrapCode,
-    Value, types,
+    self, AbiParam, ArgumentPurpose, BlockArg, InstBuilder, MemFlagsData, StackSlotData,
+    StackSlotKind, TrapCode, Value, types,
 };
 use cranelift_codegen::isa::{OwnedTargetIsa, TargetFrontendConfig};
 use cranelift_codegen::settings;
@@ -28,6 +30,8 @@ use reimer_hir::{
 use reimer_layout::{AggregateLayoutKind, Layouts};
 use reimer_runtime::Failure;
 use reimer_types::{Type, TypeId};
+
+use crate::c_abi::{FunctionAbi as ExternFunctionAbi, ParameterPassing, ReturnPassing};
 
 const ENTRY_SYMBOL: &str = "program_main";
 const BUILTIN_RUNTIME_LIBRARY: &str = "runtime";
@@ -212,6 +216,15 @@ fn execute_internal(
     optimization: OptimizationLevel,
     arguments: Option<Vec<OsString>>,
 ) -> Result<i32, Vec<Diagnostic>> {
+    execute_internal_with_symbols(program, optimization, arguments, &[])
+}
+
+fn execute_internal_with_symbols(
+    program: &Program,
+    optimization: OptimizationLevel,
+    arguments: Option<Vec<OsString>>,
+    additional_symbols: &[(&str, *const u8)],
+) -> Result<i32, Vec<Diagnostic>> {
     let flags = [
         ("enable_llvm_abi_extensions", "true"),
         ("opt_level", optimization.setting()),
@@ -219,6 +232,9 @@ fn execute_internal(
     let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
         .map_err(|error| backend_error(error.to_string()))?;
     register_runtime_symbols(&mut builder);
+    for (name, pointer) in additional_symbols {
+        builder.symbol((*name).to_owned(), *pointer);
+    }
     let libraries = NativeLibraries::load(program).map_err(backend_error)?;
     if !libraries.is_empty() {
         builder.symbol_lookup_fn(Box::new(move |name| libraries.lookup(name)));
@@ -1021,20 +1037,20 @@ fn compile_program<M: Module>(
 ) -> Result<HashMap<FunctionId, FuncId>, String> {
     let layouts = Layouts::build(&program.types)?;
     let statics = declare_statics(module, program, &layouts)?;
-    let functions = declare_functions(module, program)?;
+    let declarations = declare_functions(module, program, &layouts)?;
     let thread_thunks = prepare_thread_thunks(module, program)?;
     for function in &program.functions {
         define_function(
             module,
             function,
-            &functions,
+            &declarations,
             &statics,
             &thread_thunks,
             &layouts,
             optimization.debug_assertions(),
         )?;
     }
-    Ok(functions)
+    Ok(declarations.functions)
 }
 
 fn declare_statics<M: Module>(
@@ -1328,19 +1344,33 @@ fn define_thread_thunk<M: Module>(
     Ok(())
 }
 
+struct FunctionDeclarations {
+    functions: HashMap<FunctionId, FuncId>,
+    extern_abis: HashMap<FunctionId, ExternFunctionAbi>,
+}
+
 fn declare_functions<M: Module>(
     module: &mut M,
     program: &Program,
-) -> Result<HashMap<FunctionId, FuncId>, String> {
+    layouts: &Layouts,
+) -> Result<FunctionDeclarations, String> {
     let mut declarations =
         HashMap::with_capacity(program.functions.len() + program.extern_functions.len());
+    let mut extern_abis = HashMap::with_capacity(program.extern_functions.len());
 
     for function in &program.extern_functions {
-        let signature = extern_function_signature(module, function)?;
+        let abi = c_abi::classify_function(
+            function,
+            &program.types,
+            layouts,
+            &module.isa().triple().to_string(),
+        )?;
+        let signature = extern_function_signature(module, function, &abi)?;
         let id = module
             .declare_function(&function.symbol, Linkage::Import, &signature)
             .map_err(|error| error.to_string())?;
         declarations.insert(function.id, id);
+        extern_abis.insert(function.id, abi);
     }
 
     for function in &program.functions {
@@ -1356,25 +1386,42 @@ fn declare_functions<M: Module>(
             .map_err(|error| error.to_string())?;
         declarations.insert(function.id, id);
     }
-    Ok(declarations)
+    Ok(FunctionDeclarations {
+        functions: declarations,
+        extern_abis,
+    })
 }
 
 fn extern_function_signature<M: Module>(
     module: &M,
     function: &reimer_hir::ExternFunction,
+    abi: &ExternFunctionAbi,
 ) -> Result<ir::Signature, String> {
     let mut signature = module.make_signature();
-    for parameter in &function.parameters {
+    if matches!(abi.return_value, ReturnPassing::IndirectAggregate { .. }) {
+        signature.params.push(AbiParam::special(
+            pointer_type(),
+            ArgumentPurpose::StructReturn,
+        ));
+    }
+    for (parameter, passing) in function.parameters.iter().zip(&abi.parameters) {
         if parameter.ty.has_runtime_value() {
-            signature
-                .params
-                .push(AbiParam::new(runtime_type(parameter.ty)?));
+            let value_type = match passing {
+                ParameterPassing::Scalar => runtime_type(parameter.ty)?,
+                ParameterPassing::DirectAggregate(value_type) => *value_type,
+                ParameterPassing::IndirectAggregate { .. } => pointer_type(),
+            };
+            signature.params.push(AbiParam::new(value_type));
         }
     }
-    if function.return_type.has_runtime_value() {
-        signature
+    match abi.return_value {
+        ReturnPassing::Unit | ReturnPassing::IndirectAggregate { .. } => {}
+        ReturnPassing::Scalar => signature
             .returns
-            .push(AbiParam::new(runtime_type(function.return_type)?));
+            .push(AbiParam::new(runtime_type(function.return_type)?)),
+        ReturnPassing::DirectAggregate(value_type) => {
+            signature.returns.push(AbiParam::new(value_type));
+        }
     }
     Ok(signature)
 }
@@ -1833,13 +1880,14 @@ fn mangle_symbol_name(prefix: &str, name: &str) -> String {
 fn define_function<M: Module>(
     module: &mut M,
     function: &Function,
-    functions: &HashMap<FunctionId, FuncId>,
+    declarations: &FunctionDeclarations,
     statics: &HashMap<StaticId, DataId>,
     thread_thunks: &HashMap<ThreadThunkKey, FuncId>,
     layouts: &Layouts,
     debug_assertions: bool,
 ) -> Result<(), String> {
-    let function_id = functions
+    let function_id = declarations
+        .functions
         .get(&function.id)
         .copied()
         .ok_or_else(|| format!("function `{}` was not declared", function.name))?;
@@ -1867,6 +1915,7 @@ fn define_function<M: Module>(
         };
         let mut state = CodegenState::new(
             layouts,
+            &declarations.extern_abis,
             statics,
             thread_thunks,
             return_destination,
@@ -1890,7 +1939,13 @@ fn define_function<M: Module>(
             )?;
         }
 
-        let emitted = emit_block(&mut builder, module, functions, &mut state, &function.body)?;
+        let emitted = emit_block(
+            &mut builder,
+            module,
+            &declarations.functions,
+            &mut state,
+            &function.body,
+        )?;
         if !emitted.terminated {
             if function.return_type.is_composite() {
                 let source = require_value(emitted, "function body")?;
@@ -2113,6 +2168,7 @@ struct CodegenState<'layouts> {
     locals: HashMap<LocalId, LocalStorage>,
     loops: Vec<LoopTargets>,
     layouts: &'layouts Layouts,
+    extern_abis: &'layouts HashMap<FunctionId, ExternFunctionAbi>,
     statics: &'layouts HashMap<StaticId, DataId>,
     thread_thunks: &'layouts HashMap<ThreadThunkKey, FuncId>,
     return_destination: Option<Value>,
@@ -2130,6 +2186,7 @@ enum LocalStorage {
 impl<'layouts> CodegenState<'layouts> {
     fn new(
         layouts: &'layouts Layouts,
+        extern_abis: &'layouts HashMap<FunctionId, ExternFunctionAbi>,
         statics: &'layouts HashMap<StaticId, DataId>,
         thread_thunks: &'layouts HashMap<ThreadThunkKey, FuncId>,
         return_destination: Option<Value>,
@@ -2140,6 +2197,7 @@ impl<'layouts> CodegenState<'layouts> {
             locals: HashMap::new(),
             loops: Vec::new(),
             layouts,
+            extern_abis,
             statics,
             thread_thunks,
             return_destination,
@@ -5561,9 +5619,24 @@ fn allocate_composite(
     layouts: &Layouts,
     ty: Type,
 ) -> Result<Value, String> {
+    allocate_composite_with_minimum_alignment(builder, layouts, ty, 1)
+}
+
+fn allocate_composite_with_minimum_alignment(
+    builder: &mut FunctionBuilder<'_>,
+    layouts: &Layouts,
+    ty: Type,
+    minimum_alignment: u32,
+) -> Result<Value, String> {
     let layout = layouts.aggregate(ty)?.value;
     let size = layout.size.max(1);
-    let align_shift = u8::try_from(layout.align.trailing_zeros())
+    let alignment = layout.align.max(minimum_alignment);
+    if !alignment.is_power_of_two() {
+        return Err(format!(
+            "aggregate ABI alignment {alignment} is not a power of two"
+        ));
+    }
+    let align_shift = u8::try_from(alignment.trailing_zeros())
         .map_err(|_| "aggregate alignment exponent does not fit in u8".to_owned())?;
     let slot = builder.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
@@ -6608,7 +6681,19 @@ fn emit_call<M: Module>(
     arguments: &[Expression],
     return_type: Type,
 ) -> Result<Emitted, String> {
-    let function = functions
+    if let Some(abi) = state.extern_abis.get(&function).cloned() {
+        return emit_extern_call(
+            builder,
+            module,
+            functions,
+            state,
+            function,
+            arguments,
+            return_type,
+            &abi,
+        );
+    }
+    let declared_function = functions
         .get(&function)
         .copied()
         .ok_or_else(|| format!("called function {} was not declared", function.0))?;
@@ -6629,8 +6714,8 @@ fn emit_call<M: Module>(
             values.push(require_value(emitted, "call argument")?);
         }
     }
-    let function = module.declare_func_in_func(function, builder.func);
-    let call = builder.ins().call(function, &values);
+    let function_reference = module.declare_func_in_func(declared_function, builder.func);
+    let call = builder.ins().call(function_reference, &values);
     if let Some(destination) = return_destination {
         Ok(Emitted::value(destination))
     } else if return_type.has_runtime_value() {
@@ -6642,6 +6727,117 @@ fn emit_call<M: Module>(
         Ok(Emitted::value(value))
     } else {
         Ok(Emitted::unit())
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native call lowering needs the same explicit compiler context as ordinary calls"
+)]
+fn emit_extern_call<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    function: FunctionId,
+    arguments: &[Expression],
+    return_type: Type,
+    abi: &ExternFunctionAbi,
+) -> Result<Emitted, String> {
+    if arguments.len() != abi.parameters.len() {
+        return Err("external call ABI parameter count differs from typed HIR".to_owned());
+    }
+    let declared_function = functions
+        .get(&function)
+        .copied()
+        .ok_or_else(|| format!("called external function {} was not declared", function.0))?;
+    let mut values = Vec::with_capacity(
+        arguments.len()
+            + usize::from(matches!(
+                abi.return_value,
+                ReturnPassing::IndirectAggregate { .. }
+            )),
+    );
+    let return_destination = match abi.return_value {
+        ReturnPassing::DirectAggregate(_) => {
+            Some(allocate_composite(builder, state.layouts, return_type)?)
+        }
+        ReturnPassing::IndirectAggregate { minimum_alignment } => {
+            let destination = allocate_composite_with_minimum_alignment(
+                builder,
+                state.layouts,
+                return_type,
+                minimum_alignment,
+            )?;
+            values.push(destination);
+            Some(destination)
+        }
+        ReturnPassing::Unit | ReturnPassing::Scalar => None,
+    };
+    for (argument, passing) in arguments.iter().zip(&abi.parameters) {
+        let emitted = emit_expression(builder, module, functions, state, argument)?;
+        if emitted.terminated {
+            return Ok(emitted);
+        }
+        if !argument.ty.has_runtime_value() {
+            continue;
+        }
+        let value = require_value(emitted, "external call argument")?;
+        let abi_value = match passing {
+            ParameterPassing::Scalar => value,
+            ParameterPassing::DirectAggregate(value_type) => {
+                builder
+                    .ins()
+                    .load(*value_type, MemFlagsData::new(), value, 0)
+            }
+            ParameterPassing::IndirectAggregate { minimum_alignment } => {
+                let copy = allocate_composite_with_minimum_alignment(
+                    builder,
+                    state.layouts,
+                    argument.ty,
+                    *minimum_alignment,
+                )?;
+                copy_composite(
+                    builder,
+                    state.layouts,
+                    state.target_config,
+                    argument.ty,
+                    copy,
+                    value,
+                )?;
+                copy
+            }
+        };
+        values.push(abi_value);
+    }
+    let function_reference = module.declare_func_in_func(declared_function, builder.func);
+    let call = builder.ins().call(function_reference, &values);
+    match abi.return_value {
+        ReturnPassing::Unit => Ok(Emitted::unit()),
+        ReturnPassing::Scalar => {
+            let value = builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .ok_or_else(|| "value-returning external call has no result".to_owned())?;
+            Ok(Emitted::value(value))
+        }
+        ReturnPassing::DirectAggregate(_) => {
+            let destination = return_destination
+                .ok_or_else(|| "direct aggregate return destination is missing".to_owned())?;
+            let value = builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .ok_or_else(|| "aggregate-returning external call has no result".to_owned())?;
+            builder
+                .ins()
+                .store(MemFlagsData::new(), value, destination, 0);
+            Ok(Emitted::value(destination))
+        }
+        ReturnPassing::IndirectAggregate { .. } => return_destination
+            .map(Emitted::value)
+            .ok_or_else(|| "indirect aggregate return destination is missing".to_owned()),
     }
 }
 
@@ -7489,9 +7685,43 @@ mod tests {
     use reimer_resolver::resolve;
 
     use super::{
-        OptimizationLevel, emit_object, emit_object_with_options, execute, execute_test,
-        execute_with_options,
+        OptimizationLevel, emit_object, emit_object_with_options, execute,
+        execute_internal_with_symbols, execute_test, execute_with_options,
     };
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[repr(C)]
+    struct SmallRecord {
+        left: i32,
+        right: i32,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[repr(C)]
+    struct WideRecord {
+        left: u64,
+        right: u64,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    extern "C" fn make_small_record(left: i32, right: i32) -> SmallRecord {
+        SmallRecord { left, right }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    extern "C" fn sum_small_record(record: SmallRecord) -> i32 {
+        record.left + record.right
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    extern "C" fn make_wide_record(left: u64, right: u64) -> WideRecord {
+        WideRecord { left, right }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    extern "C" fn sum_wide_record(record: WideRecord) -> i32 {
+        i32::try_from(record.left + record.right).unwrap_or_default()
+    }
 
     fn compile_fixture(source: &str) -> reimer_hir::Program {
         let tokens = lex(source).expect("fixture should lex");
@@ -7695,6 +7925,42 @@ mod tests {
         let program = compile_fixture(&source);
 
         let result = execute(&program).expect("C string call should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    fn execute_should_follow_windows_c_aggregate_calling_conventions() {
+        let program = compile_fixture(
+            "@repr(C)
+             struct SmallRecord { left: i32, right: i32 }
+             @repr(C)
+             struct WideRecord { left: u64, right: u64 }
+             extern \"C\" {
+                 fn make_small_record(left: i32, right: i32) -> SmallRecord;
+                 fn sum_small_record(record: SmallRecord) -> i32;
+                 fn make_wide_record(left: u64, right: u64) -> WideRecord;
+                 fn sum_wide_record(record: WideRecord) -> i32;
+             }
+             fn main() -> i32 {
+                 let small = unsafe { make_small_record(20, 22) };
+                 let small_sum = unsafe { sum_small_record(small) };
+                 let wide = unsafe { make_wide_record(19, 23) };
+                 let wide_sum = unsafe { sum_wide_record(wide) };
+                 if small_sum == 42 && wide_sum == 42 { 42 } else { 0 }
+             }",
+        );
+        let symbols = [
+            ("make_small_record", make_small_record as *const u8),
+            ("sum_small_record", sum_small_record as *const u8),
+            ("make_wide_record", make_wide_record as *const u8),
+            ("sum_wide_record", sum_wide_record as *const u8),
+        ];
+
+        let result =
+            execute_internal_with_symbols(&program, OptimizationLevel::None, None, &symbols)
+                .expect("C aggregate fixture should execute");
 
         assert_eq!(result, 42);
     }

@@ -42,9 +42,14 @@ not own or validate the pointed-to memory. Constructing or checking the record
 is safe; dereferencing its pointer remains an `unsafe` operation governed by
 the original native API's lifetime and alignment contract.
 
-Pass these records through raw pointers in current bindings. By-value C
-aggregate argument classification is intentionally deferred until a supported
-binding requires and tests each platform ABI case.
+Windows x64 external declarations may also pass and return ABI-safe
+`@repr(C)` structs by value. Records of 1, 2, 4, or 8 bytes use the matching
+integer register representation; other records use caller-owned, 16-byte-aligned
+copies and structure-return storage. The backend tests both paths against real
+`extern "C"` functions, and the SDL package additionally exercises a 16-byte
+`SDL_GUID` round trip. Other native targets reject by-value aggregates during
+code generation until their C ABI classifiers are implemented; raw pointers
+remain portable across the currently supported targets.
 
 `int_from_bool` and `bool_from_int` convert conventional zero/nonzero integer
 booleans. Use `Bool` only when the C declaration specifically uses `_Bool` or

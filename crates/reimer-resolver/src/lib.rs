@@ -2415,8 +2415,68 @@ impl TypeRegistry {
         }
     }
 
+    fn is_ffi_safe_extern_value(&self, ty: Type) -> bool {
+        self.is_ffi_safe_type(ty) || self.is_ffi_safe_c_struct(ty)
+    }
+
+    fn is_ffi_safe_c_struct(&self, ty: Type) -> bool {
+        let Some(definition) = self.definition(ty) else {
+            return false;
+        };
+        let hir::TypeDefinitionKind::Struct { fields } = &definition.kind else {
+            return false;
+        };
+        definition.representation == hir::TypeRepresentation::C
+            && !fields.is_empty()
+            && fields
+                .iter()
+                .all(|field| self.is_ffi_safe_c_field(field.ty))
+    }
+
+    fn is_ffi_safe_c_field(&self, ty: Type) -> bool {
+        if self.is_ffi_safe_type(ty) {
+            return true;
+        }
+        match ty {
+            Type::Struct(_) => self.is_ffi_safe_c_struct(ty),
+            Type::Array(_) => self
+                .definition(ty)
+                .and_then(|definition| match &definition.kind {
+                    hir::TypeDefinitionKind::Array { element, .. } => Some(*element),
+                    _ => None,
+                })
+                .is_some_and(|element| self.is_ffi_safe_c_field(element)),
+            Type::I128
+            | Type::U128
+            | Type::Char
+            | Type::Enum(_)
+            | Type::Tuple(_)
+            | Type::Reference(_)
+            | Type::Slice(_)
+            | Type::Str
+            | Type::Unit
+            | Type::Never
+            | Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::Isize
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Usize
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::CStr
+            | Type::RawPointer(_)
+            | Type::Function(_) => false,
+        }
+    }
+
     fn is_ffi_safe_return_type(&self, ty: Type) -> bool {
-        ty == Type::Unit || self.is_ffi_safe_type(ty)
+        ty == Type::Unit || self.is_ffi_safe_extern_value(ty)
     }
 
     fn ffi_pointer_target(&self, ty: Type) -> Option<Type> {
@@ -3932,14 +3992,16 @@ impl Resolver {
 
     fn validate_extern_signature(&mut self, function: &ast::ExternFunction, signature: &Signature) {
         for (parameter, ty) in function.parameters.iter().zip(&signature.parameter_types) {
-            if !self.types.is_ffi_safe_type(*ty) {
+            if !self.types.is_ffi_safe_extern_value(*ty) {
                 self.diagnostics.push(
                     Diagnostic::error(
                         "E5001",
                         format!("type `{ty}` is not ABI-safe in an extern parameter"),
                         parameter.ty.span,
                     )
-                    .with_help("use C-compatible scalars, cstr, or raw pointers"),
+                    .with_help(
+                        "use C-compatible scalars, cstr, raw pointers, or an ABI-safe `@repr(C)` struct",
+                    ),
                 );
             }
         }
@@ -3957,7 +4019,9 @@ impl Resolver {
                     ),
                     span,
                 )
-                .with_help("use `()`, a C-compatible scalar, cstr, or a raw pointer"),
+                .with_help(
+                    "use `()`, a C-compatible scalar, cstr, a raw pointer, or an ABI-safe `@repr(C)` struct",
+                ),
             );
         }
     }
@@ -12723,6 +12787,48 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "E5001")
+        );
+    }
+
+    #[test]
+    fn resolve_should_accept_abi_safe_c_structs_by_value() {
+        let source = "
+            @repr(C)
+            struct Identifier { bytes: [u8; 16] }
+            @repr(C)
+            struct Request { identifier: Identifier, count: u32 }
+            extern \"C\" {
+                fn native_read(request: Request) -> Identifier;
+            }
+            fn main() -> i32 {
+                let request = Request {
+                    identifier: Identifier {
+                        bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    },
+                    count: 1,
+                };
+                let identifier = unsafe { native_read(request) };
+                identifier.bytes[0] as i32
+            }";
+
+        resolve_fixture(source).expect("ABI-safe C structs should resolve by value");
+    }
+
+    #[test]
+    fn resolve_should_reject_native_structs_by_value_at_ffi_boundaries() {
+        let source = "
+            struct Native { value: i32 }
+            extern \"C\" fn native_read(value: Native) -> Native;
+            fn main() -> i32 { 42 }";
+
+        let diagnostics = resolve_fixture(source).expect_err("native struct should fail");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E5001")
+                .count(),
+            2
         );
     }
 
