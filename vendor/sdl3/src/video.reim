@@ -1,424 +1,130 @@
-from std::alloc import Allocator, OwnedBytes, allocate_bytes;
-from std::c import null_const;
+import self::raw::functions as sdl;
+import self::raw::types as types;
 
-import self::bindings as sdl;
-from self::input import MouseButton, SCANCODE_COUNT, Scancode;
-
-/// Recoverable failures from the vendored SDL3 presentation layer.
-pub enum SdlError {
+/// Recoverable failures from SDL's window API.
+pub enum WindowError {
     InvalidDimensions,
-    AllocationFailed,
-    InitializationFailed,
-    WindowCreationFailed,
-    RendererCreationFailed,
-    TextureCreationFailed,
-    TextureConfigurationFailed,
-    TextureUploadFailed,
-    RenderingFailed,
-    PresentationFailed,
+    CreationFailed,
+    OperationFailed,
 }
 
-/// An owned row-major ARGB8888 software frame buffer.
-pub struct FrameBuffer {
-    storage: OwnedBytes,
-    pixels: *mut u8,
-    width: i32,
-    height: i32,
-    len: usize,
+/// The logical size of an SDL window.
+@derive(Copy, Clone, Debug, Eq)
+pub struct WindowSize {
+    pub width: i32,
+    pub height: i32,
 }
 
-impl FrameBuffer {
-    /// Allocates a frame buffer through `allocator`.
-    pub fn new(
-        allocator: &Allocator,
+/// One owned SDL window.
+///
+/// Window operations and `deinit` must run on the thread that initialized the
+/// video subsystem. Dependent renderer, GPU, OpenGL, or Vulkan objects must be
+/// destroyed before the window.
+pub struct Window {
+    raw: *mut types::SDL_Window,
+}
+
+impl Window {
+    /// Creates a window using SDL window flags.
+    pub fn create(
+        title: cstr,
         width: i32,
         height: i32,
-    ) -> Result<FrameBuffer, SdlError> {
-        if width <= 0 || height <= 0 || width > 536_870_911 {
-            return Err(SdlError::InvalidDimensions);
+        flags: types::SDL_WindowFlags,
+    ) -> Result<Window, WindowError> {
+        if width <= 0 || height <= 0 {
+            return Err(WindowError::InvalidDimensions);
         }
-
-        let pixel_count = width as usize * height as usize;
-        let byte_count = pixel_count * 4;
-        let allocation = allocate_bytes(allocator, byte_count);
-        let mut storage = match allocation {
-            Ok(value) => value,
-            Err(_) => {
-                return Err(SdlError::AllocationFailed);
-            },
+        let raw = unsafe {
+            sdl::SDL_CreateWindow(title as *const c_char, width, height, flags)
         };
-        let pixels = storage.as_mut_ptr();
-        let mut frame = FrameBuffer {
-            storage: storage,
-            pixels: pixels,
-            width: width,
-            height: height,
-            len: pixel_count,
-        };
-        frame.clear(rgb(0, 0, 0));
-        Ok(frame)
-    }
-
-    /// Returns the frame width in pixels.
-    pub fn width(&self) -> i32 {
-        self.width
-    }
-
-    /// Returns the frame height in pixels.
-    pub fn height(&self) -> i32 {
-        self.height
-    }
-
-    /// Returns the total number of pixels.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Fills the complete frame with one ARGB8888 color.
-    pub fn clear(&mut self, color: u32) {
-        let mut index: usize = 0;
-        while index < self.len {
-            write_pixel(self.pixels, index, color);
-            index += 1;
-        }
-    }
-
-    /// Replaces one pixel, returning `false` for coordinates outside the frame.
-    pub fn set_pixel(&mut self, x: i32, y: i32, color: u32) -> bool {
-        if x < 0 || y < 0 || x >= self.width || y >= self.height {
-            return false;
-        }
-        let index = y as usize * self.width as usize + x as usize;
-        write_pixel(self.pixels, index, color);
-        true
-    }
-
-    /// Returns one pixel, or `None` for coordinates outside the frame.
-    pub fn pixel(&self, x: i32, y: i32) -> Option<u32> {
-        if x < 0 || y < 0 || x >= self.width || y >= self.height {
-            return None;
-        }
-        let index = y as usize * self.width as usize + x as usize;
-        Some(read_pixel(self.pixels as *const u8, index))
-    }
-
-    /// Draws a clipped vertical segment over `[top, bottom)`.
-    @inline
-    pub fn draw_vertical(
-        &mut self,
-        x: i32,
-        top: i32,
-        bottom: i32,
-        color: u32,
-    ) {
-        if x < 0 || x >= self.width {
-            return;
-        }
-        let clipped_top = if top < 0 { 0 } else { top };
-        let clipped_bottom = if bottom > self.height {
-            self.height
+        if raw as usize == 0 {
+            Err(WindowError::CreationFailed)
         } else {
-            bottom
-        };
-        if clipped_top >= clipped_bottom {
-            return;
-        }
-
-        let mut y = clipped_top;
-        while y < clipped_bottom {
-            let index = y as usize * self.width as usize + x as usize;
-            write_pixel(self.pixels, index, color);
-            y += 1;
+            Ok(Window { raw: raw })
         }
     }
 
-    /// Releases the pixel allocation.
-    pub fn deinit(self) {
-        self.storage.deinit();
-    }
-}
-
-/// A snapshot of window, keyboard, and mouse state for one frame.
-pub struct InputState {
-    quit_requested: bool,
-    pressed_keys: [u64; 8],
-    mouse_buttons: u32,
-    mouse_x: f32,
-    mouse_y: f32,
-}
-
-impl InputState {
-    /// Returns whether SDL received a window-close request.
-    pub fn quit_requested(&self) -> bool {
-        self.quit_requested
+    /// Returns SDL's stable identifier for this live window.
+    pub fn id(&self) -> types::SDL_WindowID {
+        unsafe { sdl::SDL_GetWindowID(self.raw) }
     }
 
-    /// Returns whether a physical keyboard key is currently held.
-    pub fn key_down(&self, scancode: Scancode) -> bool {
-        let raw = scancode.raw();
-        let word = raw / 64;
-        let bit = (raw % 64) as u64;
-        (self.pressed_keys[word] & ((1 as u64) << bit)) != 0
+    /// Returns the current SDL window flags.
+    pub fn flags(&self) -> types::SDL_WindowFlags {
+        unsafe { sdl::SDL_GetWindowFlags(self.raw) }
     }
 
-    /// Returns whether a mouse button is currently held.
-    pub fn mouse_button_down(&self, button: MouseButton) -> bool {
-        let bit = button.raw() as u32 - 1;
-        (self.mouse_buttons & ((1 as u32) << bit)) != 0
+    /// Returns SDL's borrowed NUL-terminated UTF-8 title.
+    ///
+    /// The view remains valid until the title changes or the window is
+    /// destroyed.
+    pub fn title(&self) -> cstr {
+        unsafe { sdl::SDL_GetWindowTitle(self.raw) } as cstr
     }
 
-    /// Returns the current mouse x-coordinate in window pixels.
-    pub fn mouse_x(&self) -> f32 {
-        self.mouse_x
-    }
-
-    /// Returns the current mouse y-coordinate in window pixels.
-    pub fn mouse_y(&self) -> f32 {
-        self.mouse_y
-    }
-}
-
-/// An SDL window, renderer, and streaming texture with explicit cleanup.
-/// Create, use, and close this value on the application's main thread.
-pub struct Display {
-    window: *mut (),
-    renderer: *mut (),
-    texture: *mut (),
-    frame_width: i32,
-    frame_height: i32,
-}
-
-impl Display {
-    /// Initializes SDL video and creates a nearest-neighbor streaming display.
-    pub fn open(
-        title: cstr,
-        window_width: i32,
-        window_height: i32,
-        frame_width: i32,
-        frame_height: i32,
-    ) -> Result<Display, SdlError> {
-        if window_width <= 0
-            || window_height <= 0
-            || frame_width <= 0
-            || frame_width > 536_870_911
-            || frame_height <= 0
-        {
-            return Err(SdlError::InvalidDimensions);
-        }
-        if !unsafe { sdl::SDL_Init(sdl::INIT_VIDEO) } {
-            return Err(SdlError::InitializationFailed);
-        }
-
-        let window = unsafe {
-            sdl::SDL_CreateWindow(title, window_width, window_height, 0)
-        };
-        if window as usize == 0 {
-            unsafe {
-                sdl::SDL_QuitSubSystem(sdl::INIT_VIDEO);
-            }
-            return Err(SdlError::WindowCreationFailed);
-        }
-
-        let renderer = unsafe {
-            sdl::SDL_CreateRenderer(window, null_const<u8>())
-        };
-        if renderer as usize == 0 {
-            unsafe {
-                sdl::SDL_DestroyWindow(window);
-                sdl::SDL_QuitSubSystem(sdl::INIT_VIDEO);
-            }
-            return Err(SdlError::RendererCreationFailed);
-        }
-
-        let texture = unsafe {
-            sdl::SDL_CreateTexture(
-                renderer,
-                sdl::PIXELFORMAT_ARGB8888,
-                sdl::TEXTUREACCESS_STREAMING,
-                frame_width,
-                frame_height,
+    /// Queries the logical window size.
+    pub fn size(&self) -> Result<WindowSize, WindowError> {
+        let mut width: i32 = 0;
+        let mut height: i32 = 0;
+        if unsafe {
+            sdl::SDL_GetWindowSize(
+                self.raw,
+                &mut width as *mut i32,
+                &mut height as *mut i32,
             )
-        };
-        if texture as usize == 0 {
-            unsafe {
-                sdl::SDL_DestroyRenderer(renderer);
-                sdl::SDL_DestroyWindow(window);
-                sdl::SDL_QuitSubSystem(sdl::INIT_VIDEO);
-            }
-            return Err(SdlError::TextureCreationFailed);
-        }
-
-        if !unsafe {
-            sdl::SDL_SetTextureScaleMode(texture, sdl::SCALEMODE_NEAREST)
         } {
-            unsafe {
-                sdl::SDL_DestroyTexture(texture);
-                sdl::SDL_DestroyRenderer(renderer);
-                sdl::SDL_DestroyWindow(window);
-                sdl::SDL_QuitSubSystem(sdl::INIT_VIDEO);
-            }
-            return Err(SdlError::TextureConfigurationFailed);
+            Ok(WindowSize { width: width, height: height })
+        } else {
+            Err(WindowError::OperationFailed)
         }
-        unsafe {
-            sdl::SDL_SetRenderVSync(renderer, 1);
-        }
+    }
 
-        Ok(Display {
-            window: window,
-            renderer: renderer,
-            texture: texture,
-            frame_width: frame_width,
-            frame_height: frame_height,
+    /// Changes the window title.
+    pub fn set_title(&mut self, title: cstr) -> Result<(), WindowError> {
+        operation_result(unsafe {
+            sdl::SDL_SetWindowTitle(self.raw, title as *const c_char)
         })
     }
 
-    /// Polls and drains SDL events, then snapshots the current input state.
-    pub fn poll_input(&self) -> InputState {
-        let mut event = sdl::Event::default();
-        let mut quit_requested = false;
-        while unsafe { sdl::SDL_PollEvent(&mut event as *mut sdl::Event) } {
-            if event.kind == sdl::EVENT_QUIT {
-                quit_requested = true;
-            }
+    /// Changes the logical window size.
+    pub fn set_size(&mut self, width: i32, height: i32) -> Result<(), WindowError> {
+        if width <= 0 || height <= 0 {
+            return Err(WindowError::InvalidDimensions);
         }
-
-        let mut key_count: i32 = 0;
-        let keys = unsafe {
-            sdl::SDL_GetKeyboardState(&mut key_count as *mut i32)
-        };
-        let mut pressed_keys: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
-        let available = if key_count <= 0 {
-            0 as usize
-        } else if key_count as usize > SCANCODE_COUNT {
-            SCANCODE_COUNT
-        } else {
-            key_count as usize
-        };
-        let mut scancode: usize = 0;
-        while scancode < available {
-            if raw_key_down(keys, key_count, scancode) {
-                let word = scancode / 64;
-                let bit = (scancode % 64) as u64;
-                pressed_keys[word] =
-                    pressed_keys[word] | ((1 as u64) << bit);
-            }
-            scancode += 1;
-        }
-
-        let mut mouse_x: f32 = 0.0;
-        let mut mouse_y: f32 = 0.0;
-        let mouse_buttons = unsafe {
-            sdl::SDL_GetMouseState(
-                &mut mouse_x as *mut f32,
-                &mut mouse_y as *mut f32,
-            )
-        };
-
-        InputState {
-            quit_requested: quit_requested,
-            pressed_keys: pressed_keys,
-            mouse_buttons: mouse_buttons,
-            mouse_x: mouse_x,
-            mouse_y: mouse_y,
-        }
+        operation_result(unsafe { sdl::SDL_SetWindowSize(self.raw, width, height) })
     }
 
-    /// Uploads and presents one complete software frame.
-    pub fn present(&self, frame: &FrameBuffer) -> Result<(), SdlError> {
-        if frame.width != self.frame_width
-            || frame.height != self.frame_height
-        {
-            return Err(SdlError::InvalidDimensions);
-        }
-        let no_rect = null_const<u8>();
-        if !unsafe {
-            sdl::SDL_UpdateTexture(
-                self.texture,
-                no_rect,
-                frame.pixels as *const u8,
-                self.frame_width * 4,
-            )
-        } {
-            return Err(SdlError::TextureUploadFailed);
-        }
-        if !unsafe {
-            sdl::SDL_RenderTexture(
-                self.renderer,
-                self.texture,
-                no_rect,
-                no_rect,
-            )
-        } {
-            return Err(SdlError::RenderingFailed);
-        }
-        if unsafe { sdl::SDL_RenderPresent(self.renderer) } {
-            Ok(())
-        } else {
-            Err(SdlError::PresentationFailed)
-        }
+    /// Makes the window visible.
+    pub fn show(&mut self) -> Result<(), WindowError> {
+        operation_result(unsafe { sdl::SDL_ShowWindow(self.raw) })
     }
 
-    /// Destroys the texture, renderer, window, and SDL video state in order.
-    pub fn close(self) {
+    /// Hides the window.
+    pub fn hide(&mut self) -> Result<(), WindowError> {
+        operation_result(unsafe { sdl::SDL_HideWindow(self.raw) })
+    }
+
+    /// Returns the non-null native handle for advanced raw API calls.
+    ///
+    /// Any operation performed through this pointer remains subject to SDL's
+    /// ownership and main-thread rules.
+    pub fn as_raw(&self) -> *mut types::SDL_Window {
+        self.raw
+    }
+
+    /// Destroys the window.
+    pub fn deinit(self) {
         unsafe {
-            sdl::SDL_DestroyTexture(self.texture);
-            sdl::SDL_DestroyRenderer(self.renderer);
-            sdl::SDL_DestroyWindow(self.window);
-            sdl::SDL_QuitSubSystem(sdl::INIT_VIDEO);
+            sdl::SDL_DestroyWindow(self.raw);
         }
     }
 }
 
-fn raw_key_down(
-    keys: *const bool,
-    key_count: i32,
-    scancode: usize,
-) -> bool {
-    if keys as usize == 0 || key_count <= 0 || scancode >= key_count as usize {
-        return false;
+fn operation_result(success: bool) -> Result<(), WindowError> {
+    if success {
+        Ok(())
+    } else {
+        Err(WindowError::OperationFailed)
     }
-    let key = (keys as usize + scancode) as *const bool;
-    // SAFETY: SDL owns this array for the process lifetime, and the bounds
-    // check above proves that the selected byte belongs to it.
-    unsafe { *key }
-}
-
-@inline
-fn write_pixel(pixels: *mut u8, index: usize, color: u32) {
-    let offset = index * 4;
-    // SAFETY: All callers own the frame allocation and prove that `index` is
-    // below its pixel count. Byte access has no alignment requirement.
-    unsafe {
-        *((pixels as usize + offset) as *mut u8) = color as u8;
-        *((pixels as usize + offset + 1) as *mut u8) =
-            (color >> 8) as u8;
-        *((pixels as usize + offset + 2) as *mut u8) =
-            (color >> 16) as u8;
-        *((pixels as usize + offset + 3) as *mut u8) =
-            (color >> 24) as u8;
-    }
-}
-
-@inline
-fn read_pixel(pixels: *const u8, index: usize) -> u32 {
-    let offset = index * 4;
-    // SAFETY: The caller validates the index against the same live frame
-    // allocation. Reading individual bytes avoids an aligned `u32` cast.
-    unsafe {
-        *((pixels as usize + offset) as *const u8) as u32
-            | (*((pixels as usize + offset + 1) as *const u8) as u32
-                << 8)
-            | (*((pixels as usize + offset + 2) as *const u8) as u32
-                << 16)
-            | (*((pixels as usize + offset + 3) as *const u8) as u32
-                << 24)
-    }
-}
-
-/// Packs an opaque red, green, and blue color into SDL's ARGB8888 format.
-pub fn rgb(red: u8, green: u8, blue: u8) -> u32 {
-    0xff00_0000
-        | ((red as u32) << 16)
-        | ((green as u32) << 8)
-        | blue as u32
 }

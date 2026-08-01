@@ -12,7 +12,8 @@ Available packages:
 
 - [`opengl`](opengl/README.md): generated OpenGL 4.6 core constants,
   signatures, context-local dispatch, and a Windows WGL resolver.
-- [`sdl3`](sdl3/README.md): SDL3 windows, input, software frame buffers, and
-  presentation for Windows x64.
+- [`sdl3`](sdl3/README.md): generated SDL 3.4.12 ABI bindings and clean safe
+  lifecycle, window, event, input, clipboard, file, and timing modules for
+  Windows x64.
 - [`vulkan`](vulkan/README.md): generated Vulkan 1.4 core constants, typed
   global/instance/device dispatch, and extension-free instance bootstrap.

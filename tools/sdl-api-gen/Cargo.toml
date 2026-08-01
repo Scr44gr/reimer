@@ -1,0 +1,14 @@
+[package]
+name = "sdl-api-gen"
+description = "Deterministic SDL dynapi binding generator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+lang-c = "0.15.1"
+
+[lints]
+workspace = true

@@ -17,39 +17,62 @@ Reference the package from the application's `reimer.toml`:
 sdl3 = { path = "../reimer/vendor/sdl3", version = "=3.4.12" }
 ```
 
-The facade exposes window ownership, generic input snapshots, an allocator-backed
-ARGB8888 frame buffer, whole-file byte loading, and presentation:
+The facade exposes reference-counted subsystem initialization, window
+ownership, events, generic input snapshots, clipboard text, timing, and
+whole-file byte loading. It intentionally contains no application-specific
+frame buffer, controls, or rendering policy:
 
 ```reimer
-from std::alloc import general_allocator;
-from sdl3 import Display, FrameBuffer, SdlError, rgb;
+from sdl3 import Subsystems, Window;
+import sdl3::events as events;
+import sdl3::init as init;
 import sdl3::input as input;
+import sdl3::raw::constants as constants;
+import sdl3::time as time;
 
-fn main() -> Result<(), SdlError> {
-    let allocator = general_allocator();
-    let mut frame = FrameBuffer::new(&allocator, 320, 200)?;
-    defer frame.deinit();
+fn main() -> i32 {
+    let systems = match Subsystems::init(init::VIDEO | init::EVENTS) {
+        Ok(value) => value,
+        Err(_) => return 1,
+    };
+    defer systems.deinit();
 
-    let display = Display::open(c"Software renderer", 800, 600, 320, 200)?;
-    defer display.close();
+    let window = match Window::create(
+        c"SDL application",
+        1280,
+        720,
+        constants::SDL_WINDOW_RESIZABLE,
+    ) {
+        Ok(value) => value,
+        Err(_) => return 2,
+    };
+    defer window.deinit();
 
-    let state = display.poll_input();
-    if state.quit_requested()
-        || state.key_down(input::SCANCODE_ESCAPE)
-    {
-        return Ok(());
+    let mut running = true;
+    while running {
+        match events::poll() {
+            Some(event) => {
+                if event.is_quit() {
+                    running = false;
+                }
+            },
+            None => (),
+        }
+        let keyboard = input::keyboard_state();
+        if keyboard.is_down(input::SCANCODE_ESCAPE) {
+            running = false;
+        }
+        time::sleep(1);
     }
-
-    frame.clear(rgb(135, 206, 235));
-    display.present(&frame)
+    0
 }
 ```
 
-Raw handles, pointers, and `unsafe` FFI calls stay private to the package. The
-safe facade validates dimensions, clips pixel writes, drains events, and owns
-SDL teardown order. Input policy stays in the application: the vendor exposes
-typed mouse buttons and the complete SDL 3.4.12 physical-key scancode catalog,
-while each program maps those values to its own actions.
+The safe modules hide their native calls and validate values where necessary.
+Advanced bindings can use `sdl3::raw`, which exposes generated ABI declarations
+and therefore requires explicit `unsafe`. Input policy stays in the application:
+the vendor exposes typed mouse buttons and the complete SDL 3.4.12 physical-key
+scancode catalog, while each program maps them to its own actions.
 
 ## Run or build an application
 

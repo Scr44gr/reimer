@@ -1,0 +1,72 @@
+import self::raw::constants as constants;
+import self::raw::functions as sdl;
+import self::raw::types as types;
+
+/// Waiting for the next SDL event failed.
+pub enum EventError {
+    WaitFailed,
+}
+
+/// One value copied from SDL's event queue.
+pub struct Event {
+    raw: types::SDL_Event,
+}
+
+impl Event {
+    /// Returns the SDL event type constant.
+    pub fn kind(&self) -> types::SDL_EventType {
+        self.raw.kind as types::SDL_EventType
+    }
+
+    /// Returns whether this is an application quit request.
+    pub fn is_quit(&self) -> bool {
+        self.kind() == constants::SDL_EVENT_QUIT
+    }
+
+    /// Returns a read-only pointer to the complete raw event storage.
+    pub fn as_raw(&self) -> *const types::SDL_Event {
+        &self.raw as *const types::SDL_Event
+    }
+}
+
+/// Removes and returns the next queued event without blocking.
+pub fn poll() -> Option<Event> {
+    let mut raw = types::SDL_Event::default();
+    if unsafe { sdl::SDL_PollEvent(&mut raw as *mut types::SDL_Event) } {
+        Some(Event { raw: raw })
+    } else {
+        None
+    }
+}
+
+/// Waits indefinitely for the next queued event.
+pub fn wait() -> Result<Event, EventError> {
+    let mut raw = types::SDL_Event::default();
+    if unsafe { sdl::SDL_WaitEvent(&mut raw as *mut types::SDL_Event) } {
+        Ok(Event { raw: raw })
+    } else {
+        Err(EventError::WaitFailed)
+    }
+}
+
+/// Waits up to `timeout_ms` and returns `None` when the timeout expires.
+pub fn wait_timeout(timeout_ms: i32) -> Option<Event> {
+    let mut raw = types::SDL_Event::default();
+    if unsafe {
+        sdl::SDL_WaitEventTimeout(
+            &mut raw as *mut types::SDL_Event,
+            timeout_ms,
+        )
+    } {
+        Some(Event { raw: raw })
+    } else {
+        None
+    }
+}
+
+/// Updates SDL's input devices and posts pending events.
+pub fn pump() {
+    unsafe {
+        sdl::SDL_PumpEvents();
+    }
+}

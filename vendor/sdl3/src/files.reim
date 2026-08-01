@@ -1,4 +1,4 @@
-import self::bindings as sdl;
+import self::raw::functions as sdl;
 
 /// Recoverable failures from SDL's whole-file loader.
 pub enum FileLoadError {
@@ -37,7 +37,7 @@ impl FileBytes {
     /// Releases the file allocation through SDL's matching allocator.
     pub fn deinit(self) {
         unsafe {
-            sdl::SDL_free(self.data);
+            sdl::SDL_free(self.data as *mut ());
         }
     }
 }
@@ -45,9 +45,10 @@ impl FileBytes {
 /// Loads one complete file using a NUL-terminated UTF-8 path.
 pub fn load_file(path: cstr) -> Result<FileBytes, FileLoadError> {
     let mut len: usize = 0;
-    let data = unsafe {
-        sdl::SDL_LoadFile(path, &mut len as *mut usize)
+    let raw = unsafe {
+        sdl::SDL_LoadFile(path as *const c_char, &mut len as *mut usize)
     };
+    let data = raw as *mut u8;
     if data as usize == 0 {
         Err(FileLoadError::LoadFailed)
     } else {

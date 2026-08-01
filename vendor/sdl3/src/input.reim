@@ -1,5 +1,97 @@
+import self::raw::functions as sdl;
+
 /// The number of entries in SDL's keyboard-state array.
 pub const SCANCODE_COUNT: usize = 512;
+
+/// A copied snapshot of SDL's keyboard state.
+pub struct KeyboardState {
+    pressed_keys: [u64; 8],
+}
+
+impl KeyboardState {
+    /// Returns whether a physical keyboard key was held when sampled.
+    pub fn is_down(&self, scancode: Scancode) -> bool {
+        let raw = scancode.raw();
+        let word = raw / 64;
+        let bit = (raw % 64) as u64;
+        (self.pressed_keys[word] & ((1 as u64) << bit)) != 0
+    }
+}
+
+/// A copied snapshot of SDL's mouse state.
+@derive(Copy, Clone, Debug)
+pub struct MouseState {
+    buttons: u32,
+    x: f32,
+    y: f32,
+}
+
+impl MouseState {
+    /// Returns whether a mouse button was held when sampled.
+    pub fn is_down(&self, button: MouseButton) -> bool {
+        let bit = button.raw() as u32 - 1;
+        (self.buttons & ((1 as u32) << bit)) != 0
+    }
+
+    /// Returns the sampled x-coordinate in window space.
+    pub fn x(&self) -> f32 {
+        self.x
+    }
+
+    /// Returns the sampled y-coordinate in window space.
+    pub fn y(&self) -> f32 {
+        self.y
+    }
+
+    /// Returns SDL's complete mouse-button bit mask.
+    pub fn button_mask(&self) -> u32 {
+        self.buttons
+    }
+}
+
+/// Copies SDL's current keyboard state into an independent snapshot.
+pub fn keyboard_state() -> KeyboardState {
+    let mut key_count: i32 = 0;
+    let keys = unsafe { sdl::SDL_GetKeyboardState(&mut key_count as *mut i32) };
+    let mut pressed_keys: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+    let available = if key_count <= 0 {
+        0 as usize
+    } else if key_count as usize > SCANCODE_COUNT {
+        SCANCODE_COUNT
+    } else {
+        key_count as usize
+    };
+    let mut scancode: usize = 0;
+    while scancode < available {
+        if raw_key_down(keys, key_count, scancode) {
+            let word = scancode / 64;
+            let bit = (scancode % 64) as u64;
+            pressed_keys[word] = pressed_keys[word] | ((1 as u64) << bit);
+        }
+        scancode += 1;
+    }
+    KeyboardState { pressed_keys: pressed_keys }
+}
+
+/// Copies SDL's current mouse position and button mask.
+pub fn mouse_state() -> MouseState {
+    let mut x: f32 = 0.0;
+    let mut y: f32 = 0.0;
+    let buttons = unsafe {
+        sdl::SDL_GetMouseState(&mut x as *mut f32, &mut y as *mut f32)
+    };
+    MouseState { buttons: buttons, x: x, y: y }
+}
+
+fn raw_key_down(keys: *const bool, key_count: i32, scancode: usize) -> bool {
+    if keys as usize == 0 || key_count <= 0 || scancode >= key_count as usize {
+        return false;
+    }
+    let key = (keys as usize + scancode) as *const bool;
+    // SAFETY: SDL owns this array for the process lifetime, and the bounds
+    // check above proves that the selected byte belongs to it.
+    unsafe { *key }
+}
 
 /// A physical keyboard key independent of the active keyboard layout.
 @derive(Copy, Clone, Debug, Eq, Hash)
