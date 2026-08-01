@@ -2392,6 +2392,81 @@ mod tests {
     }
 
     #[test]
+    fn imgui_example_should_show_safe_facade_documentation_on_hover() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join("imgui_demo")
+            .join("src")
+            .join("main.reim");
+        let source = fs::read_to_string(&path).expect("Dear ImGui example should be readable");
+        let call_offset = source
+            .find("SdlOpenGl::create")
+            .expect("safe Dear ImGui constructor should exist");
+        let position = LineIndex::new(Arc::from(source.as_str())).position(call_offset);
+        let document = Document::new(
+            Url::from_file_path(path).expect("example URL should be created"),
+            source,
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("safe Dear ImGui constructor should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents
+                .value
+                .contains("SdlOpenGl::create(gl_context: &gl::GlContext)"),
+            "unexpected hover contents: {}",
+            contents.value
+        );
+        assert!(
+            contents
+                .value
+                .contains("Creates a Dear ImGui context and initializes the official SDL3")
+        );
+        assert!(!contents.value.contains("__module_"));
+    }
+
+    #[test]
+    fn generated_imgui_completion_should_include_upstream_documentation() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("vendor")
+            .join("imgui")
+            .join("src")
+            .join("raw")
+            .join("functions.reim");
+        let source =
+            fs::read_to_string(&path).expect("generated Dear ImGui API should be readable");
+        let document = Document::new(
+            Url::from_file_path(path).expect("generated API URL should be created"),
+            source,
+        );
+        let completion = document
+            .completions()
+            .into_iter()
+            .find(|item| item.label == "ImGui_ShowDemoWindow")
+            .expect("Dear ImGui demo function should be completed");
+        let Some(tower_lsp::lsp_types::Documentation::MarkupContent(documentation)) =
+            completion.documentation
+        else {
+            panic!("completion documentation should use markdown");
+        };
+
+        assert!(
+            documentation
+                .value
+                .contains("create Demo window. demonstrate most ImGui features")
+        );
+    }
+
+    #[test]
     fn document_should_show_documentation_for_imported_generic_struct_values() {
         let fixture = Fixture::new();
         fixture.write(
