@@ -1,0 +1,15 @@
+[package]
+name = "imgui-demo"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+imgui = { path = "../../vendor/imgui", version = "^1.92" }
+opengl = { path = "../../vendor/opengl", version = "^4.6" }
+sdl3 = { path = "../../vendor/sdl3", version = "^3.4" }
+
+[profile.debug]
+optimization = 0
+
+[profile.release]
+optimization = 3

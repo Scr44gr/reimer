@@ -1,0 +1,52 @@
+format = 1
+
+[[package]]
+id = "2af63601e81063d8276e4688"
+name = "imgui"
+version = "1.92.8"
+source = "path+../../vendor/imgui"
+checksum = "a44ce43665417a134b87b8325da2875ce7334623ee8eb920b84382b5283c0352"
+
+[[package.dependencies]]
+alias = "sdl3"
+request = "path+../sdl3"
+package = "2cd76739b1e7b319c68f889b"
+
+[[package]]
+id = "2cd76739b1e7b319c68f889b"
+name = "sdl3"
+version = "3.4.12"
+source = "path+../../vendor/sdl3"
+checksum = "2b5cee1d538caa9fe3e5e1ea36b4948c9c1f3954f940e087ff1b9cb9e6abbab8"
+dependencies = []
+
+[[package]]
+id = "a4aaa218775ace35ac19ee44"
+name = "imgui-demo"
+version = "0.1.0"
+source = "path+."
+checksum = "775da3a9b1c0afff722121802ab6aade95b7186808238c017af57ec0d46bd47d"
+
+[[package.dependencies]]
+alias = "imgui"
+request = "path+../../vendor/imgui"
+package = "2af63601e81063d8276e4688"
+
+[[package.dependencies]]
+alias = "opengl"
+request = "path+../../vendor/opengl"
+package = "c3cb09ae1f536ea8e3867222"
+
+[[package.dependencies]]
+alias = "sdl3"
+request = "path+../../vendor/sdl3"
+package = "2cd76739b1e7b319c68f889b"
+
+[[package]]
+id = "c3cb09ae1f536ea8e3867222"
+name = "opengl"
+version = "4.6.0"
+source = "path+../../vendor/opengl"
+checksum = "08461dca30538279f44b22564e34e9649ad5fa65e22a9531d68444d55667c6ee"
+dependencies = []
+

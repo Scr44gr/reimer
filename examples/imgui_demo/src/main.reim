@@ -1,0 +1,190 @@
+from imgui import SdlOpenGl;
+from opengl import COLOR_BUFFER, clear, clear_color, viewport;
+from opengl::raw import Functions;
+from sdl3 import GlContext, Subsystems, Window;
+import sdl3::events as events;
+import sdl3::gl as gl;
+import sdl3::init as init;
+import sdl3::raw::constants as sdl;
+
+enum DemoError {
+    SdlInitializationFailed,
+    OpenGlConfigurationFailed,
+    WindowCreationFailed,
+    ContextCreationFailed,
+    ContextActivationFailed,
+    SwapIntervalFailed,
+    ImGuiInitializationFailed,
+    FrameFailed,
+    OpenGlCommandFailed,
+    PresentationFailed,
+}
+
+fn configure_opengl() -> Result<(), DemoError> {
+    match gl::set_attribute(gl::CONTEXT_MAJOR_VERSION, 3) {
+        Ok(_) => {},
+        Err(_) => {
+            return Err(DemoError::OpenGlConfigurationFailed);
+        },
+    }
+    match gl::set_attribute(gl::CONTEXT_MINOR_VERSION, 3) {
+        Ok(_) => {},
+        Err(_) => {
+            return Err(DemoError::OpenGlConfigurationFailed);
+        },
+    }
+    match gl::set_attribute(gl::CONTEXT_PROFILE_MASK, gl::PROFILE_CORE) {
+        Ok(_) => {},
+        Err(_) => {
+            return Err(DemoError::OpenGlConfigurationFailed);
+        },
+    }
+    match gl::set_attribute(gl::DOUBLEBUFFER, 1) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(DemoError::OpenGlConfigurationFailed),
+    }
+}
+
+fn keep_running(ui: &mut SdlOpenGl) -> bool {
+    let mut running = true;
+    let mut polling = true;
+    while polling {
+        match events::poll() {
+            Some(event) => {
+                ui.process_event(&event);
+                if event.is_quit()
+                    || event.kind() == sdl::SDL_EVENT_WINDOW_CLOSE_REQUESTED {
+                    running = false;
+                }
+            },
+            None => {
+                polling = false;
+            },
+        }
+    }
+    running
+}
+
+fn close_context(context: GlContext) {
+    let _result = context.deinit();
+}
+
+fn run() -> Result<(), DemoError> {
+    let subsystems = match Subsystems::init(init::VIDEO | init::EVENTS) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(DemoError::SdlInitializationFailed);
+        },
+    };
+    defer subsystems.deinit();
+
+    configure_opengl()?;
+    let window_flags: u64 = sdl::SDL_WINDOW_OPENGL
+        | sdl::SDL_WINDOW_RESIZABLE
+        | sdl::SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    let window = match Window::create(
+        c"Reimer - Dear ImGui Demo",
+        1280,
+        720,
+        window_flags,
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(DemoError::WindowCreationFailed);
+        },
+    };
+    defer window.deinit();
+
+    let context = match GlContext::create(&window) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(DemoError::ContextCreationFailed);
+        },
+    };
+    defer close_context(context);
+    match context.make_current() {
+        Ok(_) => {},
+        Err(_) => {
+            return Err(DemoError::ContextActivationFailed);
+        },
+    }
+    match context.set_swap_interval(1) {
+        Ok(_) => {},
+        Err(_) => {
+            return Err(DemoError::SwapIntervalFailed);
+        },
+    }
+
+    let functions = Functions::load(gl::get_proc_address);
+    let mut ui = match SdlOpenGl::create(&context) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(DemoError::ImGuiInitializationFailed);
+        },
+    };
+    defer ui.deinit();
+
+    let mut demo_open = true;
+    let mut running = true;
+    while running && demo_open {
+        running = keep_running(&mut ui);
+        match ui.new_frame() {
+            Ok(_) => {},
+            Err(_) => {
+                return Err(DemoError::FrameFailed);
+            },
+        }
+        match ui.show_demo_window(&mut demo_open) {
+            Ok(_) => {},
+            Err(_) => {
+                return Err(DemoError::FrameFailed);
+            },
+        }
+
+        let size = match window.size() {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(DemoError::OpenGlCommandFailed);
+            },
+        };
+        match viewport(&functions, 0, 0, size.width, size.height) {
+            Ok(_) => {},
+            Err(_) => {
+                return Err(DemoError::OpenGlCommandFailed);
+            },
+        }
+        match clear_color(&functions, 0.07, 0.09, 0.13, 1.0) {
+            Ok(_) => {},
+            Err(_) => {
+                return Err(DemoError::OpenGlCommandFailed);
+            },
+        }
+        match clear(&functions, COLOR_BUFFER) {
+            Ok(_) => {},
+            Err(_) => {
+                return Err(DemoError::OpenGlCommandFailed);
+            },
+        }
+        match ui.render() {
+            Ok(_) => {},
+            Err(_) => {
+                return Err(DemoError::FrameFailed);
+            },
+        }
+        match context.swap() {
+            Ok(_) => {},
+            Err(_) => {
+                return Err(DemoError::PresentationFailed);
+            },
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> i32 {
+    match run() {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
