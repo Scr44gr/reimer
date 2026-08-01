@@ -5,6 +5,6 @@ id = "0c735ad59bd4c6d39bf1167b"
 name = "sdl3"
 version = "3.4.12"
 source = "path+."
-checksum = "24d117a099d8ee464ba91d1f4913c56e9841afc3879f4d78bc81c264326a14ad"
+checksum = "0eb68669e896a3a4923959a1399fe7ad4dfbaf89cdfcd2a53f2f51ad7c35d4e6"
 dependencies = []
 

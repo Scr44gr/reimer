@@ -3,7 +3,8 @@
 This package provides source-visible SDL 3.4.12 bindings. Its public facade is
 application-neutral: reference-counted subsystem initialization, owned windows,
 typed event polling, copied keyboard and mouse snapshots, clipboard text,
-whole-file loading, and SDL timing. Every owned value has explicit cleanup.
+whole-file loading, SDL timing, owned software surfaces, lifetime-bound renderers,
+and gamepad enumeration and handles. Every owned value has explicit cleanup.
 
 Raw pointers and native calls stay inside the facade. A separate `raw`
 namespace exposes the generated low-level functions, constants, callbacks, and
@@ -23,14 +24,29 @@ The package separates three concerns:
 - the package root exposes safe, ownership-aware wrappers. These wrappers do
   not contain application input mappings, frame buffers, or rendering policy.
 
+The safe modules are organized by SDL responsibility:
+
+- `init`, `video`, `events`, and `input` cover lifecycle, windows, queued
+  events, and copied device state;
+- `surface` and `render` own software surfaces and bind renderer lifetimes to
+  their window or mutable surface;
+- `gamepad` owns SDL identifier arrays and open handles while exposing SDL's
+  physical axes and buttons without defining application actions;
+- `clipboard`, `files`, and `time` own allocations or provide allocation-free
+  process services;
+- `gl` binds an OpenGL context to its live window, while the separate OpenGL
+  and Vulkan vendors provide their complete generated APIs.
+
 `coverage.toml` is the machine-readable completeness contract. The current
-generator emits 1,239 of SDL's 1,270 dynapi functions, 153 aliases, 36 callback
-types, 118 concrete records, 1,164 enum constants, and 799 current object-like
-macro constants. No current object-like constant is blocked. The remaining 31
-functions require C variadics, platform `va_list`, or by-value C aggregate ABI
-classification and are listed individually. `SDL_Event`, `SDL_HapticEffect`,
-and `SDL_GamepadBinding` retain exact or opaque storage because Reimer does not
-yet expose C unions.
+generator emits 1,247 of SDL's 1,270 dynapi functions, 153 aliases, 36 callback
+types, 122 concrete or exact-storage records, 1,164 enum constants, and 799 current object-like
+macro constants. No current object-like constant is blocked. The remaining 23
+functions require C variadics or platform `va_list` and are listed individually.
+By-value `SDL_GUID` and `SDL_FColor` calls use the tested Windows x64 C aggregate
+ABI. `SDL_Event`, `SDL_HapticEffect`, and `SDL_GamepadBinding` use exact checked
+storage because Reimer does not yet expose C unions; the other 42 opaque records
+are native handles and forward declarations intended for pointer use, and the
+coverage report lists each one explicitly.
 
 ## Dependency
 
@@ -89,17 +105,22 @@ matching, version-pinned native directory and launcher branch are added.
 ## Updating SDL
 
 1. Select a stable upstream SDL release and record its exact source commit.
-2. Download the official development archive from the SDL GitHub release.
-3. Verify the archive digest published by GitHub.
-4. Replace only the target-specific library files and upstream license.
-5. Run the generator against the matching SDL source checkout:
+2. Update the pinned version, source URL, and published SHA-256 in
+   `tools/generate.ps1` and the Rust generator.
+3. Replace only the target-specific library files and upstream license.
+4. Run the generator. It downloads, verifies, and caches the official source
+   archive under `target/sdl-api-gen`. It also compiles C layout assertions for
+   every exact-storage union record before writing bindings:
 
    ```powershell
-   .\vendor\sdl3\tools\generate.ps1 -SdlSource C:\source\SDL
+   .\vendor\sdl3\tools\generate.ps1
    ```
 
-6. Review every `coverage.toml` change and every newly opaque or concrete type.
-7. Regenerate `checksums.sha256`, then run format, check, and tests.
+   Pass `-SdlSource C:\source\SDL` only to test an already verified local source
+   tree.
+
+5. Review every `coverage.toml` change and every newly opaque or concrete type.
+6. Regenerate `checksums.sha256`, then run format, check, and tests.
 
 Generated source must not be edited by hand. Update the Rust generator or a
 safe facade module so regeneration remains deterministic.

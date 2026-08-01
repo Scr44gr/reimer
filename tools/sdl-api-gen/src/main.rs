@@ -214,7 +214,6 @@ struct Procedure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Blocker {
     Variadic,
-    ByValueAggregate,
     PlatformVaList,
 }
 
@@ -222,7 +221,6 @@ impl Blocker {
     const fn label(self) -> &'static str {
         match self {
             Self::Variadic => "c_variadic",
-            Self::ByValueAggregate => "by_value_aggregate",
             Self::PlatformVaList => "platform_va_list",
         }
     }
@@ -304,8 +302,6 @@ fn strip_parentheses(source: &str) -> Option<&str> {
 }
 
 fn classify_blocker(return_type: &str, parameters: &[String]) -> Option<Blocker> {
-    const AGGREGATES: [&str; 2] = ["SDL_GUID", "SDL_FColor"];
-
     if parameters.iter().any(|parameter| parameter.trim() == "...") {
         return Some(Blocker::Variadic);
     }
@@ -315,14 +311,6 @@ fn classify_blocker(return_type: &str, parameters: &[String]) -> Option<Blocker>
             .any(|parameter| is_by_value(parameter, "va_list"))
     {
         return Some(Blocker::PlatformVaList);
-    }
-    if AGGREGATES.iter().any(|name| {
-        is_by_value(return_type, name)
-            || parameters
-                .iter()
-                .any(|parameter| is_by_value(parameter, name))
-    }) {
-        return Some(Blocker::ByValueAggregate);
     }
     None
 }
@@ -449,8 +437,7 @@ fn render_types(model: &HeaderModel) -> Result<String, GeneratorError> {
 
     let blockers = propagated_record_blockers(model);
     for (name, record) in &model.records {
-        if name == "SDL_Event" {
-            render_event_storage(&mut output)?;
+        if render_storage_record(&mut output, name)? {
             continue;
         }
         if blockers.contains_key(name) || record.fields.is_none() {
@@ -466,6 +453,16 @@ fn render_types(model: &HeaderModel) -> Result<String, GeneratorError> {
         writeln!(output)?;
     }
     Ok(output)
+}
+
+fn render_storage_record(output: &mut String, name: &str) -> Result<bool, fmt::Error> {
+    match name {
+        "SDL_Event" => render_event_storage(output)?,
+        "SDL_GamepadBinding" => render_gamepad_binding_storage(output)?,
+        "SDL_HapticEffect" => render_haptic_effect_storage(output)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn render_opaque_record(output: &mut String, name: &str) -> Result<(), fmt::Error> {
@@ -495,6 +492,54 @@ fn render_event_storage(output: &mut String) -> Result<(), fmt::Error> {
     writeln!(output, "    assert(align_of<SDL_Event>() == 8);")?;
     writeln!(output, "}}")?;
     writeln!(output)
+}
+
+fn render_gamepad_binding_storage(output: &mut String) -> Result<(), fmt::Error> {
+    writeln!(
+        output,
+        "/// Storage-compatible gamepad binding. The data arrays contain the active C union arms."
+    )?;
+    writeln!(output, "@derive(Default)")?;
+    writeln!(output, "@repr(C)")?;
+    writeln!(output, "pub struct SDL_GamepadBinding {{")?;
+    writeln!(output, "    pub input_type: SDL_GamepadBindingType,")?;
+    writeln!(output, "    pub input_data: [c::Int; 3],")?;
+    writeln!(output, "    pub output_type: SDL_GamepadBindingType,")?;
+    writeln!(output, "    pub output_data: [c::Int; 3],")?;
+    writeln!(output, "}}")?;
+    writeln!(output)?;
+    writeln!(output, "comptime {{")?;
+    writeln!(output, "    assert(size_of<SDL_GamepadBinding>() == 32);")?;
+    writeln!(output, "    assert(align_of<SDL_GamepadBinding>() == 4);")?;
+    writeln!(output, "}}")?;
+    writeln!(output)
+}
+
+fn render_haptic_effect_storage(output: &mut String) -> Result<(), fmt::Error> {
+    writeln!(
+        output,
+        "/// Storage-compatible haptic effect. Cast its address to the selected effect record inside `unsafe`."
+    )?;
+    writeln!(output, "@derive(Default)")?;
+    writeln!(output, "@repr(C)")?;
+    writeln!(output, "@align(8)")?;
+    writeln!(output, "pub struct SDL_HapticEffect {{")?;
+    writeln!(output, "    pub type_value: SDL_HapticEffectType,")?;
+    writeln!(output, "    pub storage: [u8; 70],")?;
+    writeln!(output, "}}")?;
+    writeln!(output)?;
+    writeln!(output, "comptime {{")?;
+    writeln!(output, "    assert(size_of<SDL_HapticEffect>() == 72);")?;
+    writeln!(output, "    assert(align_of<SDL_HapticEffect>() == 8);")?;
+    writeln!(output, "}}")?;
+    writeln!(output)
+}
+
+fn is_storage_record(name: &str) -> bool {
+    matches!(
+        name,
+        "SDL_Event" | "SDL_GamepadBinding" | "SDL_HapticEffect"
+    )
 }
 
 fn propagated_record_blockers(
@@ -757,7 +802,7 @@ fn render_report(procedures: &[Procedure], model: &HeaderModel, macros: &MacroMo
         .records
         .iter()
         .filter(|(name, record)| {
-            name.as_str() == "SDL_Event"
+            is_storage_record(name)
                 || (record.fields.is_some() && !record_blockers.contains_key(name.as_str()))
         })
         .count();
@@ -797,10 +842,27 @@ fn render_report(procedures: &[Procedure], model: &HeaderModel, macros: &MacroMo
         let _ = writeln!(report, "name = \"{}\"", procedure.name);
         let _ = writeln!(report, "reason = \"{blocker}\"");
     }
-    for (name, blocker) in record_blockers {
+    for (name, record) in &model.records {
+        if is_storage_record(name) {
+            let source_shape = record_blockers
+                .get(name)
+                .map_or("manual_exact_storage", |blocker| blocker.label());
+            report.push_str("\n[[storage_record]]\n");
+            let _ = writeln!(report, "name = \"{name}\"");
+            let _ = writeln!(report, "source_shape = \"{source_shape}\"");
+            continue;
+        }
+        let reason = if record.fields.is_none() {
+            Some("forward_declaration")
+        } else {
+            record_blockers.get(name).copied().map(RecordBlocker::label)
+        };
+        let Some(reason) = reason else {
+            continue;
+        };
         report.push_str("\n[[opaque_record]]\n");
         let _ = writeln!(report, "name = \"{name}\"");
-        let _ = writeln!(report, "reason = \"{}\"", blocker.label());
+        let _ = writeln!(report, "reason = \"{reason}\"");
     }
     for name in &macros.blocked {
         report.push_str("\n[[blocked_macro]]\n");
@@ -854,7 +916,7 @@ SDL_DYNAPI_PROC(SDL_GUID,SDL_GetGuid,(void),(),return)";
         assert_eq!(procedures.len(), 3);
         assert_eq!(procedures[0].blocker, None);
         assert_eq!(procedures[1].blocker, Some(Blocker::Variadic));
-        assert_eq!(procedures[2].blocker, Some(Blocker::ByValueAggregate));
+        assert_eq!(procedures[2].blocker, None);
     }
 
     #[test]

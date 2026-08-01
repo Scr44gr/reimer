@@ -559,6 +559,11 @@ extern "C" {
         argument_1: types::SDL_GPUTextureFormat,
         argument_2: types::SDL_GPUSampleCount,
     ) -> bool;
+    pub fn SDL_GUIDToString(
+        argument_0: types::SDL_GUID,
+        argument_1: *mut c::Char,
+        argument_2: c::Int,
+    );
     pub fn SDL_GamepadConnected(argument_0: *mut types::SDL_Gamepad) -> bool;
     pub fn SDL_GamepadEventsEnabled() -> bool;
     pub fn SDL_GamepadHasAxis(argument_0: *mut types::SDL_Gamepad, argument_1: types::SDL_GamepadAxis) -> bool;
@@ -709,9 +714,11 @@ extern "C" {
     pub fn SDL_GetGamepadFirmwareVersion(argument_0: *mut types::SDL_Gamepad) -> u16;
     pub fn SDL_GetGamepadFromID(argument_0: types::SDL_JoystickID) -> *mut types::SDL_Gamepad;
     pub fn SDL_GetGamepadFromPlayerIndex(argument_0: c::Int) -> *mut types::SDL_Gamepad;
+    pub fn SDL_GetGamepadGUIDForID(argument_0: types::SDL_JoystickID) -> types::SDL_GUID;
     pub fn SDL_GetGamepadID(argument_0: *mut types::SDL_Gamepad) -> types::SDL_JoystickID;
     pub fn SDL_GetGamepadJoystick(argument_0: *mut types::SDL_Gamepad) -> *mut types::SDL_Joystick;
     pub fn SDL_GetGamepadMapping(argument_0: *mut types::SDL_Gamepad) -> *mut c::Char;
+    pub fn SDL_GetGamepadMappingForGUID(argument_0: types::SDL_GUID) -> *mut c::Char;
     pub fn SDL_GetGamepadMappingForID(argument_0: types::SDL_JoystickID) -> *mut c::Char;
     pub fn SDL_GetGamepadMappings(argument_0: *mut c::Int) -> *mut *mut c::Char;
     pub fn SDL_GetGamepadName(argument_0: *mut types::SDL_Gamepad) -> *const c::Char;
@@ -785,6 +792,15 @@ extern "C" {
     pub fn SDL_GetJoystickFirmwareVersion(argument_0: *mut types::SDL_Joystick) -> u16;
     pub fn SDL_GetJoystickFromID(argument_0: types::SDL_JoystickID) -> *mut types::SDL_Joystick;
     pub fn SDL_GetJoystickFromPlayerIndex(argument_0: c::Int) -> *mut types::SDL_Joystick;
+    pub fn SDL_GetJoystickGUID(argument_0: *mut types::SDL_Joystick) -> types::SDL_GUID;
+    pub fn SDL_GetJoystickGUIDForID(argument_0: types::SDL_JoystickID) -> types::SDL_GUID;
+    pub fn SDL_GetJoystickGUIDInfo(
+        argument_0: types::SDL_GUID,
+        argument_1: *mut u16,
+        argument_2: *mut u16,
+        argument_3: *mut u16,
+        argument_4: *mut u16,
+    );
     pub fn SDL_GetJoystickHat(argument_0: *mut types::SDL_Joystick, argument_1: c::Int) -> u8;
     pub fn SDL_GetJoystickID(argument_0: *mut types::SDL_Joystick) -> types::SDL_JoystickID;
     pub fn SDL_GetJoystickName(argument_0: *mut types::SDL_Joystick) -> *const c::Char;
@@ -1751,6 +1767,7 @@ extern "C" {
         argument_1: *const c::Char,
         argument_2: f32,
     ) -> bool;
+    pub fn SDL_SetGPUBlendConstants(argument_0: *mut types::SDL_GPURenderPass, argument_1: types::SDL_FColor);
     pub fn SDL_SetGPUBufferName(
         argument_0: *mut types::SDL_GPUDevice,
         argument_1: *mut types::SDL_GPUBuffer,
@@ -2066,6 +2083,7 @@ extern "C" {
     pub fn SDL_StopHapticRumble(argument_0: *mut types::SDL_Haptic) -> bool;
     pub fn SDL_StopTextInput(argument_0: *mut types::SDL_Window) -> bool;
     pub fn SDL_StorageReady(argument_0: *mut types::SDL_Storage) -> bool;
+    pub fn SDL_StringToGUID(argument_0: *const c::Char) -> types::SDL_GUID;
     pub fn SDL_SubmitGPUCommandBuffer(argument_0: *mut types::SDL_GPUCommandBuffer) -> bool;
     pub fn SDL_SubmitGPUCommandBufferAndAcquireFence(argument_0: *mut types::SDL_GPUCommandBuffer) -> *mut types::SDL_GPUFence;
     pub fn SDL_SurfaceHasAlternateImages(argument_0: *mut types::SDL_Surface) -> bool;

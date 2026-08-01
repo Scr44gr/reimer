@@ -952,9 +952,19 @@ pub struct SDL_GamepadAxisEvent {
     pub padding4: u16,
 }
 
+/// Storage-compatible gamepad binding. The data arrays contain the active C union arms.
+@derive(Default)
 @repr(C)
 pub struct SDL_GamepadBinding {
-    private_byte: u8,
+    pub input_type: SDL_GamepadBindingType,
+    pub input_data: [c::Int; 3],
+    pub output_type: SDL_GamepadBindingType,
+    pub output_data: [c::Int; 3],
+}
+
+comptime {
+    assert(size_of<SDL_GamepadBinding>() == 32);
+    assert(align_of<SDL_GamepadBinding>() == 4);
 }
 
 @repr(C)
@@ -1061,9 +1071,18 @@ pub struct SDL_HapticDirection {
     pub dir: [i32; 3],
 }
 
+/// Storage-compatible haptic effect. Cast its address to the selected effect record inside `unsafe`.
+@derive(Default)
 @repr(C)
+@align(8)
 pub struct SDL_HapticEffect {
-    private_byte: u8,
+    pub type_value: SDL_HapticEffectType,
+    pub storage: [u8; 70],
+}
+
+comptime {
+    assert(size_of<SDL_HapticEffect>() == 72);
+    assert(align_of<SDL_HapticEffect>() == 8);
 }
 
 @repr(C)
@@ -1524,7 +1543,14 @@ pub struct SDL_StorageInterface {
 
 @repr(C)
 pub struct SDL_Surface {
-    private_byte: u8,
+    pub flags: SDL_SurfaceFlags,
+    pub format: SDL_PixelFormat,
+    pub w: c::Int,
+    pub h: c::Int,
+    pub pitch: c::Int,
+    pub pixels: *mut (),
+    pub refcount: c::Int,
+    pub reserved: *mut (),
 }
 
 @repr(C)
@@ -1564,7 +1590,10 @@ pub struct SDL_TextInputEvent {
 
 @repr(C)
 pub struct SDL_Texture {
-    private_byte: u8,
+    pub format: SDL_PixelFormat,
+    pub w: c::Int,
+    pub h: c::Int,
+    pub refcount: c::Int,
 }
 
 @repr(C)

@@ -221,6 +221,15 @@ pub(crate) fn parse_header(source: &str) -> Result<HeaderModel, HeaderError> {
         }
         collect_typedef(&declaration.node, &mut model, &mut enum_values)?;
     }
+    for external in &parsed.unit.0 {
+        let ExternalDeclaration::Declaration(declaration) = &external.node else {
+            continue;
+        };
+        if is_typedef(&declaration.node) {
+            continue;
+        }
+        collect_tagged_record_declarations(&declaration.node, &mut model, &enum_values);
+    }
     Ok(model)
 }
 
@@ -776,6 +785,28 @@ fn is_typedef(declaration: &Declaration) -> bool {
                 if storage.node == StorageClassSpecifier::Typedef
         )
     })
+}
+
+fn collect_tagged_record_declarations(
+    declaration: &Declaration,
+    model: &mut HeaderModel,
+    constants: &BTreeMap<String, i128>,
+) {
+    for specifier in &declaration.specifiers {
+        let DeclarationSpecifier::TypeSpecifier(ty) = &specifier.node else {
+            continue;
+        };
+        let TypeSpecifier::Struct(record) = &ty.node else {
+            continue;
+        };
+        let Some(identifier) = &record.node.identifier else {
+            continue;
+        };
+        let name = identifier.node.name.as_str();
+        if is_public_type_name(name) {
+            collect_record(name, &record.node, model, constants);
+        }
+    }
 }
 
 fn collect_typedef(
@@ -1404,7 +1435,7 @@ fn collect_named_types(ty: &CType, output: &mut BTreeSet<String>) {
 mod tests {
     use super::{
         CType, EnumConstant, HeaderModel, apply_declarator, declaration_base, evaluate_integer,
-        parse_macro_expansions, render_integer_literal, render_macro_probe,
+        parse_header, parse_macro_expansions, render_integer_literal, render_macro_probe,
     };
     use lang_c::ast::{DeclarationSpecifier, ExternalDeclaration};
     use lang_c::driver::{Config, Flavor};
@@ -1452,6 +1483,29 @@ mod tests {
     fn array_of_pointers_should_preserve_shape() {
         let (ty, _) = parse_typedef("typedef const char *Names[4];");
         assert_eq!(ty.render(), "[*const c::Char; 4]");
+    }
+
+    #[test]
+    fn tagged_record_definition_should_replace_its_forward_typedef() {
+        let source = "#line 1 \"C:/SDL/include/SDL3/SDL_surface.h\"\n\
+                      typedef unsigned int SDL_SurfaceFlags;\n\
+                      struct SDL_Surface { SDL_SurfaceFlags flags; int width; void *pixels; };\n\
+                      typedef struct SDL_Surface SDL_Surface;\n";
+
+        let header = parse_header(source).expect("header should parse");
+        let record = header
+            .records
+            .get("SDL_Surface")
+            .expect("surface record should exist");
+        let fields = record
+            .fields
+            .as_ref()
+            .expect("tagged definition should remain concrete");
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "flags");
+        assert_eq!(fields[1].name, "width");
+        assert_eq!(fields[2].name, "pixels");
     }
 
     #[test]

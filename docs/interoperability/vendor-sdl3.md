@@ -19,8 +19,10 @@ sdl3 = { path = "../reimer/vendor/sdl3", version = "=3.4.12" }
 
 The facade exposes reference-counted subsystem initialization, window
 ownership, events, generic input snapshots, clipboard text, timing, and
-whole-file byte loading. It intentionally contains no application-specific
-frame buffer, controls, or rendering policy:
+whole-file byte loading. Owned software surfaces, lifetime-bound window and
+software renderers, and gamepad identifier/handle wrappers are available in
+`surface`, `render`, and `gamepad`. The facade intentionally contains no
+application-specific frame buffer, controls, or rendering policy:
 
 ```reimer
 from sdl3 import Subsystems, Window;
@@ -72,7 +74,8 @@ The safe modules hide their native calls and validate values where necessary.
 Advanced bindings can use `sdl3::raw`, which exposes generated ABI declarations
 and therefore requires explicit `unsafe`. Input policy stays in the application:
 the vendor exposes typed mouse buttons and the complete SDL 3.4.12 physical-key
-scancode catalog, while each program maps them to its own actions.
+scancode catalog, plus typed physical gamepad axes and buttons, while each
+program maps them to its own actions.
 
 ## Run or build an application
 

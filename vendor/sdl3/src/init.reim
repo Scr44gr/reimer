@@ -29,6 +29,11 @@ impl Subsystems {
         self.flags
     }
 
+    /// Returns whether this value owns every requested subsystem flag.
+    pub fn contains(&self, flags: types::SDL_InitFlags) -> bool {
+        (self.flags & flags) == flags
+    }
+
     /// Releases this value's subsystem initialization reference.
     pub fn deinit(self) {
         unsafe {

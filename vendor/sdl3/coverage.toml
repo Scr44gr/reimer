@@ -2,8 +2,8 @@
 sdl_version = "3.4.12"
 source_commit = "f87239e71e42da91ca317a12eefb82cfbf3393eb"
 catalog_functions = 1270
-generated_functions = 1239
-blocked_functions = 31
+generated_functions = 1247
+blocked_functions = 23
 type_aliases = 153
 callback_types = 36
 enum_constants = 1164
@@ -11,8 +11,8 @@ discovered_object_macros = 997
 generated_object_macros = 799
 excluded_object_macros = 198
 blocked_object_macros = 0
-concrete_records = 118
-opaque_records = 46
+concrete_records = 122
+opaque_records = 42
 
 [[blocked]]
 name = "SDL_IOprintf"
@@ -75,44 +75,12 @@ name = "SDL_swprintf"
 reason = "c_variadic"
 
 [[blocked]]
-name = "SDL_GUIDToString"
-reason = "by_value_aggregate"
-
-[[blocked]]
-name = "SDL_GetGamepadGUIDForID"
-reason = "by_value_aggregate"
-
-[[blocked]]
-name = "SDL_GetGamepadMappingForGUID"
-reason = "by_value_aggregate"
-
-[[blocked]]
-name = "SDL_GetJoystickGUID"
-reason = "by_value_aggregate"
-
-[[blocked]]
-name = "SDL_GetJoystickGUIDForID"
-reason = "by_value_aggregate"
-
-[[blocked]]
-name = "SDL_GetJoystickGUIDInfo"
-reason = "by_value_aggregate"
-
-[[blocked]]
 name = "SDL_IOvprintf"
 reason = "platform_va_list"
 
 [[blocked]]
 name = "SDL_LogMessageV"
 reason = "platform_va_list"
-
-[[blocked]]
-name = "SDL_SetGPUBlendConstants"
-reason = "by_value_aggregate"
-
-[[blocked]]
-name = "SDL_StringToGUID"
-reason = "by_value_aggregate"
 
 [[blocked]]
 name = "SDL_vasprintf"
@@ -139,16 +107,184 @@ name = "SDL_RenderDebugTextFormat"
 reason = "c_variadic"
 
 [[opaque_record]]
+name = "SDL_AsyncIO"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_AsyncIOQueue"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_AudioStream"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Camera"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Condition"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Cursor"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_DisplayModeData"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Environment"
+reason = "forward_declaration"
+
+[[storage_record]]
 name = "SDL_Event"
-reason = "union"
+source_shape = "union"
 
 [[opaque_record]]
+name = "SDL_GLContextState"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUBuffer"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUCommandBuffer"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUComputePass"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUComputePipeline"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUCopyPass"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUDevice"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUFence"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUGraphicsPipeline"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPURenderPass"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPURenderState"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUSampler"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUShader"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUTexture"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_GPUTransferBuffer"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Gamepad"
+reason = "forward_declaration"
+
+[[storage_record]]
 name = "SDL_GamepadBinding"
-reason = "anonymous_field"
+source_shape = "anonymous_field"
 
 [[opaque_record]]
+name = "SDL_Haptic"
+reason = "forward_declaration"
+
+[[storage_record]]
 name = "SDL_HapticEffect"
-reason = "union"
+source_shape = "union"
+
+[[opaque_record]]
+name = "SDL_IOStream"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Joystick"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Mutex"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Process"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_RWLock"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Renderer"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Semaphore"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Sensor"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_SharedObject"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Storage"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Thread"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Tray"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_TrayEntry"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_TrayMenu"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_Window"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_hid_device"
+reason = "forward_declaration"
+
+[[opaque_record]]
+name = "SDL_iconv_data_t"
+reason = "forward_declaration"
 
 [[excluded_macro]]
 name = "SDL_APP_DIDENTERBACKGROUND"
