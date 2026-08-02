@@ -1,12 +1,35 @@
+# Rust build output
 /target/
 **/target/
-/.tmp/
+
+# Reimer build output
 /.reimer-build/
+**/.reimer-build/
 *.reimer.c
-/.agents/
-/output/
-/tmp/
-/skills-lock.json
 *.o
 *.obj
+*.pdb
+*.ilk
+*.exp
+
+# Generated editor packages and dependencies
+/editors/vscode/node_modules/
+/editors/vscode/out/
+/editors/vscode/server/
 *.vsix
+
+# Local caches and scratch directories
+/.ruff_cache/
+/.tmp/
+/tmp/
+/output/
+/examples/test.reim
+
+# Local agent configuration
+/.agents/
+/skills-lock.json
+
+# IDE and operating-system metadata
+/.idea/
+.DS_Store
+Thumbs.db

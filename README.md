@@ -1,9 +1,22 @@
-# Reimer
+<p align="center">
+  <img src="docs/assets/reimer-mascot.jpg" width="320" alt="The Reimer language mascot, drawn by Reimer">
+</p>
 
-[![CI](https://github.com/Scr44gr/reimer/actions/workflows/ci.yml/badge.svg)](https://github.com/Scr44gr/reimer/actions/workflows/ci.yml)
-[![Documentation](https://github.com/Scr44gr/reimer/actions/workflows/docs.yml/badge.svg)](https://scr44gr.github.io/reimer/)
+<h1 align="center">Reimer</h1>
 
-Reimer is an experimental compiled language for games, engines, and content tools. The compiler is written in Rust and lowers typed HIR to native machine code through Cranelift.
+<p align="center">
+  A native programming language for games, engines, and content tools.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Scr44gr/reimer/actions/workflows/ci.yml"><img src="https://github.com/Scr44gr/reimer/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://scr44gr.github.io/reimer/"><img src="https://github.com/Scr44gr/reimer/actions/workflows/docs.yml/badge.svg" alt="Documentation status"></a>
+</p>
+
+Reimer is an experimental compiled language with static types, explicit
+ownership, allocator-aware APIs, native interoperability, and tooling designed
+to support complete applications. The compiler is written in Rust and lowers
+typed HIR directly to native machine code through Cranelift.
 
 The current v0.1 surface includes static types, implicit moves, references, explicit allocators, recoverable errors, modules with `::` paths, packages and lockfiles, C FFI, traits and generics, compile-time evaluation, Unicode text, collections, filesystem and process APIs, tensors, concurrency, a linter/LSP, and standalone native executable linking.
 
@@ -17,6 +30,20 @@ fn main() -> i32 {
     }
 }
 ```
+
+## Dedication
+
+Reimer carries the name of a friend of mine named Reimer. He was an incredible
+and talented person, and the best friend I could have had during that part of
+my life. He drew the bird that became the language's mascot. When he sent the
+drawing to me, he wrote: *"mira el pupu q hice"* -- *"look at the pupu I
+made."*
+
+This language keeps his name, his drawing, and that small moment alive.
+
+> **"Mientras existas aquí jamas seras olvidado"**
+>
+> *"As long as you exist here, you will never be forgotten."*
 
 ## Start here
 
@@ -65,3 +92,7 @@ mdbook serve --open
 ```
 
 See [Contributing](docs/contributing.md) for the repository map and the required vertical compiler workflow.
+
+## License
+
+Reimer is available under the [MIT License](LICENSE).
