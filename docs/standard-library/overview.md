@@ -12,6 +12,8 @@ The standard library is source-visible and ships with the compiler. Public wrapp
 | Format values | `std::fmt` | `Display`, `Debug`, `Formatter`, `FormatError` |
 | Read and write terminals | `std::io` | `stdin`, `stdout`, `stderr`, `print`, `println`, bounded input buffers |
 | Work with files | `std::fs` | `File`, `FileBuffer`, `open`, `create`, `append`, `rename`, `remove_file` |
+| Decode binary formats | `std::binary` | bounded little-endian readers and IEEE-754 bit conversions |
+| Detect byte corruption | `std::checksum` | CRC-32/ISO-HDLC over borrowed bytes |
 | Measure and wait | `std::time` | `Duration`, `Instant`, `unix_time`, `monotonic`, `sleep` |
 | Inspect the process | `std::env` | arguments, variables, current directory, executable path |
 | Launch child processes | `std::process` | `Command`, `Child`, `ExitStatus`, `id`, `exit` |

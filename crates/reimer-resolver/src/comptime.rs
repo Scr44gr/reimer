@@ -375,9 +375,38 @@ impl<'ast, 'metadata, M: Metadata> Evaluator<'ast, 'metadata, M> {
             Expression::Tuple(tuple) => self
                 .evaluate_values(&tuple.elements, frame)
                 .map(Value::Tuple),
-            Expression::Array(array) => self
-                .evaluate_values(&array.elements, frame)
-                .map(Value::Array),
+            Expression::Array(array) => match &array.kind {
+                ast::ArrayExpressionKind::List(elements) => {
+                    self.evaluate_values(elements, frame).map(Value::Array)
+                }
+                ast::ArrayExpressionKind::Repeat { value, length } => {
+                    let length_value = self.evaluate_expression(length, frame)?;
+                    let Some(length) = length_value
+                        .as_non_negative_u128()
+                        .and_then(|value| usize::try_from(value).ok())
+                    else {
+                        return self.fail(
+                            "E7011",
+                            "repeated array length must be a non-negative integer constant",
+                            length.span(),
+                            "use a compile-time length that fits in `usize`",
+                        );
+                    };
+                    let value = self.evaluate_expression(value, frame)?;
+                    let element_storage = std::mem::size_of::<Value>()
+                        .saturating_add(value.memory_size())
+                        .max(1);
+                    if length > DEFAULT_MEMORY_LIMIT / element_storage {
+                        return self.fail(
+                            "E7014",
+                            "repeated array exceeds the compile-time memory limit",
+                            array.span,
+                            "reduce the repeated length or construct the array at runtime",
+                        );
+                    }
+                    Ok(Value::Array(vec![value; length]))
+                }
+            },
             Expression::Struct(structure) => {
                 let mut fields = BTreeMap::new();
                 for field in &structure.fields {

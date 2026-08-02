@@ -1,0 +1,895 @@
+import std::c;
+import std::slice;
+from std::string import as_ptr as string_as_ptr, byte_len as string_byte_len;
+
+import self::raw::constants as constants;
+import self::raw::functions as api;
+import self::raw::types as types;
+
+@link("wgpu_bridge")
+extern "C" {
+    fn wgpuBridgeCreateInstance() -> types::WGPUInstance;
+    fn wgpuBridgeRequestAdapter(
+        instance: types::WGPUInstance,
+        options: *const types::WGPURequestAdapterOptions,
+        status: *mut types::WGPURequestAdapterStatus,
+        adapter: *mut types::WGPUAdapter,
+    ) -> types::WGPUWaitStatus;
+    fn wgpuBridgeRequestDevice(
+        adapter: types::WGPUAdapter,
+        descriptor: *const types::WGPUDeviceDescriptor,
+        status: *mut types::WGPURequestDeviceStatus,
+        device: *mut types::WGPUDevice,
+    ) -> types::WGPUWaitStatus;
+    fn wgpuBridgeMapBuffer(
+        device: types::WGPUDevice,
+        buffer: types::WGPUBuffer,
+        mode: types::WGPUMapMode,
+        offset: usize,
+        size: usize,
+        status: *mut types::WGPUMapAsyncStatus,
+    ) -> types::WGPUWaitStatus;
+}
+
+/// Recoverable errors produced by the safe WebGPU facade.
+@derive(Copy, Clone, Debug, Eq)
+pub enum Error {
+    InstanceCreationFailed,
+    WaitFailed,
+    AdapterUnavailable,
+    AdapterRequestCancelled,
+    AdapterRequestFailed,
+    DeviceRequestCancelled,
+    DeviceRequestFailed,
+    ResourceCreationFailed,
+    InvalidBufferRange,
+    BufferMapCancelled,
+    BufferMapAborted,
+    BufferMapFailed,
+    QueueWorkCancelled,
+    QueueWorkFailed,
+    SurfaceTimeout,
+    SurfaceOutdated,
+    SurfaceLost,
+    SurfaceOccluded,
+    SurfaceFailed,
+    PresentFailed,
+}
+
+/// Creates a WebGPU string view that borrows `value`.
+///
+/// The returned view must not outlive the source string. WebGPU descriptor
+/// creation functions consume these strings during the call.
+pub fn string_view(value: str) -> types::WGPUStringView {
+    types::WGPUStringView {
+        data: string_as_ptr(value) as *const c::Char,
+        length: string_byte_len(value),
+    }
+}
+
+/// Creates the empty WebGPU string view used for optional labels.
+pub fn empty_string_view() -> types::WGPUStringView {
+    types::WGPUStringView {
+        data: c::null_const<c::Char>(),
+        length: 0,
+    }
+}
+
+/// An owning WebGPU instance with blocking callback synchronization.
+pub struct Instance {
+    raw: types::WGPUInstance,
+}
+
+impl Instance {
+    /// Creates an instance configured for efficient blocking requests.
+    pub fn create() -> Result<Instance, Error> {
+        let raw = unsafe { wgpuBridgeCreateInstance() };
+        if c::is_null_mut(raw) {
+            Err(Error::InstanceCreationFailed)
+        } else {
+            Ok(Instance { raw: raw })
+        }
+    }
+
+    /// Requests the system's default adapter and waits without busy-spinning.
+    pub fn request_adapter(&self) -> Result<Adapter, Error> {
+        let options = types::WGPURequestAdapterOptions {
+            next_in_chain: c::null<types::WGPUChainedStruct>(),
+            feature_level: constants::WGPUFeatureLevel_Undefined,
+            power_preference: constants::WGPUPowerPreference_Undefined,
+            force_fallback_adapter: 0,
+            backend_type: constants::WGPUBackendType_Undefined,
+            compatible_surface: c::null<()>(),
+        };
+        self.request_adapter_with(&options)
+    }
+
+    /// Requests an adapter using an advanced raw descriptor.
+    ///
+    /// The caller must keep every pointer in `options` valid for the call and
+    /// obey all WebGPU descriptor-chain contracts.
+    pub fn request_adapter_with(
+        &self,
+        options: &types::WGPURequestAdapterOptions,
+    ) -> Result<Adapter, Error> {
+        request_adapter_from(self.raw, options)
+    }
+
+    /// Returns the borrowed native instance handle for descriptor adapters.
+    pub fn as_raw(&self) -> types::WGPUInstance {
+        self.raw
+    }
+
+    /// Creates another owning reference to this native instance.
+    pub fn clone_ref(&self) -> Instance {
+        unsafe {
+            api::wgpuInstanceAddRef(self.raw);
+        }
+        Instance { raw: self.raw }
+    }
+
+    /// Creates a surface from a platform descriptor chain.
+    ///
+    /// The caller must supply a valid chain whose native objects remain alive
+    /// for the lifetime required by the selected window system.
+    pub fn create_surface_with(
+        &self,
+        descriptor: &types::WGPUSurfaceDescriptor,
+    ) -> Result<Surface, Error> {
+        let raw = unsafe {
+            api::wgpuInstanceCreateSurface(
+                self.raw,
+                descriptor as *const types::WGPUSurfaceDescriptor,
+            )
+        };
+        if c::is_null_mut(raw) {
+            return Err(Error::ResourceCreationFailed);
+        }
+        unsafe {
+            api::wgpuInstanceAddRef(self.raw);
+        }
+        Ok(Surface { instance: self.raw, raw: raw })
+    }
+
+    /// Releases the instance after all dependent objects are gone.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuInstanceRelease(self.raw);
+        }
+    }
+}
+
+/// An owning physical-device adapter borrowing its instance.
+pub struct Adapter {
+    raw: types::WGPUAdapter,
+}
+
+impl Adapter {
+    /// Requests a device with WebGPU's default descriptor.
+    pub fn request_device(&self) -> Result<Device, Error> {
+        let mut status = constants::WGPURequestDeviceStatus_Error;
+        let mut device: types::WGPUDevice = c::null<()>();
+        let wait_status = unsafe {
+            wgpuBridgeRequestDevice(
+                self.raw,
+                c::null_const<types::WGPUDeviceDescriptor>(),
+                &mut status as *mut types::WGPURequestDeviceStatus,
+                &mut device as *mut types::WGPUDevice,
+            )
+        };
+        if wait_status == constants::WGPUWaitStatus_Success
+            && status == constants::WGPURequestDeviceStatus_Success
+            && !c::is_null_mut(device)
+        {
+            return Ok(Device { raw: device });
+        }
+        if !c::is_null_mut(device) {
+            unsafe {
+                api::wgpuDeviceRelease(device);
+            }
+        }
+        if wait_status != constants::WGPUWaitStatus_Success {
+            Err(Error::WaitFailed)
+        } else if status == constants::WGPURequestDeviceStatus_CallbackCancelled {
+            Err(Error::DeviceRequestCancelled)
+        } else {
+            Err(Error::DeviceRequestFailed)
+        }
+    }
+
+    /// Returns the borrowed native adapter handle.
+    pub fn as_raw(&self) -> types::WGPUAdapter {
+        self.raw
+    }
+
+    /// Releases this adapter reference.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuAdapterRelease(self.raw);
+        }
+    }
+}
+
+/// An owning logical device borrowing the instance that services its futures.
+pub struct Device {
+    raw: types::WGPUDevice,
+}
+
+impl Device {
+    /// Gets an owning reference to the device's default queue.
+    pub fn queue(&self) -> Result<Queue, Error> {
+        let raw = unsafe { api::wgpuDeviceGetQueue(self.raw) };
+        if c::is_null_mut(raw) {
+            Err(Error::ResourceCreationFailed)
+        } else {
+            unsafe {
+                api::wgpuDeviceAddRef(self.raw);
+            }
+            Ok(Queue {
+                device: self.raw,
+                raw: raw,
+            })
+        }
+    }
+
+    /// Creates an owned, initially unmapped buffer.
+    pub fn create_buffer(
+        &self,
+        size: u64,
+        usage: types::WGPUBufferUsage,
+    ) -> Result<Buffer, Error> {
+        let descriptor = types::WGPUBufferDescriptor {
+            next_in_chain: c::null<types::WGPUChainedStruct>(),
+            label: empty_string_view(),
+            usage: usage,
+            size: size,
+            mapped_at_creation: 0,
+        };
+        let raw = unsafe {
+            api::wgpuDeviceCreateBuffer(
+                self.raw,
+                &descriptor as *const types::WGPUBufferDescriptor,
+            )
+        };
+        if c::is_null_mut(raw) {
+            Err(Error::ResourceCreationFailed)
+        } else {
+            unsafe {
+                api::wgpuDeviceAddRef(self.raw);
+            }
+            Ok(Buffer {
+                device: self.raw,
+                raw: raw,
+            })
+        }
+    }
+
+    /// Creates a WGSL shader module from borrowed UTF-8 source text.
+    pub fn create_shader_module_wgsl(
+        &self,
+        label: str,
+        source: str,
+    ) -> Result<ShaderModule, Error> {
+        let mut wgsl = types::WGPUShaderSourceWGSL {
+            chain: types::WGPUChainedStruct {
+                next: c::null<types::WGPUChainedStruct>(),
+                s_type: constants::WGPUSType_ShaderSourceWGSL,
+            },
+            code: string_view(source),
+        };
+        let descriptor = types::WGPUShaderModuleDescriptor {
+            next_in_chain: &mut wgsl.chain as *mut types::WGPUChainedStruct,
+            label: string_view(label),
+        };
+        let raw = unsafe {
+            api::wgpuDeviceCreateShaderModule(
+                self.raw,
+                &descriptor as *const types::WGPUShaderModuleDescriptor,
+            )
+        };
+        owned_shader_module(raw)
+    }
+
+    /// Creates an empty command encoder.
+    pub fn create_command_encoder(&self) -> Result<CommandEncoder, Error> {
+        let raw = unsafe {
+            api::wgpuDeviceCreateCommandEncoder(
+                self.raw,
+                c::null_const<types::WGPUCommandEncoderDescriptor>(),
+            )
+        };
+        if c::is_null_mut(raw) {
+            Err(Error::ResourceCreationFailed)
+        } else {
+            Ok(CommandEncoder {
+                raw: raw,
+            })
+        }
+    }
+
+    /// Returns the borrowed native device handle.
+    pub fn as_raw(&self) -> types::WGPUDevice {
+        self.raw
+    }
+
+    /// Releases the logical device after all child resources are gone.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuDeviceRelease(self.raw);
+        }
+    }
+}
+
+/// An owning queue reference borrowing its device and instance.
+pub struct Queue {
+    device: types::WGPUDevice,
+    raw: types::WGPUQueue,
+}
+
+impl Queue {
+    /// Copies bytes immediately into a buffer at `offset`.
+    pub fn write_buffer(
+        &self,
+        buffer: &Buffer,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        let len = slice::byte_len(data);
+        if offset > buffer.size() || len as u64 > buffer.size() - offset {
+            return Err(Error::InvalidBufferRange);
+        }
+        let pointer = slice::bytes_as_ptr(data) as *const ();
+        unsafe {
+            api::wgpuQueueWriteBuffer(self.raw, buffer.as_raw(), offset, pointer, len);
+        }
+        Ok(())
+    }
+
+    /// Submits one finished command buffer and releases its host reference.
+    pub fn submit(&self, command: CommandBuffer) {
+        let raw = command.as_raw();
+        unsafe {
+            api::wgpuQueueSubmit(
+                self.raw,
+                1,
+                &raw as *const types::WGPUCommandBuffer,
+            );
+        }
+        command.deinit();
+    }
+
+    /// Waits for previously submitted work without consuming CPU.
+    pub fn wait(&self) -> Result<(), Error> {
+        if unsafe {
+            api::wgpuDevicePoll(
+                self.device,
+                1,
+                c::null_const<types::WGPUSubmissionIndex>(),
+            )
+        } != 0 {
+            Ok(())
+        } else {
+            Err(Error::QueueWorkFailed)
+        }
+    }
+
+    /// Returns the borrowed native queue handle.
+    pub fn as_raw(&self) -> types::WGPUQueue {
+        self.raw
+    }
+
+    /// Releases this queue reference.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuQueueRelease(self.raw);
+            api::wgpuDeviceRelease(self.device);
+        }
+    }
+}
+
+/// An owning GPU buffer.
+pub struct Buffer {
+    device: types::WGPUDevice,
+    raw: types::WGPUBuffer,
+}
+
+impl Buffer {
+    /// Returns the buffer size in bytes.
+    pub fn size(&self) -> u64 {
+        unsafe { api::wgpuBufferGetSize(self.raw) }
+    }
+
+    /// Maps a byte range for read access and waits without busy-spinning.
+    pub fn map_read(
+        &mut self,
+        offset: usize,
+        size: usize,
+    ) -> Result<ReadMapping, Error> {
+        let total = unsafe { api::wgpuBufferGetSize(self.raw) };
+        let offset_u64 = offset as u64;
+        let size_u64 = size as u64;
+        if size == 0 || offset_u64 > total || size_u64 > total - offset_u64 {
+            return Err(Error::InvalidBufferRange);
+        }
+        let mut status: types::WGPUMapAsyncStatus =
+            constants::WGPUMapAsyncStatus_Error;
+        let wait_status = unsafe {
+            wgpuBridgeMapBuffer(
+                self.device,
+                self.raw,
+                constants::WGPUMapMode_Read,
+                offset,
+                size,
+                &mut status as *mut types::WGPUMapAsyncStatus,
+            )
+        };
+        check_mapping_status(wait_status, status)?;
+        let data = unsafe {
+            api::wgpuBufferGetConstMappedRange(self.raw, offset, size)
+        } as *const u8;
+        if c::is_null(data) {
+            unsafe {
+                api::wgpuBufferUnmap(self.raw);
+            }
+            Err(Error::BufferMapFailed)
+        } else {
+            Ok(ReadMapping { buffer: self, data: data, len: size })
+        }
+    }
+
+    /// Maps a byte range for write access and waits without busy-spinning.
+    pub fn map_write(
+        &mut self,
+        offset: usize,
+        size: usize,
+    ) -> Result<WriteMapping, Error> {
+        let total = unsafe { api::wgpuBufferGetSize(self.raw) };
+        let offset_u64 = offset as u64;
+        let size_u64 = size as u64;
+        if size == 0 || offset_u64 > total || size_u64 > total - offset_u64 {
+            return Err(Error::InvalidBufferRange);
+        }
+        let mut status: types::WGPUMapAsyncStatus =
+            constants::WGPUMapAsyncStatus_Error;
+        let wait_status = unsafe {
+            wgpuBridgeMapBuffer(
+                self.device,
+                self.raw,
+                constants::WGPUMapMode_Write,
+                offset,
+                size,
+                &mut status as *mut types::WGPUMapAsyncStatus,
+            )
+        };
+        check_mapping_status(wait_status, status)?;
+        let data = unsafe {
+            api::wgpuBufferGetMappedRange(self.raw, offset, size)
+        } as *mut u8;
+        if c::is_null_mut(data) {
+            unsafe {
+                api::wgpuBufferUnmap(self.raw);
+            }
+            Err(Error::BufferMapFailed)
+        } else {
+            Ok(WriteMapping { buffer: self, data: data, len: size })
+        }
+    }
+
+    /// Explicitly destroys the GPU allocation while retaining the handle.
+    pub fn destroy(&mut self) {
+        unsafe {
+            api::wgpuBufferDestroy(self.raw);
+        }
+    }
+
+    /// Returns the borrowed native buffer handle.
+    pub fn as_raw(&self) -> types::WGPUBuffer {
+        self.raw
+    }
+
+    /// Releases the buffer reference.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuBufferRelease(self.raw);
+            api::wgpuDeviceRelease(self.device);
+        }
+    }
+}
+
+/// A read-only mapped buffer range borrowing its buffer.
+pub struct ReadMapping {
+    buffer: &mut Buffer,
+    data: *const u8,
+    len: usize,
+}
+
+impl ReadMapping {
+    /// Returns the mapped range length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Reads one byte, or returns `None` when `index` is out of bounds.
+    pub fn get(&self, index: usize) -> Option<u8> {
+        if index >= self.len {
+            None
+        } else {
+            let pointer = (self.data as usize + index) as *const u8;
+            Some(unsafe { *pointer })
+        }
+    }
+
+    /// Unmaps the range and returns access to its buffer to the caller.
+    pub fn unmap(self) {
+        unsafe {
+            api::wgpuBufferUnmap(self.buffer.raw);
+        }
+    }
+}
+
+/// A writable mapped buffer range borrowing its buffer.
+pub struct WriteMapping {
+    buffer: &mut Buffer,
+    data: *mut u8,
+    len: usize,
+}
+
+impl WriteMapping {
+    /// Returns the mapped range length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Reads one byte, or returns `None` when `index` is out of bounds.
+    pub fn get(&self, index: usize) -> Option<u8> {
+        if index >= self.len {
+            None
+        } else {
+            let pointer = (self.data as usize + index) as *const u8;
+            Some(unsafe { *pointer })
+        }
+    }
+
+    /// Writes one byte after checking the mapped range bounds.
+    pub fn set(&mut self, index: usize, value: u8) -> Result<(), Error> {
+        if index >= self.len {
+            Err(Error::InvalidBufferRange)
+        } else {
+            let pointer = (self.data as usize + index) as *mut u8;
+            unsafe {
+                *pointer = value;
+            }
+            Ok(())
+        }
+    }
+
+    /// Unmaps the range and makes writes visible to the GPU.
+    pub fn unmap(self) {
+        unsafe {
+            api::wgpuBufferUnmap(self.buffer.raw);
+        }
+    }
+}
+
+/// An owning shader module.
+pub struct ShaderModule {
+    raw: types::WGPUShaderModule,
+}
+
+impl ShaderModule {
+    /// Returns the borrowed native shader-module handle.
+    pub fn as_raw(&self) -> types::WGPUShaderModule {
+        self.raw
+    }
+
+    /// Releases the shader module.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuShaderModuleRelease(self.raw);
+        }
+    }
+}
+
+/// An owning command encoder.
+pub struct CommandEncoder {
+    raw: types::WGPUCommandEncoder,
+}
+
+impl CommandEncoder {
+    /// Finishes recording and transfers ownership to a command buffer.
+    pub fn finish(self) -> Result<CommandBuffer, Error> {
+        let raw = unsafe {
+            api::wgpuCommandEncoderFinish(
+                self.raw,
+                c::null_const<types::WGPUCommandBufferDescriptor>(),
+            )
+        };
+        unsafe {
+            api::wgpuCommandEncoderRelease(self.raw);
+        }
+        if c::is_null_mut(raw) {
+            Err(Error::ResourceCreationFailed)
+        } else {
+            Ok(CommandBuffer { raw: raw })
+        }
+    }
+
+    /// Releases an unfinished encoder.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuCommandEncoderRelease(self.raw);
+        }
+    }
+}
+
+/// An owning, finished command buffer.
+pub struct CommandBuffer {
+    raw: types::WGPUCommandBuffer,
+}
+
+impl CommandBuffer {
+    /// Returns the borrowed native command-buffer handle.
+    pub fn as_raw(&self) -> types::WGPUCommandBuffer {
+        self.raw
+    }
+
+    /// Releases the command buffer.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuCommandBufferRelease(self.raw);
+        }
+    }
+}
+
+/// An owning presentation surface borrowing its instance.
+pub struct Surface {
+    instance: types::WGPUInstance,
+    raw: types::WGPUSurface,
+}
+
+impl Surface {
+    /// Requests an adapter compatible with this surface.
+    pub fn request_adapter(&self) -> Result<Adapter, Error> {
+        let options = types::WGPURequestAdapterOptions {
+            next_in_chain: c::null<types::WGPUChainedStruct>(),
+            feature_level: constants::WGPUFeatureLevel_Undefined,
+            power_preference: constants::WGPUPowerPreference_Undefined,
+            force_fallback_adapter: 0,
+            backend_type: constants::WGPUBackendType_Undefined,
+            compatible_surface: self.raw,
+        };
+        request_adapter_from(self.instance, &options)
+    }
+
+    /// Configures this surface for rendering and FIFO presentation.
+    pub fn configure(
+        &mut self,
+        device: &Device,
+        format: types::WGPUTextureFormat,
+        width: u32,
+        height: u32,
+    ) {
+        let config = types::WGPUSurfaceConfiguration {
+            next_in_chain: c::null<types::WGPUChainedStruct>(),
+            device: device.as_raw(),
+            format: format,
+            usage: constants::WGPUTextureUsage_RenderAttachment,
+            width: width,
+            height: height,
+            view_format_count: 0,
+            view_formats: c::null_const<types::WGPUTextureFormat>(),
+            alpha_mode: constants::WGPUCompositeAlphaMode_Auto,
+            present_mode: constants::WGPUPresentMode_Fifo,
+        };
+        unsafe {
+            api::wgpuSurfaceConfigure(
+                self.raw,
+                &config as *const types::WGPUSurfaceConfiguration,
+            );
+        }
+    }
+
+    /// Acquires the next presentable texture.
+    pub fn acquire(&self) -> Result<SurfaceFrame, Error> {
+        let mut texture = types::WGPUSurfaceTexture {
+            next_in_chain: c::null<types::WGPUChainedStruct>(),
+            texture: c::null<()>(),
+            status: 0,
+        };
+        unsafe {
+            api::wgpuSurfaceGetCurrentTexture(
+                self.raw,
+                &mut texture as *mut types::WGPUSurfaceTexture,
+            );
+        }
+        if texture.status == constants::WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal
+            || texture.status == constants::WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal
+        {
+            if c::is_null_mut(texture.texture) {
+                Err(Error::SurfaceFailed)
+            } else {
+                unsafe {
+                    api::wgpuSurfaceAddRef(self.raw);
+                }
+                Ok(SurfaceFrame {
+                    surface: self.raw,
+                    texture: texture.texture,
+                    suboptimal: texture.status
+                        == constants::WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal,
+                })
+            }
+        } else {
+            Err(surface_error(texture.status))
+        }
+    }
+
+    /// Removes the current device configuration.
+    pub fn unconfigure(&mut self) {
+        unsafe {
+            api::wgpuSurfaceUnconfigure(self.raw);
+        }
+    }
+
+    /// Returns the borrowed native surface handle.
+    pub fn as_raw(&self) -> types::WGPUSurface {
+        self.raw
+    }
+
+    /// Releases the surface after it has been unconfigured.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuSurfaceRelease(self.raw);
+            api::wgpuInstanceRelease(self.instance);
+        }
+    }
+}
+
+/// One acquired presentation image.
+pub struct SurfaceFrame {
+    surface: types::WGPUSurface,
+    texture: types::WGPUTexture,
+    suboptimal: bool,
+}
+
+impl SurfaceFrame {
+    /// Reports whether the surface should be reconfigured soon.
+    pub fn is_suboptimal(&self) -> bool {
+        self.suboptimal
+    }
+
+    /// Creates a default view borrowing the frame's texture lifetime.
+    pub fn create_view(&self) -> Result<SurfaceTextureView, Error> {
+        let raw = unsafe {
+            api::wgpuTextureCreateView(
+                self.texture,
+                c::null_const<types::WGPUTextureViewDescriptor>(),
+            )
+        };
+        if c::is_null_mut(raw) {
+            Err(Error::ResourceCreationFailed)
+        } else {
+            Ok(SurfaceTextureView { raw: raw })
+        }
+    }
+
+    /// Presents the frame and releases its texture reference.
+    pub fn present(self) -> Result<(), Error> {
+        let status = unsafe { api::wgpuSurfacePresent(self.surface) };
+        unsafe {
+            api::wgpuTextureRelease(self.texture);
+            api::wgpuSurfaceRelease(self.surface);
+        }
+        if status == constants::WGPUStatus_Success {
+            Ok(())
+        } else {
+            Err(Error::PresentFailed)
+        }
+    }
+
+    /// Releases an acquired frame without presenting it.
+    pub fn discard(self) {
+        unsafe {
+            api::wgpuTextureRelease(self.texture);
+            api::wgpuSurfaceRelease(self.surface);
+        }
+    }
+}
+
+/// A texture view borrowing an acquired surface frame.
+pub struct SurfaceTextureView {
+    raw: types::WGPUTextureView,
+}
+
+impl SurfaceTextureView {
+    /// Returns the borrowed native texture-view handle.
+    pub fn as_raw(&self) -> types::WGPUTextureView {
+        self.raw
+    }
+
+    /// Releases the view before its surface frame is presented.
+    pub fn deinit(self) {
+        unsafe {
+            api::wgpuTextureViewRelease(self.raw);
+        }
+    }
+}
+
+fn owned_shader_module(
+    raw: types::WGPUShaderModule,
+) -> Result<ShaderModule, Error> {
+    if c::is_null_mut(raw) {
+        Err(Error::ResourceCreationFailed)
+    } else {
+        Ok(ShaderModule { raw: raw })
+    }
+}
+
+fn request_adapter_from(
+    instance: types::WGPUInstance,
+    options: &types::WGPURequestAdapterOptions,
+) -> Result<Adapter, Error> {
+    let mut status = constants::WGPURequestAdapterStatus_Error;
+    let mut adapter: types::WGPUAdapter = c::null<()>();
+    let wait_status = unsafe {
+        wgpuBridgeRequestAdapter(
+            instance,
+            options as *const types::WGPURequestAdapterOptions,
+            &mut status as *mut types::WGPURequestAdapterStatus,
+            &mut adapter as *mut types::WGPUAdapter,
+        )
+    };
+    if wait_status == constants::WGPUWaitStatus_Success
+        && status == constants::WGPURequestAdapterStatus_Success
+        && !c::is_null_mut(adapter)
+    {
+        return Ok(Adapter { raw: adapter });
+    }
+    if !c::is_null_mut(adapter) {
+        unsafe {
+            api::wgpuAdapterRelease(adapter);
+        }
+    }
+    if wait_status != constants::WGPUWaitStatus_Success {
+        Err(Error::WaitFailed)
+    } else if status == constants::WGPURequestAdapterStatus_CallbackCancelled {
+        Err(Error::AdapterRequestCancelled)
+    } else if status == constants::WGPURequestAdapterStatus_Unavailable {
+        Err(Error::AdapterUnavailable)
+    } else {
+        Err(Error::AdapterRequestFailed)
+    }
+}
+
+fn check_mapping_status(
+    wait_status: types::WGPUWaitStatus,
+    status: types::WGPUMapAsyncStatus,
+) -> Result<(), Error> {
+    if wait_status != constants::WGPUWaitStatus_Success {
+        return Err(Error::WaitFailed);
+    }
+    if status == constants::WGPUMapAsyncStatus_CallbackCancelled {
+        return Err(Error::BufferMapCancelled);
+    }
+    if status == constants::WGPUMapAsyncStatus_Aborted {
+        return Err(Error::BufferMapAborted);
+    }
+    if status == constants::WGPUMapAsyncStatus_Success {
+        Ok(())
+    } else {
+        Err(Error::BufferMapFailed)
+    }
+}
+
+fn surface_error(status: types::WGPUSurfaceGetCurrentTextureStatus) -> Error {
+    if status == constants::WGPUSurfaceGetCurrentTextureStatus_Timeout {
+        Error::SurfaceTimeout
+    } else if status == constants::WGPUSurfaceGetCurrentTextureStatus_Outdated {
+        Error::SurfaceOutdated
+    } else if status == constants::WGPUSurfaceGetCurrentTextureStatus_Lost {
+        Error::SurfaceLost
+    } else if status == constants::WGPUSurfaceGetCurrentTextureStatus_Occluded {
+        Error::SurfaceOccluded
+    } else {
+        Error::SurfaceFailed
+    }
+}

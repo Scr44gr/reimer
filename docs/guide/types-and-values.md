@@ -23,6 +23,20 @@ let ratio: f64 = 0.5;
 let scalar: char = 'λ';
 ```
 
+Explicit `f32`/`f64` casts to integer types up to 64 bits truncate toward zero
+and saturate at the destination range. `NaN` converts to zero. These semantics
+are defined by Reimer and do not depend on a platform's native conversion
+instruction:
+
+```reimer
+let frame: u32 = 41.9 as u32;       // 41
+let channel: u8 = 300.0 as u8;      // 255
+let unsigned: u16 = -2.0 as u16;    // 0
+```
+
+Float-to-`i128` and float-to-`u128` casts are intentionally rejected until the
+native backend can preserve the same saturating contract at those widths.
+
 ## Tuples and arrays
 
 Tuples combine values with fixed, possibly different types. Arrays contain a compile-time number of values of one type.
@@ -30,10 +44,24 @@ Tuples combine values with fixed, possibly different types. Arrays contain a com
 ```reimer
 let status: (i32, bool) = (42, true);
 let samples: [f32; 4] = [0.0, 0.25, 0.5, 1.0];
+let cleared: [u32; 256] = [0; 256];
 
 let code = status.0;
 let sample = samples[2];
 ```
+
+`[value; N]` evaluates `value` exactly once and copies it into all `N`
+elements. `N` is a compile-time non-negative integer, including a const generic,
+and the element type must satisfy `Copy`:
+
+```reimer
+fn filled<T: Copy, const N: usize>(value: T) -> [T; N] {
+    [value; N]
+}
+```
+
+Use an explicit element list when each element must be constructed separately
+or owns resources.
 
 Array and slice indexing is always bounds checked. `get` and `get_mut` return `Option` when an invalid index is expected rather than exceptional.
 

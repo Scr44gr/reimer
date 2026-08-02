@@ -1,0 +1,57 @@
+format = 1
+
+[[package]]
+id = "2cd76739b1e7b319c68f889b"
+name = "sdl3"
+version = "3.4.12"
+source = "path+../../vendor/sdl3"
+checksum = "dcc58503e2ea9d0533b021a3e329363b856037c80a7277daea59f7dfc0a475b7"
+dependencies = []
+
+[[package]]
+id = "53c552c23555ac09c03d05f2"
+name = "wgpu-window"
+version = "0.1.0"
+source = "path+."
+checksum = "bebacb86b0fab1c76fa87763c39e2cbfbb42700af9929c4361941adbbe760180"
+
+[[package.dependencies]]
+alias = "sdl3"
+request = "path+../../vendor/sdl3"
+package = "2cd76739b1e7b319c68f889b"
+
+[[package.dependencies]]
+alias = "wgpu"
+request = "path+../../vendor/wgpu"
+package = "ba665127e4683f3f1dee0e46"
+
+[[package.dependencies]]
+alias = "wgpu_sdl3"
+request = "path+../../vendor/wgpu-sdl3"
+package = "a35bd537495c522b2bb47fe6"
+
+[[package]]
+id = "a35bd537495c522b2bb47fe6"
+name = "wgpu-sdl3"
+version = "0.1.0"
+source = "path+../../vendor/wgpu-sdl3"
+checksum = "14f264bc66fb45e3f79fd91f064c3916321235fa2a3f28d38bcc712a90c86169"
+
+[[package.dependencies]]
+alias = "sdl3"
+request = "path+../sdl3"
+package = "2cd76739b1e7b319c68f889b"
+
+[[package.dependencies]]
+alias = "wgpu"
+request = "path+../wgpu"
+package = "ba665127e4683f3f1dee0e46"
+
+[[package]]
+id = "ba665127e4683f3f1dee0e46"
+name = "wgpu"
+version = "29.0.1"
+source = "path+../../vendor/wgpu"
+checksum = "0f9d8daf9c1f30d6ecdf8ebe290261f17370c009f70e78d4b3841d83b90ccb65"
+dependencies = []
+

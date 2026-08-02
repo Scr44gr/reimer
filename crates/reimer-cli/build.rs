@@ -18,31 +18,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     optimization_flag.push(optimization);
     let runtime_source = manifest_directory.join("../reimer-runtime/src/lib.rs");
     let runtime_archive = output_directory.join("libreimer_runtime.rlib");
-    let sysroot_output = Command::new(&compiler)
-        .args(["--print", "sysroot"])
-        .output()?;
-    if !sysroot_output.status.success() {
-        return Err(io::Error::other(format!(
-            "failed to locate the Rust sysroot:\n{}",
-            String::from_utf8_lossy(&sysroot_output.stderr)
-        ))
-        .into());
-    }
-    let sysroot = PathBuf::from(String::from_utf8(sysroot_output.stdout)?.trim());
-    let linker = sysroot
-        .join("lib")
-        .join("rustlib")
-        .join(&target)
-        .join("bin")
-        .join(format!("rust-lld{}", env::consts::EXE_SUFFIX));
-    if !linker.is_file() {
-        return Err(io::Error::other(format!(
-            "bundled native linker was not found at `{}`",
-            linker.display()
-        ))
-        .into());
-    }
-
     let output = Command::new(&compiler)
         .arg(&runtime_source)
         .args([
@@ -74,10 +49,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         runtime_archive.display()
     );
     println!(
-        "cargo:rustc-env=REIMER_RUST_COMPILER={}",
-        PathBuf::from(compiler).display()
+        "cargo:rustc-env=REIMER_HOST_TARGET={}",
+        target.to_string_lossy()
     );
-    println!("cargo:rustc-env=REIMER_NATIVE_LINKER={}", linker.display());
     Ok(())
 }
 

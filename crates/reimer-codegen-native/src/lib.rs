@@ -92,6 +92,145 @@ impl NativeLibraries {
     }
 }
 
+fn prepare_extern_return(
+    builder: &mut FunctionBuilder<'_>,
+    state: &CodegenState<'_>,
+    return_type: Type,
+    passing: &ReturnPassing,
+    arguments: &mut Vec<Value>,
+) -> Result<Option<Value>, String> {
+    match passing {
+        ReturnPassing::DirectAggregate { storage_size, .. } => {
+            let layout = state.layouts.aggregate(return_type)?.value;
+            allocate_zeroed_abi_storage(builder, state, *storage_size, layout.align).map(Some)
+        }
+        ReturnPassing::IndirectAggregate { minimum_alignment } => {
+            let destination = allocate_composite_with_minimum_alignment(
+                builder,
+                state.layouts,
+                return_type,
+                *minimum_alignment,
+            )?;
+            arguments.push(destination);
+            Ok(Some(destination))
+        }
+        ReturnPassing::Unit | ReturnPassing::Scalar => Ok(None),
+    }
+}
+
+fn push_extern_argument(
+    builder: &mut FunctionBuilder<'_>,
+    state: &CodegenState<'_>,
+    ty: Type,
+    value: Value,
+    passing: &ParameterPassing,
+    arguments: &mut Vec<Value>,
+) -> Result<(), String> {
+    match passing {
+        ParameterPassing::Scalar => arguments.push(value),
+        ParameterPassing::DirectAggregate {
+            padding,
+            components,
+            storage_size,
+        } => {
+            for value_type in padding {
+                arguments.push(zero_value(builder, *value_type)?);
+            }
+            let layout = state.layouts.aggregate(ty)?.value;
+            let source = if *storage_size > layout.size {
+                copy_composite_into_abi_storage(
+                    builder,
+                    state,
+                    ty,
+                    value,
+                    *storage_size,
+                    layout.align,
+                )?
+            } else {
+                value
+            };
+            for component in components {
+                arguments.push(
+                    builder.ins().load(
+                        component.value_type,
+                        MemFlagsData::new(),
+                        source,
+                        i32::try_from(component.offset)
+                            .map_err(|_| "aggregate ABI offset exceeds i32".to_owned())?,
+                    ),
+                );
+            }
+        }
+        ParameterPassing::IndirectAggregate { minimum_alignment } => {
+            let layout = state.layouts.aggregate(ty)?.value;
+            arguments.push(copy_composite_into_abi_storage(
+                builder,
+                state,
+                ty,
+                value,
+                layout.size,
+                *minimum_alignment,
+            )?);
+        }
+        ParameterPassing::StackAggregate {
+            size,
+            minimum_alignment,
+        } => arguments.push(copy_composite_into_abi_storage(
+            builder,
+            state,
+            ty,
+            value,
+            *size,
+            *minimum_alignment,
+        )?),
+    }
+    Ok(())
+}
+
+fn finish_extern_call(
+    builder: &mut FunctionBuilder<'_>,
+    call: ir::Inst,
+    return_destination: Option<Value>,
+    passing: &ReturnPassing,
+) -> Result<Emitted, String> {
+    match passing {
+        ReturnPassing::Unit => Ok(Emitted::unit()),
+        ReturnPassing::Scalar => {
+            let value = builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .ok_or_else(|| "value-returning external call has no result".to_owned())?;
+            Ok(Emitted::value(value))
+        }
+        ReturnPassing::DirectAggregate { components, .. } => {
+            let destination = return_destination
+                .ok_or_else(|| "direct aggregate return destination is missing".to_owned())?;
+            let results = builder.inst_results(call).to_vec();
+            if results.len() != components.len() {
+                return Err(format!(
+                    "aggregate-returning external call produced {} results for {} ABI components",
+                    results.len(),
+                    components.len()
+                ));
+            }
+            for (value, component) in results.into_iter().zip(components) {
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    destination,
+                    i32::try_from(component.offset)
+                        .map_err(|_| "aggregate ABI offset exceeds i32".to_owned())?,
+                );
+            }
+            Ok(Emitted::value(destination))
+        }
+        ReturnPassing::IndirectAggregate { .. } => return_destination
+            .map(Emitted::value)
+            .ok_or_else(|| "indirect aggregate return destination is missing".to_owned()),
+    }
+}
+
 #[expect(
     unsafe_code,
     reason = "loading a user-declared native library may execute its platform initializer"
@@ -138,7 +277,7 @@ pub fn emit_object_with_options(
     let mut module = ObjectModule::new(builder);
     compile_program(&mut module, program, optimization).map_err(backend_error)?;
     let mut product = module.finish();
-    add_object_link_metadata(&mut product.object, program);
+    add_object_link_metadata(&mut product.object, program).map_err(backend_error)?;
     product
         .emit()
         .map_err(|error| backend_error(error.to_string()))
@@ -156,22 +295,38 @@ fn linked_native_libraries(program: &Program) -> BTreeSet<&str> {
 fn add_object_link_metadata(
     object: &mut cranelift_object::object::write::Object<'_>,
     program: &Program,
-) {
+) -> Result<(), String> {
     let libraries = linked_native_libraries(program);
     if object.format() != BinaryFormat::Coff || libraries.is_empty() {
-        return;
+        return Ok(());
     }
     let mut directives = Vec::new();
     for library in libraries {
-        let filename = if library.to_ascii_lowercase().ends_with(".lib") {
-            library.to_owned()
-        } else {
-            format!("{library}.lib")
-        };
+        let filename = coff_library_filename(library)?;
         directives.extend_from_slice(format!(" /DEFAULTLIB:\"{filename}\"").as_bytes());
     }
     let section = object.add_section(Vec::new(), b".drectve".to_vec(), SectionKind::Linker);
     object.append_section_data(section, &directives, 1);
+    Ok(())
+}
+
+fn coff_library_filename(library: &str) -> Result<String, String> {
+    if library.is_empty() {
+        return Err("native library names cannot be empty".to_owned());
+    }
+    if library
+        .chars()
+        .any(|character| character == '"' || character.is_control())
+    {
+        return Err(format!(
+            "native library name {library:?} cannot contain quotes or control characters"
+        ));
+    }
+    if library.to_ascii_lowercase().ends_with(".lib") {
+        Ok(library.to_owned())
+    } else {
+        Ok(format!("{library}.lib"))
+    }
 }
 
 /// Compiles and executes the validated entry point in the host process.
@@ -292,15 +447,62 @@ pub fn execute_test_with_options(
         .get(test_index)
         .copied()
         .ok_or_else(|| backend_error(format!("unit test index {test_index} does not exist")))?;
-    let declaration = program
-        .functions
-        .iter()
-        .find(|function| function.id == test)
-        .ok_or_else(|| backend_error("typed HIR unit test function is missing"))?;
-    if !declaration.parameters.is_empty() || declaration.return_type != Type::Unit {
-        return Err(backend_error(
-            "typed HIR unit test must take no parameters and return `()`",
-        ));
+    execute_selected_tests(program, &[test], optimization, |_, _| {})
+}
+
+/// Compiles the program once and executes every discovered `@test` function.
+///
+/// This entry point is intended to run in an isolated child process because a
+/// checked runtime panic terminates the current process. A caller that needs
+/// precise failure attribution can retry individual tests after a failed suite.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when typed test metadata is invalid or native
+/// code generation fails.
+pub fn execute_tests_with_options(
+    program: &Program,
+    optimization: OptimizationLevel,
+) -> Result<(), Vec<Diagnostic>> {
+    execute_tests_with_options_and_progress(program, optimization, |_, _| {})
+}
+
+/// Compiles and executes every discovered `@test`, reporting each test before
+/// it starts.
+///
+/// The callback runs after code generation succeeds and immediately before the
+/// selected test function. It can therefore identify the test that terminated
+/// an isolated suite process.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when typed test metadata is invalid or native
+/// code generation fails.
+pub fn execute_tests_with_options_and_progress(
+    program: &Program,
+    optimization: OptimizationLevel,
+    progress: impl FnMut(usize, &str),
+) -> Result<(), Vec<Diagnostic>> {
+    execute_selected_tests(program, &program.tests, optimization, progress)
+}
+
+fn execute_selected_tests(
+    program: &Program,
+    tests: &[FunctionId],
+    optimization: OptimizationLevel,
+    mut progress: impl FnMut(usize, &str),
+) -> Result<(), Vec<Diagnostic>> {
+    for test in tests {
+        let declaration = program
+            .functions
+            .iter()
+            .find(|function| function.id == *test)
+            .ok_or_else(|| backend_error("typed HIR unit test function is missing"))?;
+        if !declaration.parameters.is_empty() || declaration.return_type != Type::Unit {
+            return Err(backend_error(
+                "typed HIR unit test must take no parameters and return `()`",
+            ));
+        }
     }
 
     let flags = [
@@ -319,17 +521,26 @@ pub fn execute_test_with_options(
     module
         .finalize_definitions()
         .map_err(|error| backend_error(error.to_string()))?;
-    let function = functions
-        .get(&test)
-        .copied()
-        .ok_or_else(|| backend_error("compiled unit test function is missing"))?;
-    let pointer = module.get_finalized_function(function);
-    let session = reimer_runtime::ExecutionSession::begin();
-    let result = call_jit_unit(pointer);
-    reimer_runtime::shutdown_job_pools(session.id());
-    reimer_runtime::join_session_threads(session.id());
-    reimer_runtime::shutdown_processes(session.id());
-    result
+    for (test_index, test) in tests.iter().enumerate() {
+        let declaration = program
+            .functions
+            .iter()
+            .find(|function| function.id == *test)
+            .ok_or_else(|| backend_error("typed HIR unit test function is missing"))?;
+        progress(test_index, &declaration.name);
+        let function = functions
+            .get(test)
+            .copied()
+            .ok_or_else(|| backend_error("compiled unit test function is missing"))?;
+        let pointer = module.get_finalized_function(function);
+        let session = reimer_runtime::ExecutionSession::begin();
+        let result = call_jit_unit(pointer);
+        reimer_runtime::shutdown_job_pools(session.id());
+        reimer_runtime::join_session_threads(session.id());
+        reimer_runtime::shutdown_processes(session.id());
+        result?;
+    }
+    Ok(())
 }
 
 fn register_runtime_symbols(builder: &mut JITBuilder) {
@@ -337,6 +548,8 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_collection_symbols(builder);
     register_target_symbols(builder);
     register_time_symbols(builder);
+    register_binary_symbols(builder);
+    register_checksum_symbols(builder);
     register_mathematics_symbols(builder);
     register_text_symbols(builder);
     register_filesystem_symbols(builder);
@@ -344,6 +557,38 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_process_symbols(builder);
     register_storage_symbols(builder);
     register_coordination_symbols(builder);
+}
+
+fn register_binary_symbols(builder: &mut JITBuilder) {
+    let symbols = [
+        (
+            reimer_runtime::BINARY_F32_FROM_BITS_SYMBOL,
+            reimer_runtime::binary_f32_from_bits as *const u8,
+        ),
+        (
+            reimer_runtime::BINARY_F32_TO_BITS_SYMBOL,
+            reimer_runtime::binary_f32_to_bits as *const u8,
+        ),
+        (
+            reimer_runtime::BINARY_F64_FROM_BITS_SYMBOL,
+            reimer_runtime::binary_f64_from_bits as *const u8,
+        ),
+        (
+            reimer_runtime::BINARY_F64_TO_BITS_SYMBOL,
+            reimer_runtime::binary_f64_to_bits as *const u8,
+        ),
+    ];
+    register_symbol_group(builder, symbols);
+}
+
+fn register_checksum_symbols(builder: &mut JITBuilder) {
+    register_symbol_group(
+        builder,
+        [(
+            reimer_runtime::CHECKSUM_CRC32_SYMBOL,
+            reimer_runtime::checksum_crc32 as *const u8,
+        )],
+    );
 }
 
 fn register_environment_symbols(builder: &mut JITBuilder) {
@@ -462,95 +707,126 @@ fn register_symbol_group<const COUNT: usize>(
 }
 
 fn register_core_symbols(builder: &mut JITBuilder) {
+    register_failure_symbols(builder);
+    register_memory_symbols(builder);
+    register_standard_io_symbols(builder);
+    register_thread_symbols(builder);
+}
+
+fn register_failure_symbols(builder: &mut JITBuilder) {
+    register_symbol_group(
+        builder,
+        [
+            (
+                reimer_runtime::FAIL_SYMBOL,
+                reimer_runtime::runtime_fail as *const u8,
+            ),
+            (
+                reimer_runtime::PANIC_SYMBOL,
+                reimer_runtime::runtime_panic as *const u8,
+            ),
+        ],
+    );
+}
+
+fn register_memory_symbols(builder: &mut JITBuilder) {
+    register_symbol_group(
+        builder,
+        [
+            (
+                reimer_runtime::ALLOCATE_BYTES_SYMBOL,
+                reimer_runtime::allocate_bytes as *const u8,
+            ),
+            (
+                reimer_runtime::DEALLOCATE_BYTES_SYMBOL,
+                reimer_runtime::deallocate_bytes as *const u8,
+            ),
+            (
+                reimer_runtime::ABS_I32_SYMBOL,
+                reimer_runtime::absolute_i32 as *const u8,
+            ),
+            (
+                reimer_runtime::ARENA_INIT_SYMBOL,
+                reimer_runtime::arena_allocator_init as *const u8,
+            ),
+            (
+                reimer_runtime::ARENA_DEINIT_SYMBOL,
+                reimer_runtime::arena_allocator_deinit as *const u8,
+            ),
+            (
+                reimer_runtime::FIXED_INIT_SYMBOL,
+                reimer_runtime::fixed_buffer_allocator_init as *const u8,
+            ),
+            (
+                reimer_runtime::FIXED_DEINIT_SYMBOL,
+                reimer_runtime::fixed_buffer_allocator_deinit as *const u8,
+            ),
+            (
+                reimer_runtime::BUFFER_EQUALS_SYMBOL,
+                reimer_runtime::buffer_equals as *const u8,
+            ),
+            (
+                reimer_runtime::COPY_BYTES_SYMBOL,
+                reimer_runtime::copy_bytes as *const u8,
+            ),
+            (
+                reimer_runtime::UTF8_IS_VALID_SYMBOL,
+                reimer_runtime::utf8_is_valid as *const u8,
+            ),
+            (
+                reimer_runtime::UTF8_DECODE_NEXT_SYMBOL,
+                reimer_runtime::utf8_decode_next as *const u8,
+            ),
+        ],
+    );
+}
+
+fn register_standard_io_symbols(builder: &mut JITBuilder) {
+    register_symbol_group(
+        builder,
+        [
+            (
+                reimer_runtime::OUTPUT_WRITE_SYMBOL,
+                reimer_runtime::output_write as *const u8,
+            ),
+            (
+                reimer_runtime::OUTPUT_WRITE_ALL_SYMBOL,
+                reimer_runtime::output_write_all as *const u8,
+            ),
+            (
+                reimer_runtime::OUTPUT_FLUSH_SYMBOL,
+                reimer_runtime::output_flush as *const u8,
+            ),
+            (
+                reimer_runtime::OUTPUT_IS_TERMINAL_SYMBOL,
+                reimer_runtime::output_is_terminal as *const u8,
+            ),
+            (
+                reimer_runtime::INPUT_READ_SYMBOL,
+                reimer_runtime::input_read as *const u8,
+            ),
+            (
+                reimer_runtime::INPUT_READ_EXACT_SYMBOL,
+                reimer_runtime::input_read_exact as *const u8,
+            ),
+            (
+                reimer_runtime::INPUT_READ_LINE_SYMBOL,
+                reimer_runtime::input_read_line as *const u8,
+            ),
+            (
+                reimer_runtime::INPUT_READ_TO_END_SYMBOL,
+                reimer_runtime::input_read_to_end as *const u8,
+            ),
+            (
+                reimer_runtime::INPUT_IS_TERMINAL_SYMBOL,
+                reimer_runtime::input_is_terminal as *const u8,
+            ),
+        ],
+    );
+}
+
+fn register_thread_symbols(builder: &mut JITBuilder) {
     let symbols = [
-        (
-            reimer_runtime::FAIL_SYMBOL,
-            reimer_runtime::runtime_fail as *const u8,
-        ),
-        (
-            reimer_runtime::PANIC_SYMBOL,
-            reimer_runtime::runtime_panic as *const u8,
-        ),
-        (
-            reimer_runtime::ALLOCATE_BYTES_SYMBOL,
-            reimer_runtime::allocate_bytes as *const u8,
-        ),
-        (
-            reimer_runtime::DEALLOCATE_BYTES_SYMBOL,
-            reimer_runtime::deallocate_bytes as *const u8,
-        ),
-        (
-            reimer_runtime::ABS_I32_SYMBOL,
-            reimer_runtime::absolute_i32 as *const u8,
-        ),
-        (
-            reimer_runtime::ARENA_INIT_SYMBOL,
-            reimer_runtime::arena_allocator_init as *const u8,
-        ),
-        (
-            reimer_runtime::ARENA_DEINIT_SYMBOL,
-            reimer_runtime::arena_allocator_deinit as *const u8,
-        ),
-        (
-            reimer_runtime::FIXED_INIT_SYMBOL,
-            reimer_runtime::fixed_buffer_allocator_init as *const u8,
-        ),
-        (
-            reimer_runtime::FIXED_DEINIT_SYMBOL,
-            reimer_runtime::fixed_buffer_allocator_deinit as *const u8,
-        ),
-        (
-            reimer_runtime::OUTPUT_WRITE_SYMBOL,
-            reimer_runtime::output_write as *const u8,
-        ),
-        (
-            reimer_runtime::OUTPUT_WRITE_ALL_SYMBOL,
-            reimer_runtime::output_write_all as *const u8,
-        ),
-        (
-            reimer_runtime::OUTPUT_FLUSH_SYMBOL,
-            reimer_runtime::output_flush as *const u8,
-        ),
-        (
-            reimer_runtime::OUTPUT_IS_TERMINAL_SYMBOL,
-            reimer_runtime::output_is_terminal as *const u8,
-        ),
-        (
-            reimer_runtime::INPUT_READ_SYMBOL,
-            reimer_runtime::input_read as *const u8,
-        ),
-        (
-            reimer_runtime::INPUT_READ_EXACT_SYMBOL,
-            reimer_runtime::input_read_exact as *const u8,
-        ),
-        (
-            reimer_runtime::INPUT_READ_LINE_SYMBOL,
-            reimer_runtime::input_read_line as *const u8,
-        ),
-        (
-            reimer_runtime::INPUT_READ_TO_END_SYMBOL,
-            reimer_runtime::input_read_to_end as *const u8,
-        ),
-        (
-            reimer_runtime::INPUT_IS_TERMINAL_SYMBOL,
-            reimer_runtime::input_is_terminal as *const u8,
-        ),
-        (
-            reimer_runtime::BUFFER_EQUALS_SYMBOL,
-            reimer_runtime::buffer_equals as *const u8,
-        ),
-        (
-            reimer_runtime::COPY_BYTES_SYMBOL,
-            reimer_runtime::copy_bytes as *const u8,
-        ),
-        (
-            reimer_runtime::UTF8_IS_VALID_SYMBOL,
-            reimer_runtime::utf8_is_valid as *const u8,
-        ),
-        (
-            reimer_runtime::UTF8_DECODE_NEXT_SYMBOL,
-            reimer_runtime::utf8_decode_next as *const u8,
-        ),
         (
             reimer_runtime::THREAD_SPAWN_SYMBOL,
             reimer_runtime::thread_spawn as *const u8,
@@ -558,6 +834,10 @@ fn register_core_symbols(builder: &mut JITBuilder) {
         (
             reimer_runtime::THREAD_JOIN_SYMBOL,
             reimer_runtime::thread_join as *const u8,
+        ),
+        (
+            reimer_runtime::THREAD_AVAILABLE_PARALLELISM_SYMBOL,
+            reimer_runtime::thread_available_parallelism as *const u8,
         ),
     ];
     register_symbol_group(builder, symbols);
@@ -806,6 +1086,10 @@ fn register_filesystem_symbols(builder: &mut JITBuilder) {
             reimer_runtime::file_flush as *const u8,
         ),
         (
+            reimer_runtime::FILE_SYNC_ALL_SYMBOL,
+            reimer_runtime::file_sync_all as *const u8,
+        ),
+        (
             reimer_runtime::FILE_REMAINING_LEN_SYMBOL,
             reimer_runtime::file_remaining_len as *const u8,
         ),
@@ -820,6 +1104,38 @@ fn register_filesystem_symbols(builder: &mut JITBuilder) {
         (
             reimer_runtime::PATH_RENAME_SYMBOL,
             reimer_runtime::path_rename as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_REPLACE_FILE_SYMBOL,
+            reimer_runtime::path_replace_file as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_CREATE_DIR_ALL_SYMBOL,
+            reimer_runtime::path_create_dir_all as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_FILE_SIZE_SYMBOL,
+            reimer_runtime::path_file_size as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_IS_WITHIN_SYMBOL,
+            reimer_runtime::path_is_within as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_CANONICAL_OPEN_SYMBOL,
+            reimer_runtime::path_canonical_open as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_SNAPSHOT_LEN_SYMBOL,
+            reimer_runtime::path_snapshot_len as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_SNAPSHOT_COPY_SYMBOL,
+            reimer_runtime::path_snapshot_copy as *const u8,
+        ),
+        (
+            reimer_runtime::PATH_SNAPSHOT_CLOSE_SYMBOL,
+            reimer_runtime::path_snapshot_close as *const u8,
         ),
     ];
     register_symbol_group(builder, symbols);
@@ -1173,6 +1489,7 @@ fn write_static_value(
             }
             Ok(())
         }
+        ExpressionKind::ArrayRepeat { .. } => write_repeat(bytes, offset, expression, layouts),
         ExpressionKind::Enum { variant, fields } => {
             let layout = layouts.aggregate(expression.ty)?;
             let AggregateLayoutKind::Enum { variants } = &layout.kind else {
@@ -1199,6 +1516,38 @@ fn write_static_value(
         }
         _ => Err("static initializer contains a runtime-only expression".to_owned()),
     }
+}
+
+fn write_repeat(
+    bytes: &mut [u8],
+    offset: u32,
+    expression: &Expression,
+    layouts: &Layouts,
+) -> Result<(), String> {
+    let ExpressionKind::ArrayRepeat { value, length } = &expression.kind else {
+        return Err("static repeated array helper received another expression".to_owned());
+    };
+    let layout = layouts.aggregate(expression.ty)?;
+    let AggregateLayoutKind::Array {
+        stride,
+        length: layout_length,
+    } = layout.kind
+    else {
+        return Err("static repeated array initializer has no array layout".to_owned());
+    };
+    if length != &layout_length {
+        return Err("static repeated array initializer does not match its layout".to_owned());
+    }
+    for index in 0..layout_length {
+        let index = u32::try_from(index)
+            .map_err(|_| "static repeated array index exceeds u32".to_owned())?;
+        let element_offset = stride
+            .checked_mul(index)
+            .and_then(|element_offset| offset.checked_add(element_offset))
+            .ok_or_else(|| "static repeated array offset overflowed".to_owned())?;
+        write_static_value(bytes, element_offset, value, layouts)?;
+    }
+    Ok(())
 }
 
 fn write_static_integer(
@@ -1406,21 +1755,47 @@ fn extern_function_signature<M: Module>(
     }
     for (parameter, passing) in function.parameters.iter().zip(&abi.parameters) {
         if parameter.ty.has_runtime_value() {
-            let value_type = match passing {
-                ParameterPassing::Scalar => runtime_type(parameter.ty)?,
-                ParameterPassing::DirectAggregate(value_type) => *value_type,
-                ParameterPassing::IndirectAggregate { .. } => pointer_type(),
-            };
-            signature.params.push(AbiParam::new(value_type));
+            match passing {
+                ParameterPassing::Scalar => signature
+                    .params
+                    .push(AbiParam::new(runtime_type(parameter.ty)?)),
+                ParameterPassing::DirectAggregate {
+                    padding,
+                    components,
+                    ..
+                } => {
+                    signature
+                        .params
+                        .extend(padding.iter().copied().map(AbiParam::new));
+                    signature.params.extend(
+                        components
+                            .iter()
+                            .map(|component| AbiParam::new(component.value_type)),
+                    );
+                }
+                ParameterPassing::IndirectAggregate { .. } => {
+                    signature.params.push(AbiParam::new(pointer_type()));
+                }
+                ParameterPassing::StackAggregate { size, .. } => {
+                    signature.params.push(AbiParam::special(
+                        pointer_type(),
+                        ArgumentPurpose::StructArgument(*size),
+                    ));
+                }
+            }
         }
     }
-    match abi.return_value {
+    match &abi.return_value {
         ReturnPassing::Unit | ReturnPassing::IndirectAggregate { .. } => {}
         ReturnPassing::Scalar => signature
             .returns
             .push(AbiParam::new(runtime_type(function.return_type)?)),
-        ReturnPassing::DirectAggregate(value_type) => {
-            signature.returns.push(AbiParam::new(value_type));
+        ReturnPassing::DirectAggregate { components, .. } => {
+            signature.returns.extend(
+                components
+                    .iter()
+                    .map(|component| AbiParam::new(component.value_type)),
+            );
         }
     }
     Ok(signature)
@@ -2715,6 +3090,9 @@ fn emit_expression<M: Module>(
         | ExpressionKind::Array(elements)
         | ExpressionKind::Struct(elements) => {
             emit_product(builder, module, functions, state, expression.ty, elements)
+        }
+        ExpressionKind::ArrayRepeat { .. } => {
+            emit_array_repeat(builder, module, functions, state, expression)
         }
         ExpressionKind::Enum { .. } => {
             emit_enum_expression(builder, module, functions, state, expression)
@@ -5360,6 +5738,68 @@ fn emit_product<M: Module>(
     Ok(Emitted::value(destination))
 }
 
+fn emit_array_repeat<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    expression: &Expression,
+) -> Result<Emitted, String> {
+    let ExpressionKind::ArrayRepeat { value, length } = &expression.kind else {
+        return Err("repeated array helper received another expression".to_owned());
+    };
+    let layout = state.layouts.aggregate(expression.ty)?;
+    let AggregateLayoutKind::Array {
+        stride,
+        length: layout_length,
+    } = layout.kind
+    else {
+        return Err("repeated array initializer has no array layout".to_owned());
+    };
+    if length != &layout_length {
+        return Err("repeated array initializer does not match its layout".to_owned());
+    }
+    let destination = allocate_composite(builder, state.layouts, expression.ty)?;
+    let emitted = emit_expression(builder, module, functions, state, value)?;
+    if emitted.terminated {
+        return Ok(emitted);
+    }
+    if *length == 0 || !value.ty.has_runtime_value() {
+        return Ok(Emitted::value(destination));
+    }
+
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(header, pointer_type());
+    let zero = builder.ins().iconst(pointer_type(), 0);
+    builder.ins().jump(header, &[BlockArg::from(zero)]);
+
+    builder.switch_to_block(header);
+    let index = builder
+        .block_params(header)
+        .first()
+        .copied()
+        .ok_or_else(|| "repeated array loop has no index".to_owned())?;
+    let native_length = i64::try_from(*length)
+        .map_err(|_| "repeated array length exceeds native addressing".to_owned())?;
+    let native_length = builder.ins().iconst(pointer_type(), native_length);
+    let has_element = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, index, native_length);
+    builder.ins().brif(has_element, body, &[], done, &[]);
+
+    builder.switch_to_block(body);
+    let offset = builder.ins().imul_imm_u(index, i64::from(stride));
+    let element_address = builder.ins().iadd(destination, offset);
+    store_at_offset(builder, state, element_address, 0, value.ty, emitted)?;
+    let next = builder.ins().iadd_imm_u(index, 1);
+    builder.ins().jump(header, &[BlockArg::from(next)]);
+
+    builder.switch_to_block(done);
+    Ok(Emitted::value(destination))
+}
+
 fn emit_enum<M: Module>(
     builder: &mut FunctionBuilder<'_>,
     module: &mut M,
@@ -5629,8 +6069,18 @@ fn allocate_composite_with_minimum_alignment(
     minimum_alignment: u32,
 ) -> Result<Value, String> {
     let layout = layouts.aggregate(ty)?.value;
-    let size = layout.size.max(1);
-    let alignment = layout.align.max(minimum_alignment);
+    allocate_abi_storage(
+        builder,
+        layout.size.max(1),
+        layout.align.max(minimum_alignment),
+    )
+}
+
+fn allocate_abi_storage(
+    builder: &mut FunctionBuilder<'_>,
+    size: u32,
+    alignment: u32,
+) -> Result<Value, String> {
     if !alignment.is_power_of_two() {
         return Err(format!(
             "aggregate ABI alignment {alignment} is not a power of two"
@@ -5644,6 +6094,65 @@ fn allocate_composite_with_minimum_alignment(
         align_shift,
     ));
     Ok(builder.ins().stack_addr(pointer_type(), slot, 0))
+}
+
+fn copy_composite_into_abi_storage(
+    builder: &mut FunctionBuilder<'_>,
+    state: &CodegenState<'_>,
+    ty: Type,
+    source: Value,
+    storage_size: u32,
+    minimum_alignment: u32,
+) -> Result<Value, String> {
+    let layout = state.layouts.aggregate(ty)?.value;
+    if storage_size < layout.size {
+        return Err("aggregate ABI storage is smaller than its value layout".to_owned());
+    }
+    let alignment = layout.align.max(minimum_alignment);
+    let destination = allocate_zeroed_abi_storage(builder, state, storage_size, alignment)?;
+    copy_composite(
+        builder,
+        state.layouts,
+        state.target_config,
+        ty,
+        destination,
+        source,
+    )?;
+    Ok(destination)
+}
+
+fn allocate_zeroed_abi_storage(
+    builder: &mut FunctionBuilder<'_>,
+    state: &CodegenState<'_>,
+    storage_size: u32,
+    alignment: u32,
+) -> Result<Value, String> {
+    let destination = allocate_abi_storage(builder, storage_size.max(1), alignment)?;
+    let byte_alignment = u8::try_from(alignment)
+        .map_err(|_| "aggregate ABI alignment does not fit in u8".to_owned())?;
+    builder.emit_small_memset(
+        state.target_config,
+        destination,
+        0,
+        u64::from(storage_size),
+        byte_alignment,
+        MemFlagsData::new(),
+    );
+    Ok(destination)
+}
+
+fn zero_value(builder: &mut FunctionBuilder<'_>, value_type: ir::Type) -> Result<Value, String> {
+    if value_type == types::F32 {
+        Ok(builder.ins().f32const(Ieee32::with_bits(0)))
+    } else if value_type == types::F64 {
+        Ok(builder.ins().f64const(Ieee64::with_bits(0)))
+    } else if value_type.is_int() {
+        Ok(builder.ins().iconst(value_type, 0))
+    } else {
+        Err(format!(
+            "cannot synthesize ABI padding value of type `{value_type}`"
+        ))
+    }
 }
 
 fn define_local(
@@ -6751,29 +7260,9 @@ fn emit_extern_call<M: Module>(
         .get(&function)
         .copied()
         .ok_or_else(|| format!("called external function {} was not declared", function.0))?;
-    let mut values = Vec::with_capacity(
-        arguments.len()
-            + usize::from(matches!(
-                abi.return_value,
-                ReturnPassing::IndirectAggregate { .. }
-            )),
-    );
-    let return_destination = match abi.return_value {
-        ReturnPassing::DirectAggregate(_) => {
-            Some(allocate_composite(builder, state.layouts, return_type)?)
-        }
-        ReturnPassing::IndirectAggregate { minimum_alignment } => {
-            let destination = allocate_composite_with_minimum_alignment(
-                builder,
-                state.layouts,
-                return_type,
-                minimum_alignment,
-            )?;
-            values.push(destination);
-            Some(destination)
-        }
-        ReturnPassing::Unit | ReturnPassing::Scalar => None,
-    };
+    let mut values = Vec::new();
+    let return_destination =
+        prepare_extern_return(builder, state, return_type, &abi.return_value, &mut values)?;
     for (argument, passing) in arguments.iter().zip(&abi.parameters) {
         let emitted = emit_expression(builder, module, functions, state, argument)?;
         if emitted.terminated {
@@ -6783,62 +7272,11 @@ fn emit_extern_call<M: Module>(
             continue;
         }
         let value = require_value(emitted, "external call argument")?;
-        let abi_value = match passing {
-            ParameterPassing::Scalar => value,
-            ParameterPassing::DirectAggregate(value_type) => {
-                builder
-                    .ins()
-                    .load(*value_type, MemFlagsData::new(), value, 0)
-            }
-            ParameterPassing::IndirectAggregate { minimum_alignment } => {
-                let copy = allocate_composite_with_minimum_alignment(
-                    builder,
-                    state.layouts,
-                    argument.ty,
-                    *minimum_alignment,
-                )?;
-                copy_composite(
-                    builder,
-                    state.layouts,
-                    state.target_config,
-                    argument.ty,
-                    copy,
-                    value,
-                )?;
-                copy
-            }
-        };
-        values.push(abi_value);
+        push_extern_argument(builder, state, argument.ty, value, passing, &mut values)?;
     }
     let function_reference = module.declare_func_in_func(declared_function, builder.func);
     let call = builder.ins().call(function_reference, &values);
-    match abi.return_value {
-        ReturnPassing::Unit => Ok(Emitted::unit()),
-        ReturnPassing::Scalar => {
-            let value = builder
-                .inst_results(call)
-                .first()
-                .copied()
-                .ok_or_else(|| "value-returning external call has no result".to_owned())?;
-            Ok(Emitted::value(value))
-        }
-        ReturnPassing::DirectAggregate(_) => {
-            let destination = return_destination
-                .ok_or_else(|| "direct aggregate return destination is missing".to_owned())?;
-            let value = builder
-                .inst_results(call)
-                .first()
-                .copied()
-                .ok_or_else(|| "aggregate-returning external call has no result".to_owned())?;
-            builder
-                .ins()
-                .store(MemFlagsData::new(), value, destination, 0);
-            Ok(Emitted::value(destination))
-        }
-        ReturnPassing::IndirectAggregate { .. } => return_destination
-            .map(Emitted::value)
-            .ok_or_else(|| "indirect aggregate return destination is missing".to_owned()),
-    }
+    finish_extern_call(builder, call, return_destination, &abi.return_value)
 }
 
 fn emit_function_address<M: Module>(
@@ -7577,6 +8015,8 @@ fn emit_cast<M: Module>(
         } else {
             builder.ins().fcvt_from_uint(target_type, value)
         }
+    } else if source.is_float() && target.is_integer() {
+        emit_float_to_integer_cast(builder, source, target, value)?
     } else if source.is_float() && target.is_float() {
         if source == Type::F32 {
             builder.ins().fpromote(runtime_type(target)?, value)
@@ -7589,6 +8029,61 @@ fn emit_cast<M: Module>(
         ));
     };
     Ok(Emitted::value(converted))
+}
+
+fn emit_float_to_integer_cast(
+    builder: &mut FunctionBuilder<'_>,
+    source: Type,
+    target: Type,
+    value: Value,
+) -> Result<Value, String> {
+    let bits = target
+        .integer_bits()
+        .ok_or_else(|| format!("`{target}` has no integer width"))?;
+    if bits > 64 {
+        return Err(format!(
+            "float-to-integer casts wider than 64 bits are not supported for `{target}`"
+        ));
+    }
+    let target_type = runtime_type(target)?;
+    if bits >= 32 {
+        return Ok(if target.is_signed_integer() {
+            builder.ins().fcvt_to_sint_sat(target_type, value)
+        } else {
+            builder.ins().fcvt_to_uint_sat(target_type, value)
+        });
+    }
+
+    let maximum: f32 = if target.is_signed_integer() {
+        if bits == 8 { 127.0 } else { 32_767.0 }
+    } else {
+        if bits == 8 { 255.0 } else { 65_535.0 }
+    };
+    let maximum = emit_float_constant(builder, source, maximum)?;
+    let mut clamped = builder.ins().fmin(value, maximum);
+    if target.is_signed_integer() {
+        let minimum: f32 = if bits == 8 { -128.0 } else { -32_768.0 };
+        let minimum = emit_float_constant(builder, source, minimum)?;
+        clamped = builder.ins().fmax(clamped, minimum);
+    }
+    let wide = if target.is_signed_integer() {
+        builder.ins().fcvt_to_sint_sat(types::I32, clamped)
+    } else {
+        builder.ins().fcvt_to_uint_sat(types::I32, clamped)
+    };
+    Ok(builder.ins().ireduce(target_type, wide))
+}
+
+fn emit_float_constant(
+    builder: &mut FunctionBuilder<'_>,
+    source: Type,
+    value: f32,
+) -> Result<Value, String> {
+    match source {
+        Type::F32 => Ok(builder.ins().f32const(Ieee32::with_float(value))),
+        Type::F64 => Ok(builder.ins().f64const(Ieee64::with_float(f64::from(value)))),
+        _ => Err(format!("`{source}` is not a floating-point type")),
+    }
 }
 
 fn runtime_type(ty: Type) -> Result<ir::Type, String> {
@@ -7685,8 +8180,9 @@ mod tests {
     use reimer_resolver::resolve;
 
     use super::{
-        OptimizationLevel, emit_object, emit_object_with_options, execute,
-        execute_internal_with_symbols, execute_test, execute_with_options,
+        OptimizationLevel, coff_library_filename, emit_object, emit_object_with_options, execute,
+        execute_internal_with_symbols, execute_test, execute_tests_with_options,
+        execute_with_options,
     };
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -7829,6 +8325,24 @@ mod tests {
     }
 
     #[test]
+    fn execute_tests_with_options_should_run_the_complete_compiled_suite() {
+        let program = compile_fixture(
+            "@test
+             fn addition_should_work() {
+                 if 20 + 22 != 42 { panic(\"unexpected addition result\"); }
+             }
+             @test
+             fn multiplication_should_work() {
+                 if 6 * 7 != 42 { panic(\"unexpected multiplication result\"); }
+             }
+             fn main() -> i32 { 0 }",
+        );
+
+        execute_tests_with_options(&program, OptimizationLevel::Speed)
+            .expect("every test in the compiled suite should execute");
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     fn emit_object_should_preserve_link_libraries_for_the_native_linker() {
         let program = compile_fixture(
@@ -7845,6 +8359,36 @@ mod tests {
             .expect("COFF object should contain linker directives");
 
         assert!(String::from_utf8_lossy(directives).contains("/DEFAULTLIB:\"kernel32.lib\""));
+    }
+
+    #[test]
+    fn coff_library_filename_should_reject_linker_directive_injection() {
+        let library = "kernel32\" /DEFAULTLIB:\"untrusted";
+
+        let error = coff_library_filename(library)
+            .expect_err("a library name must not escape its quoted COFF directive");
+
+        assert!(error.contains("cannot contain quotes or control characters"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn emit_object_should_reject_linker_directive_injection() {
+        let program = compile_fixture(
+            r#"@link("kernel32\" /DEFAULTLIB:\"untrusted") extern "C" {
+                fn GetCurrentProcessId() -> u32;
+            }
+            fn main() -> i32 { 42 }"#,
+        );
+
+        let diagnostics = emit_object(&program)
+            .expect_err("an injected COFF library directive must not be emitted");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot contain quotes or control characters")
+        }));
     }
 
     #[test]
@@ -8047,6 +8591,34 @@ mod tests {
     }
 
     #[test]
+    fn execute_should_safely_saturate_float_to_integer_casts() {
+        let program = compile_fixture(
+            "fn main() -> i32 {
+                let truncated: i32 = 41.9 as i32;
+                let negative: i8 = -200.0 as i8;
+                let positive: u16 = 70_000.0 as u16;
+                let below_zero: u8 = -4.0 as u8;
+                let not_a_number: f32 = 0.0 / 0.0;
+                let nan: u8 = not_a_number as u8;
+                if truncated == 41
+                    && negative == -128
+                    && positive == 65_535
+                    && below_zero == 0
+                    && nan == 0
+                {
+                    42
+                } else {
+                    0
+                }
+             }",
+        );
+
+        let result = execute(&program).expect("float-to-integer fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
     fn execute_should_lower_all_integer_widths_through_the_native_abi() {
         let program = compile_fixture(
             "fn combine(
@@ -8082,6 +8654,42 @@ mod tests {
                  let selected = pairs[0];
                  let result: (i32, bool) = (sum(selected), true);
                  if result.1 { result.0 } else { 0 }
+             }",
+        );
+
+        let result = execute(&program).expect("fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_evaluate_repeated_array_values_once() {
+        let program = compile_fixture(
+            "@derive(Copy)
+             struct Pair { left: i32, right: i32 }
+             static mut CALLS: i32 = 0;
+             static BASELINE: [i32; 4] = [10; 4];
+             fn next() -> i32 {
+                 unsafe {
+                     CALLS += 1;
+                     CALLS
+                 }
+             }
+             fn main() -> i32 {
+                 let values: [i32; 4] = [next(); 4];
+                 let pairs: [Pair; 3] = [Pair { left: 20, right: 22 }; 3];
+                 let calls = unsafe { CALLS };
+                 let baseline = BASELINE[3];
+                 if calls == 1
+                     && values[0] == 1
+                     && values[3] == 1
+                     && baseline == 10
+                     && pairs[2].left + pairs[2].right == 42
+                 {
+                     42
+                 } else {
+                     0
+                 }
              }",
         );
 

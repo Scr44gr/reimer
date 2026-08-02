@@ -3,23 +3,26 @@
 use std::mem::discriminant;
 
 use reimer_ast::{
-    ArrayExpression, AssignmentExpression, AssignmentOperator, Attribute, AttributeArgument,
-    BinaryExpression, BinaryOperator, Block, BooleanLiteral, BreakStatement, CallExpression,
-    CastExpression, CharacterLiteral, ComptimeBlock, ConstantDeclaration, DeferStatement,
-    EnumDeclaration, EnumVariant, EnumVariantPayload, Expression, ExpressionStatement,
-    ExternFunction, FieldExpression, FieldInitializer, FieldName, FloatLiteral, ForStatement,
-    FormattedStringExpression, FormattedStringFragment, Function, GenericArgument,
-    GenericParameter, Identifier, IfExpression, ImplDeclaration, ImportDeclaration, ImportKind,
-    ImportedName, IndexExpression, IntegerLiteral, Item, LetStatement, LoopExpression, MatchArm,
-    MatchExpression, Parameter, Path, Pattern, PatternField, Program, ReturnStatement, Statement,
-    StaticDeclaration, StringLiteral, StructDeclaration, StructExpression, StructField,
-    TraitDeclaration, TraitMethod, TupleExpression, TypeAliasDeclaration, TypeName, TypeNameKind,
-    UnaryExpression, UnaryOperator, WherePredicate, WhileStatement,
+    ArrayExpression, ArrayExpressionKind, AssignmentExpression, AssignmentOperator, Attribute,
+    AttributeArgument, BinaryExpression, BinaryOperator, Block, BooleanLiteral, BreakStatement,
+    CallExpression, CastExpression, CharacterLiteral, ComptimeBlock, ConstantDeclaration,
+    DeferStatement, EnumDeclaration, EnumVariant, EnumVariantPayload, Expression,
+    ExpressionStatement, ExternFunction, FieldExpression, FieldInitializer, FieldName,
+    FloatLiteral, ForStatement, FormattedStringExpression, FormattedStringFragment, Function,
+    GenericArgument, GenericParameter, Identifier, IfExpression, ImplDeclaration,
+    ImportDeclaration, ImportKind, ImportedName, IndexExpression, IntegerLiteral, Item,
+    LetStatement, LoopExpression, MatchArm, MatchExpression, Parameter, Path, Pattern,
+    PatternField, Program, ReturnStatement, Statement, StaticDeclaration, StringLiteral,
+    StructDeclaration, StructExpression, StructField, TraitDeclaration, TraitMethod,
+    TupleExpression, TypeAliasDeclaration, TypeName, TypeNameKind, UnaryExpression, UnaryOperator,
+    WherePredicate, WhileStatement,
 };
 use reimer_diagnostics::{Diagnostic, Span};
 use reimer_lexer::{
     FormattedStringFragment as LexicalFormattedFragment, FormattingStyle, Token, TokenKind,
 };
+
+const MAX_NESTING_DEPTH: usize = 64;
 
 /// Parses a token stream into a Reimer syntax tree.
 ///
@@ -37,6 +40,7 @@ struct Parser<'tokens> {
     diagnostics: Vec<Diagnostic>,
     allow_struct_expression: bool,
     pending_type_greater: usize,
+    nesting_depth: usize,
 }
 
 impl<'tokens> Parser<'tokens> {
@@ -47,6 +51,7 @@ impl<'tokens> Parser<'tokens> {
             diagnostics: Vec::new(),
             allow_struct_expression: true,
             pending_type_greater: 0,
+            nesting_depth: 0,
         }
     }
 
@@ -54,9 +59,14 @@ impl<'tokens> Parser<'tokens> {
         let mut items = Vec::new();
 
         while !self.at(&TokenKind::Eof) {
-            match self.parse_item() {
-                Some(parsed) => items.extend(parsed),
-                None => self.synchronize_top_level(),
+            let item_start = self.cursor;
+            if let Some(parsed) = self.parse_item() {
+                items.extend(parsed);
+            } else {
+                if self.cursor == item_start {
+                    self.advance();
+                }
+                self.synchronize_top_level();
             }
         }
 
@@ -1089,6 +1099,10 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_type_name(&mut self) -> Option<TypeName> {
+        self.with_nesting(Self::parse_type_name_inner)
+    }
+
+    fn parse_type_name_inner(&mut self) -> Option<TypeName> {
         let type_start = self.current().span.start;
         if self.at(&TokenKind::Fn) {
             return self.parse_function_type();
@@ -1353,7 +1367,7 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_expression(&mut self) -> Option<Expression> {
-        self.parse_assignment()
+        self.with_nesting(Self::parse_assignment)
     }
 
     fn parse_condition_expression(&mut self) -> Option<Expression> {
@@ -1395,7 +1409,7 @@ impl<'tokens> Parser<'tokens> {
         let Some(operator) = operator else {
             return Some(target);
         };
-        let value = self.parse_assignment()?;
+        let value = self.parse_expression()?;
         let span = Span::new(target.span().start, value.span().end);
         Some(Expression::Assignment(Box::new(AssignmentExpression {
             target,
@@ -1564,6 +1578,10 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_unary(&mut self) -> Option<Expression> {
+        self.with_nesting(Self::parse_unary_inner)
+    }
+
+    fn parse_unary_inner(&mut self) -> Option<Expression> {
         let start = self.current().span.start;
         let operator = if self.take(&TokenKind::Minus).is_some() {
             Some(UnaryOperator::Negate)
@@ -1938,6 +1956,10 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_pattern(&mut self) -> Option<Pattern> {
+        self.with_nesting(Self::parse_pattern_inner)
+    }
+
+    fn parse_pattern_inner(&mut self) -> Option<Pattern> {
         let start = self.current().span.start;
         let mutable = self.take(&TokenKind::Mut).is_some();
         let negative = self.take(&TokenKind::Minus).is_some();
@@ -2099,10 +2121,27 @@ impl<'tokens> Parser<'tokens> {
 
     fn parse_array_expression(&mut self) -> Option<Expression> {
         let start = self.advance();
-        let elements = self.parse_expression_list(&TokenKind::RightBracket)?;
+        let kind = if self.at(&TokenKind::RightBracket) {
+            ArrayExpressionKind::List(Vec::new())
+        } else {
+            let first = self.parse_expression()?;
+            if self.take(&TokenKind::Semicolon).is_some() {
+                let length = self.parse_expression()?;
+                ArrayExpressionKind::Repeat {
+                    value: Box::new(first),
+                    length: Box::new(length),
+                }
+            } else {
+                let mut elements = vec![first];
+                while self.take(&TokenKind::Comma).is_some() && !self.at(&TokenKind::RightBracket) {
+                    elements.push(self.parse_expression()?);
+                }
+                ArrayExpressionKind::List(elements)
+            }
+        };
         let end = self.expect_symbol(&TokenKind::RightBracket, "`]` after array elements")?;
         Some(Expression::Array(ArrayExpression {
-            elements,
+            kind,
             span: Span::new(start.span.start, end.span.end),
         }))
     }
@@ -2314,6 +2353,24 @@ impl<'tokens> Parser<'tokens> {
         token
     }
 
+    fn with_nesting<T>(&mut self, parse: fn(&mut Self) -> Option<T>) -> Option<T> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E1022",
+                    "syntax nesting limit exceeded",
+                    self.current().span,
+                )
+                .with_help("reduce the number of nested expressions, types, or patterns"),
+            );
+            return None;
+        }
+        self.nesting_depth += 1;
+        let result = parse(self);
+        self.nesting_depth -= 1;
+        result
+    }
+
     fn synchronize_statement(&mut self) {
         while !self.at(&TokenKind::Eof) && !self.at(&TokenKind::RightBrace) {
             if self.take(&TokenKind::Semicolon).is_some() {
@@ -2373,12 +2430,13 @@ fn binary_expression(operator: BinaryOperator, left: Expression, right: Expressi
 #[cfg(test)]
 mod tests {
     use reimer_ast::{
-        AssignmentOperator, BinaryOperator, Expression, FormattedStringFragment, GenericArgument,
-        ImportKind, Item, Statement, TypeName, TypeNameKind,
+        ArrayExpressionKind, AssignmentOperator, BinaryOperator, Expression,
+        FormattedStringFragment, GenericArgument, ImportKind, Item, Statement, TypeName,
+        TypeNameKind,
     };
     use reimer_lexer::lex;
 
-    use super::parse;
+    use super::{MAX_NESTING_DEPTH, parse};
 
     #[test]
     fn parse_should_build_m0_program() {
@@ -2396,6 +2454,42 @@ mod tests {
             return_statement.value,
             Some(Expression::Integer(integer)) if integer.value == 42
         ));
+    }
+
+    #[test]
+    fn parse_should_make_progress_after_an_invalid_public_declaration() {
+        let tokens = lex("pub unsafe fn invalid() {}").expect("fixture should lex");
+
+        let diagnostics = parse(&tokens).expect_err("unsupported modifier should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E1001")
+        );
+    }
+
+    #[test]
+    fn parse_should_reject_excessive_syntax_nesting() {
+        let depth = MAX_NESTING_DEPTH + 1;
+        let pattern = format!("{}value{}", "(".repeat(depth), ",)".repeat(depth));
+        let sources = [
+            format!("fn main() {{ {}true; }}", "!".repeat(depth)),
+            format!("type Deep = {}i32;", "& ".repeat(depth)),
+            format!("fn main(value: i32) -> i32 {{ match value {{ {pattern} => 0 }} }}"),
+        ];
+
+        for source in sources {
+            let tokens = lex(&source).expect("nesting fixture should lex");
+            let diagnostics = parse(&tokens).expect_err("excessive nesting should fail safely");
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E1022"),
+                "fixture should report the nesting limit: {source}"
+            );
+        }
     }
 
     #[test]
@@ -2702,6 +2796,31 @@ mod tests {
         assert!(matches!(
             function.body.tail.as_deref(),
             Some(Expression::Field(_))
+        ));
+    }
+
+    #[test]
+    fn parse_should_distinguish_repeated_array_initializers() {
+        let tokens =
+            lex("fn main() { let values: [i32; 4] = [0; 4]; }").expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected function");
+        };
+        let Statement::Let(binding) = &function.body.statements[0] else {
+            panic!("expected array binding");
+        };
+        let Expression::Array(array) = &binding.initializer else {
+            panic!("expected array expression");
+        };
+        assert!(matches!(
+            array.kind,
+            ArrayExpressionKind::Repeat {
+                ref value,
+                ref length,
+            } if matches!(value.as_ref(), Expression::Integer(value) if value.value == 0)
+                && matches!(length.as_ref(), Expression::Integer(length) if length.value == 4)
         ));
     }
 

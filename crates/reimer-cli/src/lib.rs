@@ -187,6 +187,42 @@ pub fn execute_file_test(
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
+/// Executes every compiler-recognized `@test` function after compiling the
+/// source package once.
+///
+/// Callers should isolate this operation in a child process because a source
+/// panic deliberately aborts the process.
+///
+/// # Errors
+///
+/// Returns file-aware frontend or backend diagnostics.
+pub fn execute_file_tests(
+    path: &Path,
+    optimization: OptimizationLevel,
+) -> Result<(), Vec<FileDiagnostic>> {
+    execute_file_tests_with_progress(path, optimization, |_, _| {})
+}
+
+/// Executes every compiler-recognized `@test` and reports each test before it
+/// starts.
+///
+/// # Errors
+///
+/// Returns file-aware frontend or backend diagnostics.
+pub fn execute_file_tests_with_progress(
+    path: &Path,
+    optimization: OptimizationLevel,
+    mut progress: impl FnMut(usize, &str),
+) -> Result<(), Vec<FileDiagnostic>> {
+    let (package, program) = analyze_test_file(path)?;
+    reimer_codegen_native::execute_tests_with_options_and_progress(
+        &program,
+        optimization,
+        |test_index, name| progress(test_index, source_test_name(name)),
+    )
+    .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
 /// Discovers compiler-recognized `@test` functions in a resolved source graph.
 ///
 /// # Errors
@@ -216,6 +252,42 @@ pub fn execute_graph_test(
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
+/// Executes every graph-discovered `@test` function after compiling the graph
+/// once.
+///
+/// Callers should isolate this operation in a child process because a source
+/// panic deliberately aborts the process.
+///
+/// # Errors
+///
+/// Returns file-aware frontend or backend diagnostics.
+pub fn execute_graph_tests(
+    graph: &SourceGraph,
+    optimization: OptimizationLevel,
+) -> Result<(), Vec<FileDiagnostic>> {
+    execute_graph_tests_with_progress(graph, optimization, |_, _| {})
+}
+
+/// Executes every graph-discovered `@test` and reports each test before it
+/// starts.
+///
+/// # Errors
+///
+/// Returns file-aware frontend or backend diagnostics.
+pub fn execute_graph_tests_with_progress(
+    graph: &SourceGraph,
+    optimization: OptimizationLevel,
+    mut progress: impl FnMut(usize, &str),
+) -> Result<(), Vec<FileDiagnostic>> {
+    let (package, program) = analyze_test_graph(graph)?;
+    reimer_codegen_native::execute_tests_with_options_and_progress(
+        &program,
+        optimization,
+        |test_index, name| progress(test_index, source_test_name(name)),
+    )
+    .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
 fn test_names(program: &reimer_hir::Program) -> Vec<String> {
     program
         .tests
@@ -225,9 +297,13 @@ fn test_names(program: &reimer_hir::Program) -> Vec<String> {
                 .functions
                 .iter()
                 .find(|function| function.id == *test)
-                .map(|function| function.name.clone())
+                .map(|function| source_test_name(&function.name).to_owned())
         })
         .collect()
+}
+
+fn source_test_name(name: &str) -> &str {
+    name.rsplit_once('$').map_or(name, |(_, suffix)| suffix)
 }
 
 fn analyze(source: &str) -> Result<reimer_hir::Program, Vec<Diagnostic>> {
@@ -302,9 +378,19 @@ mod tests {
 
     use super::{
         check_file, check_source, compile_file_to_object, compile_to_object, execute_file,
-        execute_file_with_arguments, execute_source,
+        execute_file_with_arguments, execute_source, source_test_name,
     };
     use reimer_codegen_native::OptimizationLevel;
+
+    #[test]
+    fn source_test_name_should_hide_internal_module_mangling() {
+        let name = "__module_4_game_7_systems$camera_motion_should_prioritize_commands";
+
+        assert_eq!(
+            source_test_name(name),
+            "camera_motion_should_prioritize_commands"
+        );
+    }
 
     #[test]
     fn compile_to_object_should_complete_m0_vertical_slice() {

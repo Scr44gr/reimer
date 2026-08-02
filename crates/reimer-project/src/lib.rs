@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -466,7 +466,7 @@ impl Resolver {
         let manifest = parse_manifest(&self.manifest_path)?;
         self.debug_optimization = manifest.debug_optimization;
         self.release_optimization = manifest.release_optimization;
-        let root = self.resolve_path(manifest, None)?;
+        let root = self.resolve_path(manifest, None, None)?;
         let current = self.lock_document();
         if self.mode == LockMode::Locked {
             if self.previous.as_ref() != Some(&current) {
@@ -491,7 +491,11 @@ impl Resolver {
         &mut self,
         manifest: ParsedManifest,
         expectation: Option<&DependencyRequest>,
+        git_checkout: Option<&Path>,
     ) -> Result<String, ProjectError> {
+        if let Some(checkout) = git_checkout {
+            require_git_checkout_path(checkout, &manifest.path, expectation)?;
+        }
         validate_expectation(&manifest, expectation)?;
         let directory = manifest
             .path
@@ -511,7 +515,7 @@ impl Resolver {
             }
         })?;
         let source = format!("path+{}", normalized_path(&relative));
-        self.resolve_package(manifest, directory, source)
+        self.resolve_package(manifest, directory, source, git_checkout)
     }
 
     fn resolve_git(
@@ -541,13 +545,15 @@ impl Resolver {
         } else {
             resolve_commit(repository, select)?
         };
-        let directory = checkout(repository, &commit, &self.cache_root)?;
+        let directory = checkout(repository, &commit, &self.source_root, &self.cache_root)?;
+        let git_checkout = canonicalize(&directory, "canonicalize Git dependency checkout")?;
         let manifest_path = directory.join(MANIFEST_FILE);
         let manifest = parse_manifest(&manifest_path)?;
+        require_git_checkout_path(&git_checkout, &manifest.path, Some(request))?;
         validate_expectation(&manifest, Some(request))?;
         require_facade(&directory, &manifest.name)?;
         let source = format!("git+{repository}#{commit}");
-        self.resolve_package(manifest, directory, source)
+        self.resolve_package(manifest, directory, source, Some(&git_checkout))
     }
 
     fn resolve_package(
@@ -555,6 +561,7 @@ impl Resolver {
         manifest: ParsedManifest,
         directory: PathBuf,
         source: String,
+        git_checkout: Option<&Path>,
     ) -> Result<String, ProjectError> {
         let id = package_id(&manifest.name, &manifest.version, &source);
         if let Some(start) = self
@@ -580,7 +587,7 @@ impl Resolver {
                 DependencySource::Path(path) => {
                     let manifest_path = dependency_manifest(&manifest.path, path);
                     let dependency = parse_manifest(&manifest_path)?;
-                    self.resolve_path(dependency, Some(request))?
+                    self.resolve_path(dependency, Some(request), git_checkout)?
                 }
                 DependencySource::Git { repository, select } => {
                     self.resolve_git(&id, request, repository, select)?
@@ -781,10 +788,31 @@ fn parse_dependency(
             }
             DependencySource::Path(path)
         }
-        (None, Some(repository)) => DependencySource::Git {
-            repository,
-            select: git_select(manifest, &alias, table.rev, table.branch, table.tag)?,
-        },
+        (None, Some(repository)) => {
+            let invalid_reason = if repository.is_empty() {
+                Some("must be nonempty")
+            } else if repository.starts_with('-') {
+                Some("cannot start with `-`")
+            } else if embeds_http_credentials(&repository) {
+                Some("cannot embed HTTP credentials; use a Git credential helper")
+            } else if is_remote_helper_repository(&repository) {
+                Some("cannot use Git remote-helper syntax")
+            } else if repository.chars().any(char::is_control) {
+                Some("cannot contain control characters")
+            } else {
+                None
+            };
+            if let Some(reason) = invalid_reason {
+                return Err(ProjectError::InvalidManifest {
+                    path: manifest.to_path_buf(),
+                    message: format!("Git repository for dependency `{alias}` {reason}"),
+                });
+            }
+            DependencySource::Git {
+                repository,
+                select: git_select(manifest, &alias, table.rev, table.branch, table.tag)?,
+            }
+        }
         (Some(_), Some(_)) => {
             return Err(ProjectError::InvalidManifest {
                 path: manifest.to_path_buf(),
@@ -921,6 +949,46 @@ fn dependency_manifest(parent: &Path, dependency: &Path) -> PathBuf {
     }
 }
 
+fn is_remote_helper_repository(repository: &str) -> bool {
+    repository.split_once("::").is_some_and(|(transport, _)| {
+        !transport.is_empty()
+            && transport.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            })
+    })
+}
+
+fn embeds_http_credentials(repository: &str) -> bool {
+    let Some((scheme, remainder)) = repository.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    remainder
+        .split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+fn require_git_checkout_path(
+    checkout: &Path,
+    manifest: &Path,
+    expectation: Option<&DependencyRequest>,
+) -> Result<(), ProjectError> {
+    if manifest.starts_with(checkout) {
+        return Ok(());
+    }
+    let dependency = expectation.map_or("Git package", |request| request.alias.as_str());
+    Err(ProjectError::InvalidManifest {
+        path: manifest.to_path_buf(),
+        message: format!(
+            "dependency `{dependency}` resolves outside its Git checkout `{}`",
+            checkout.display()
+        ),
+    })
+}
+
 fn select_root_entry(directory: &Path) -> Result<PathBuf, ProjectError> {
     let main = directory.join("src").join("main.reim");
     if main.is_file() {
@@ -971,30 +1039,94 @@ fn write_lock(path: &Path, lock: &LockDocument) -> Result<(), ProjectError> {
         message: error.to_string(),
     })?;
     text.push('\n');
-    let temporary = path.with_extension(format!("lock.tmp-{}", std::process::id()));
-    fs::write(&temporary, text).map_err(|source| ProjectError::Io {
-        operation: "write temporary lockfile",
-        path: temporary.clone(),
-        source,
-    })?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| ProjectError::Io {
+    let temporary = write_temporary_lock(path, text.as_bytes())?;
+    if path.exists()
+        && let Err(source) = fs::remove_file(path)
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(ProjectError::Io {
             operation: "replace lockfile",
             path: path.to_path_buf(),
             source,
-        })?;
+        });
     }
-    fs::rename(&temporary, path).map_err(|source| ProjectError::Io {
-        operation: "install lockfile",
+    if let Err(source) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(ProjectError::Io {
+            operation: "install lockfile",
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
+}
+
+fn write_temporary_lock(path: &Path, contents: &[u8]) -> Result<PathBuf, ProjectError> {
+    for attempt in 0..100_u8 {
+        let suffix = if attempt == 0 {
+            format!("lock.tmp-{}", std::process::id())
+        } else {
+            format!("lock.tmp-{}-{attempt}", std::process::id())
+        };
+        let temporary = path.with_extension(suffix);
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(ProjectError::Io {
+                    operation: "create temporary lockfile",
+                    path: temporary,
+                    source,
+                });
+            }
+        };
+        if let Err(source) = file.write_all(contents) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(ProjectError::Io {
+                operation: "write temporary lockfile",
+                path: temporary,
+                source,
+            });
+        }
+        return Ok(temporary);
+    }
+    Err(ProjectError::Io {
+        operation: "create temporary lockfile",
         path: path.to_path_buf(),
-        source,
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "too many temporary lockfile name collisions",
+        ),
     })
 }
 
 fn source_checksum(directory: &Path) -> Result<String, ProjectError> {
     let manifest = directory.join(MANIFEST_FILE);
     let mut files = vec![manifest];
+    let vendored_checksums = directory.join("checksums.sha256");
+    if fs::symlink_metadata(&vendored_checksums)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(ProjectError::InvalidManifest {
+            path: vendored_checksums,
+            message: "vendored checksum manifests cannot be symbolic links".to_owned(),
+        });
+    }
+    if vendored_checksums.is_file() {
+        files.push(vendored_checksums);
+    }
     let source = directory.join("src");
+    if fs::symlink_metadata(&source).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(ProjectError::InvalidManifest {
+            path: source,
+            message: "package source directories cannot be symbolic links".to_owned(),
+        });
+    }
     if source.is_dir() {
         files.extend(collect_source_files(&source)?);
     }
@@ -1036,6 +1168,12 @@ fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, ProjectError> {
                 path: path.clone(),
                 source,
             })?;
+            if file_type.is_symlink() {
+                return Err(ProjectError::InvalidManifest {
+                    path,
+                    message: "package source trees cannot contain symbolic links".to_owned(),
+                });
+            }
             if file_type.is_dir() {
                 pending.push(path);
             } else if file_type.is_file()
@@ -1076,6 +1214,7 @@ fn resolve_commit(repository: &str, select: &GitSelect) -> Result<String, Projec
             None,
             [
                 OsString::from("ls-remote"),
+                OsString::from("--"),
                 OsString::from(repository),
                 OsString::from(&reference),
             ],
@@ -1098,23 +1237,35 @@ fn resolve_commit(repository: &str, select: &GitSelect) -> Result<String, Projec
     })
 }
 
-fn checkout(repository: &str, commit: &str, cache_root: &Path) -> Result<PathBuf, ProjectError> {
-    fs::create_dir_all(cache_root).map_err(|source| ProjectError::Io {
-        operation: "create dependency cache",
-        path: cache_root.to_path_buf(),
-        source,
-    })?;
+fn checkout(
+    repository: &str,
+    commit: &str,
+    project_root: &Path,
+    cache_root: &Path,
+) -> Result<PathBuf, ProjectError> {
+    create_managed_directory(project_root, cache_root)?;
     let key = digest_text(&format!("{repository}#{commit}"));
     let directory = cache_root.join(&key[..24]);
-    if directory.is_dir() {
+    if fs::symlink_metadata(&directory).is_ok() {
+        require_managed_directory(&directory)?;
         let current = git_output(
             Some(&directory),
             [OsString::from("rev-parse"), OsString::from("HEAD")],
             "inspect cached dependency",
         );
+        let clean = git_output(
+            Some(&directory),
+            [
+                OsString::from("status"),
+                OsString::from("--porcelain=v1"),
+                OsString::from("--untracked-files=all"),
+            ],
+            "inspect cached dependency worktree",
+        );
         if current
             .as_ref()
             .is_ok_and(|current| current.trim().eq_ignore_ascii_case(commit))
+            && clean.as_ref().is_ok_and(|status| status.trim().is_empty())
         {
             return Ok(directory);
         }
@@ -1129,11 +1280,13 @@ fn checkout(repository: &str, commit: &str, cache_root: &Path) -> Result<PathBuf
         [
             OsString::from("clone"),
             OsString::from("--no-checkout"),
+            OsString::from("--"),
             OsString::from(repository),
             directory.as_os_str().to_owned(),
         ],
         "clone dependency",
     )?;
+    require_managed_directory(&directory)?;
     git_output(
         Some(&directory),
         [
@@ -1157,6 +1310,71 @@ fn checkout(repository: &str, commit: &str, cache_root: &Path) -> Result<PathBuf
     Ok(directory)
 }
 
+fn create_managed_directory(root: &Path, directory: &Path) -> Result<(), ProjectError> {
+    let relative = directory.strip_prefix(root).map_err(|_| {
+        unsafe_cache_path(
+            directory,
+            format!("path is outside project root `{}`", root.display()),
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(unsafe_cache_path(
+                directory,
+                "path contains a non-normal component",
+            ));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(_) => require_managed_directory(&current)?,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|source| ProjectError::Io {
+                    operation: "create dependency cache",
+                    path: current.clone(),
+                    source,
+                })?;
+                require_managed_directory(&current)?;
+            }
+            Err(source) => {
+                return Err(ProjectError::Io {
+                    operation: "inspect dependency cache",
+                    path: current,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_managed_directory(directory: &Path) -> Result<(), ProjectError> {
+    let metadata = fs::symlink_metadata(directory).map_err(|source| ProjectError::Io {
+        operation: "inspect dependency cache",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(unsafe_cache_path(directory, "path is not a real directory"));
+    }
+    let resolved = canonicalize(directory, "canonicalize dependency cache")?;
+    if resolved != directory {
+        return Err(unsafe_cache_path(
+            directory,
+            format!("path resolves to `{}`", resolved.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn unsafe_cache_path(path: &Path, reason: impl Into<String>) -> ProjectError {
+    ProjectError::Io {
+        operation: "use dependency cache",
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, reason.into()),
+    }
+}
+
 fn git_output(
     directory: Option<&Path>,
     arguments: impl IntoIterator<Item = OsString>,
@@ -1164,6 +1382,23 @@ fn git_output(
 ) -> Result<String, ProjectError> {
     let executable = env::var_os("GIT").unwrap_or_else(|| OsString::from("git"));
     let mut command = Command::new(executable);
+    command.args([
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.file.allow=always",
+        "-c",
+        "protocol.git.allow=always",
+        "-c",
+        "protocol.http.allow=always",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.ssh.allow=always",
+        "-c",
+        "protocol.ext.allow=never",
+    ]);
+    command.env("GIT_PROTOCOL_FROM_USER", "0");
     command.args(arguments);
     if let Some(directory) = directory {
         command.current_dir(directory);
@@ -1297,6 +1532,8 @@ const fn ordinary_path(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1451,6 +1688,65 @@ edition = "2026"
     }
 
     #[test]
+    fn lockfile_write_should_not_overwrite_a_temporary_name_collision() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+"#,
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+        let collision = fixture.path(&format!("app/reimer.lock.tmp-{}", std::process::id()));
+        fs::write(&collision, "must remain unchanged")
+            .expect("collision fixture should be written");
+
+        let project =
+            Project::open(&fixture.path("app"), LockMode::Use).expect("project should resolve");
+
+        assert_eq!(
+            fs::read_to_string(collision).expect("collision should remain readable"),
+            "must remain unchanged"
+        );
+        assert!(project.lock_path().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_cache_should_reject_a_linked_ancestor() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+"#,
+        );
+        let project_root = fixture
+            .path("app")
+            .canonicalize()
+            .expect("project root should resolve");
+        let external = fixture.path("external-cache");
+        fs::create_dir(&external).expect("external cache fixture should be created");
+        symlink(&external, project_root.join("target"))
+            .expect("linked target fixture should be created");
+        let cache = project_root.join("target/reimer/dependencies");
+
+        let error = super::create_managed_directory(&project_root, &cache)
+            .expect_err("a linked cache ancestor must be rejected");
+
+        assert!(matches!(
+            error,
+            ProjectError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(!external.join("reimer").exists());
+    }
+
+    #[test]
     fn lockfile_should_be_identical_after_the_source_tree_moves() {
         let first = Fixture::new();
         let second = Fixture::new();
@@ -1602,6 +1898,18 @@ physics = {{ git = "{repository}", branch = "main" }}
 
         let pinned =
             Project::open(&fixture.path("app"), LockMode::Use).expect("Git project should resolve");
+        let cached_source = pinned
+            .packages
+            .iter()
+            .find(|package| package.name == "physics")
+            .expect("Git dependency should be present")
+            .directory
+            .join("src")
+            .join("package.reim");
+        fs::write(&cached_source, "pub fn answer() -> i32 { 99 }")
+            .expect("cached dependency should be writable for the regression fixture");
+        let restored = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect("a dirty dependency cache should be restored");
         fixture.write("physics/src/package.reim", "pub fn answer() -> i32 { 43 }");
         fixture.commit("physics", "change answer");
         let still_pinned =
@@ -1610,8 +1918,186 @@ physics = {{ git = "{repository}", branch = "main" }}
             .expect("Git reference should refresh");
 
         assert_eq!(execute(&pinned), 42);
+        assert_eq!(execute(&restored), 42);
         assert_eq!(execute(&still_pinned), 42);
         assert_eq!(execute(&refreshed), 43);
+    }
+
+    #[test]
+    fn git_dependency_path_should_remain_inside_its_checkout() {
+        let fixture = Fixture::new();
+        let repository = fixture.path("physics");
+        fs::create_dir_all(&repository).expect("repository should be created");
+        git_output(
+            Some(&repository),
+            ["init", "-b", "main"].into_iter().map(Into::into),
+            "initialize test repository",
+        )
+        .expect("repository should initialize");
+        git_output(
+            Some(&repository),
+            ["config", "user.email", "tests@example.invalid"]
+                .into_iter()
+                .map(Into::into),
+            "configure test repository",
+        )
+        .expect("email should configure");
+        git_output(
+            Some(&repository),
+            ["config", "user.name", "Project Tests"]
+                .into_iter()
+                .map(Into::into),
+            "configure test repository",
+        )
+        .expect("name should configure");
+        fixture.write(
+            "external/reimer.toml",
+            r#"[package]
+name = "external"
+version = "0.1.0"
+edition = "2026"
+"#,
+        );
+        fixture.write("external/src/package.reim", "pub fn value() -> i32 { 1 }");
+        let external = normalized_path(&fixture.path("external"));
+        fixture.write(
+            "physics/reimer.toml",
+            &format!(
+                r#"[package]
+name = "physics"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+external = {{ path = "{external}" }}
+"#
+            ),
+        );
+        fixture.write("physics/src/package.reim", "pub fn answer() -> i32 { 42 }");
+        fixture.commit("physics", "initial");
+        let repository = normalized_path(&repository);
+        fixture.write(
+            "app/reimer.toml",
+            &format!(
+                r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+physics = {{ git = "{repository}", branch = "main" }}
+"#
+            ),
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("a Git dependency must not resolve paths outside its checkout");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("outside its Git checkout")
+        ));
+    }
+
+    #[test]
+    fn git_repository_that_looks_like_an_option_should_be_rejected() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+physics = { git = "--upload-pack=git-upload-pack", rev = "." }
+"#,
+        );
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("Git option injection should be rejected before invoking Git");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("cannot start with `-`")
+        ));
+    }
+
+    #[test]
+    fn git_remote_helper_repository_should_be_rejected() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+physics = { git = "ext::sh -c arbitrary-command" }
+"#,
+        );
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("Git remote-helper syntax should be rejected before invoking Git");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("cannot use Git remote-helper syntax")
+        ));
+    }
+
+    #[test]
+    fn git_http_credentials_should_not_be_persisted_from_the_manifest() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+physics = { git = "https://user:secret@example.invalid/physics.git" }
+"#,
+        );
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("credentials must be rejected before writing a lockfile or cloning");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("cannot embed HTTP credentials")
+        ));
+        assert!(!fixture.path("app/reimer.lock").exists());
+    }
+
+    #[test]
+    fn git_should_reject_unapproved_remote_helper_protocols() {
+        let error = git_output(
+            None,
+            [
+                "ls-remote",
+                "--",
+                "audit-helper://example.invalid/repository",
+                "HEAD",
+            ]
+            .into_iter()
+            .map(Into::into),
+            "reject unapproved remote helper",
+        )
+        .expect_err("unapproved Git remote helpers must not run");
+
+        assert!(matches!(
+            error,
+            ProjectError::Git { message, .. }
+                if message.contains("audit-helper") && message.contains("not allowed")
+        ));
     }
 
     #[test]

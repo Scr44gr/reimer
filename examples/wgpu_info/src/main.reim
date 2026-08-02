@@ -1,0 +1,48 @@
+from std::io import eprintln, println;
+
+from wgpu import Buffer, Error, Instance;
+import wgpu::raw::constants as constants;
+
+fn initialize_buffer(buffer: &mut Buffer) -> Result<(), Error> {
+    let mut mapping = buffer.map_write(0, 16)?;
+    mapping.set(0, 42)?;
+    mapping.set(15, 7)?;
+    mapping.unmap();
+    Ok(())
+}
+
+fn run() -> Result<(), Error> {
+    let instance = Instance::create()?;
+    defer instance.deinit();
+
+    let adapter = instance.request_adapter()?;
+    defer adapter.deinit();
+
+    let device = adapter.request_device()?;
+    defer device.deinit();
+
+    let queue = device.queue()?;
+    defer queue.deinit();
+
+    let mut buffer = device.create_buffer(
+        16,
+        constants::WGPUBufferUsage_MapWrite
+            | constants::WGPUBufferUsage_CopySrc,
+    )?;
+    initialize_buffer(&mut buffer)?;
+    buffer.deinit();
+    queue.wait()
+}
+
+fn main() -> i32 {
+    match run() {
+        Ok(_) => {
+            println("wgpu-native initialized a device and completed its queue.");
+            0
+        },
+        Err(_) => {
+            eprintln("wgpu-native initialization failed.");
+            1
+        },
+    }
+}

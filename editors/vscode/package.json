@@ -8,6 +8,11 @@
   "engines": {
     "vscode": "^1.95.0"
   },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
   "categories": [
     "Programming Languages",
     "Linters",
@@ -29,7 +34,7 @@
     "test": "npm run check && npm run bundle && npm run test:bundle && npm run test:grammar",
     "test:bundle": "node scripts/test-bundle.mjs",
     "test:grammar": "node scripts/test-grammar.mjs",
-    "package": "cargo build --release --manifest-path ../../Cargo.toml -p reimer-lsp && node scripts/prepare-server.mjs && npm run compile && vsce package --target win32-x64 --no-dependencies --allow-missing-repository",
+    "package": "cargo build --release --locked --manifest-path ../../Cargo.toml -p reimer-lsp && node scripts/prepare-server.mjs && npm run compile && vsce package --target win32-x64 --no-dependencies --allow-missing-repository",
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {

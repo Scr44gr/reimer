@@ -191,11 +191,17 @@ pub(crate) fn expression(visitor: &mut impl Visitor, expression: &Expression) {
                 self::expression(visitor, element);
             }
         }
-        Expression::Array(array) => {
-            for element in &array.elements {
-                self::expression(visitor, element);
+        Expression::Array(array) => match &array.kind {
+            reimer_ast::ArrayExpressionKind::List(elements) => {
+                for element in elements {
+                    self::expression(visitor, element);
+                }
             }
-        }
+            reimer_ast::ArrayExpressionKind::Repeat { value, length } => {
+                self::expression(visitor, value);
+                self::expression(visitor, length);
+            }
+        },
         Expression::Struct(structure) => {
             for field in &structure.fields {
                 self::expression(visitor, &field.value);

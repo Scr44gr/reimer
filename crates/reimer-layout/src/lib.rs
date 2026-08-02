@@ -551,6 +551,7 @@ mod tests {
             representation: TypeRepresentation::Native,
             alignment: Some(16),
             derives: Vec::new(),
+            marker_traits: Vec::new(),
             must_use: false,
             span: Span::empty(0),
         }];
@@ -592,6 +593,7 @@ mod tests {
             representation: TypeRepresentation::Native,
             alignment: None,
             derives: Vec::new(),
+            marker_traits: Vec::new(),
             must_use: false,
             span: Span::empty(0),
         }];

@@ -1,14 +1,16 @@
 //! Host-native executable linking for generated Reimer objects.
 
+use std::env;
+use std::ffi::OsString;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::generated_output;
+
 const RUNTIME_ARCHIVE: &[u8] = include_bytes!(env!("REIMER_RUNTIME_ARCHIVE"));
 const STARTUP_SOURCE: &str = include_str!("../native/startup.rs");
-const RUST_COMPILER: &str = env!("REIMER_RUST_COMPILER");
-const NATIVE_LINKER: &str = env!("REIMER_NATIVE_LINKER");
+const HOST_TARGET: &str = env!("REIMER_HOST_TARGET");
 
 /// Links one generated object and the bundled runtime into a native executable.
 ///
@@ -20,27 +22,31 @@ pub fn link_executable(
     object: &[u8],
     executable: &Path,
     artifact_directory: &Path,
+    generated_root: &Path,
+    generated_executable: bool,
 ) -> Result<PathBuf, String> {
-    fs::create_dir_all(artifact_directory).map_err(|error| {
-        format!(
-            "failed to create `{}`: {error}",
-            artifact_directory.display()
-        )
-    })?;
+    let artifact_directory =
+        generated_output::prepare_directory(generated_root, artifact_directory)?;
     let object_path = artifact_directory.join(format!("program.{}", object_extension()));
     let runtime_path = artifact_directory.join("libreimer_runtime.rlib");
     let startup_path = artifact_directory.join("startup.rs");
-    write_if_changed(&object_path, object)?;
-    write_if_changed(&runtime_path, RUNTIME_ARCHIVE)?;
-    write_if_changed(&startup_path, STARTUP_SOURCE.as_bytes())?;
-    if let Some(parent) = executable.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create `{}`: {error}", parent.display()))?;
-    }
+    generated_output::write_if_changed(generated_root, &object_path, object)?;
+    generated_output::write_if_changed(generated_root, &runtime_path, RUNTIME_ARCHIVE)?;
+    generated_output::write_if_changed(generated_root, &startup_path, STARTUP_SOURCE.as_bytes())?;
+    let executable = if generated_executable {
+        generated_output::prepare_file(generated_root, executable)?
+    } else {
+        if let Some(parent) = executable.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create `{}`: {error}", parent.display()))?;
+        }
+        executable.to_path_buf()
+    };
 
-    let output = Command::new(RUST_COMPILER)
+    let (compiler, linker) = native_toolchain()?;
+    let output = Command::new(&compiler)
         .arg(&startup_path)
         .arg("--edition=2024")
         .arg("--extern")
@@ -48,11 +54,16 @@ pub fn link_executable(
         .arg("-C")
         .arg(format!("link-arg={}", object_path.display()))
         .arg("-C")
-        .arg(format!("linker={NATIVE_LINKER}"))
+        .arg(format!("linker={}", linker.display()))
         .arg("-o")
-        .arg(executable)
+        .arg(&executable)
         .output()
-        .map_err(|error| format!("failed to start native linker `{RUST_COMPILER}`: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "failed to start Rust compiler `{}`: {error}",
+                Path::new(&compiler).display()
+            )
+        })?;
     if !output.status.success() {
         return Err(format!(
             "native linking failed:\n{}",
@@ -62,15 +73,39 @@ pub fn link_executable(
     Ok(object_path)
 }
 
-fn write_if_changed(path: &Path, contents: &[u8]) -> Result<(), String> {
-    match fs::read(path) {
-        Ok(existing) if existing == contents => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("failed to read `{}`: {error}", path.display())),
+fn native_toolchain() -> Result<(OsString, PathBuf), String> {
+    let compiler = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    let output = Command::new(&compiler)
+        .args(["--print", "sysroot"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to locate Rust sysroot with `{}`: {error}",
+                Path::new(&compiler).display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to locate Rust sysroot with `{}`:\n{}",
+            Path::new(&compiler).display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-    fs::write(path, contents)
-        .map_err(|error| format!("failed to write `{}`: {error}", path.display()))
+    let sysroot = String::from_utf8(output.stdout)
+        .map_err(|error| format!("Rust returned a non-UTF-8 sysroot path: {error}"))?;
+    let linker = Path::new(sysroot.trim())
+        .join("lib")
+        .join("rustlib")
+        .join(HOST_TARGET)
+        .join("bin")
+        .join(format!("rust-lld{}", env::consts::EXE_SUFFIX));
+    if !linker.is_file() {
+        return Err(format!(
+            "native linker for target `{HOST_TARGET}` was not found at `{}`; install the matching Rust toolchain and target",
+            linker.display()
+        ));
+    }
+    Ok((compiler, linker))
 }
 
 const fn object_extension() -> &'static str {

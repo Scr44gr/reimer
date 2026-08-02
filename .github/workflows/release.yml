@@ -23,28 +23,44 @@ jobs:
     name: Validate release
     runs-on: ubuntu-latest
     outputs:
+      commit: ${{ steps.commit.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.tag.outputs.tag }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Resolve release tag
         id: tag
         shell: pwsh
         env:
           REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$env:REQUESTED_TAG"
+        run: |
+          if ($env:REQUESTED_TAG -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$') {
+            throw "Release tag '$env:REQUESTED_TAG' must be a SemVer value prefixed with 'v'."
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$env:REQUESTED_TAG"
+
+      - name: Record validated release commit
+        id: commit
+        shell: pwsh
+        run: |
+          $commit = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') {
+            throw 'Could not resolve the checked-out release commit.'
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "sha=$commit"
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
         with:
           components: clippy, rustfmt
 
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Validate tag and package versions
         id: version
@@ -97,15 +113,16 @@ jobs:
             suffix: ""
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
 
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Verify native host
         shell: pwsh
@@ -167,10 +184,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'packaged compiler could not resolve its standard library'
           }
+          $source = Join-Path $unpackRoot 'native-smoke.reim'
+          $program = Join-Path $unpackRoot 'native-smoke${{ matrix.suffix }}'
+          Set-Content -LiteralPath $source -Encoding utf8 -Value 'fn main() -> i32 { 42 }'
+          & $compiler build $source --release -o $program
+          if ($LASTEXITCODE -ne 0) { throw 'packaged compiler could not build an executable' }
+          & $program
+          if ($LASTEXITCODE -ne 42) {
+            throw "packaged native smoke test returned $LASTEXITCODE instead of 42"
+          }
 
       - name: Install Node.js for VS Code package
         if: runner.os == 'Windows'
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
@@ -185,7 +211,7 @@ jobs:
           npm run package
 
       - name: Upload release archive
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-${{ matrix.name }}
           path: |
@@ -196,7 +222,7 @@ jobs:
 
       - name: Upload VS Code extension
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-vscode
           path: editors/vscode/*.vsix
@@ -211,7 +237,7 @@ jobs:
       contents: write
     steps:
       - name: Download release assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: release-*
           path: release-assets
@@ -221,14 +247,28 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: |
           $assets = @(Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name)
           if ($assets.Count -eq 0) { throw 'no release assets were downloaded' }
 
+          $reference = & gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'release tag lookup failed' }
+          $object = $reference.object
+          while ($object.type -eq 'tag') {
+            $tagObject = & gh api "repos/$env:GITHUB_REPOSITORY/git/tags/$($object.sha)" | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'annotated release tag lookup failed' }
+            $object = $tagObject.object
+          }
+          if ($object.type -ne 'commit' -or $object.sha -ne $env:RELEASE_COMMIT) {
+            throw "Release tag '$env:RELEASE_TAG' no longer identifies validated commit '$env:RELEASE_COMMIT'."
+          }
+
           $arguments = @(
             'release', 'create', $env:RELEASE_TAG,
             '--verify-tag',
+            '--target', $env:RELEASE_COMMIT,
             '--generate-notes',
             '--title', "Reimer $env:RELEASE_TAG"
           )

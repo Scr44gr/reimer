@@ -917,13 +917,27 @@ pub struct TupleExpression {
     pub span: Span,
 }
 
-/// An array literal.
+/// An array literal or repeated array initializer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrayExpression {
-    /// Elements in index order.
-    pub elements: Vec<Expression>,
+    /// Written array initializer form.
+    pub kind: ArrayExpressionKind,
     /// Full source location.
     pub span: Span,
+}
+
+/// The two source forms accepted inside an array expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArrayExpressionKind {
+    /// Explicit elements in index order.
+    List(Vec<Expression>),
+    /// One value evaluated once and copied `length` times.
+    Repeat {
+        /// Repeated value expression.
+        value: Box<Expression>,
+        /// Compile-time array length expression.
+        length: Box<Expression>,
+    },
 }
 
 /// A struct or struct-like enum variant literal.

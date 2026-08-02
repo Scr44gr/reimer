@@ -11,9 +11,13 @@ if ($Tag -notmatch '^v(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]
 }
 
 $version = $Matches['version']
-$metadataJson = & cargo metadata --no-deps --format-version 1
+$metadataJson = & cargo metadata --locked --no-deps --format-version 1
 if ($LASTEXITCODE -ne 0) {
     throw 'Cargo metadata failed while validating the release tag.'
+}
+& git diff --exit-code -- Cargo.lock
+if ($LASTEXITCODE -ne 0) {
+    throw 'Cargo.lock changed while validating the release tag.'
 }
 
 $metadata = $metadataJson | ConvertFrom-Json

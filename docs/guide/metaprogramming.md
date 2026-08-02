@@ -69,7 +69,9 @@ rules are also validated in `comptime` functions that have not been called.
 
 ## Attributes
 
-Valid attributes form a closed list and are rejected on incompatible targets:
+Valid attribute names form a closed list and are rejected on incompatible
+targets. `@derive` accepts both compiler-provided structural derives and
+library-defined marker traits:
 
 ```reimer
 @repr(C)
@@ -94,7 +96,8 @@ fn header_default_should_be_zeroed() {
 
 - `@repr(C)` preserves the interoperable representation of an FFI struct.
 - `@align(N)` raises alignment to a valid power of two.
-- `@derive(...)` requests known structural implementations.
+- `@derive(...)` requests structural implementations or declares satisfaction
+  of an imported marker trait.
 - `@inline` is an optimization hint and does not change semantics.
 - `@test` requires a function with no parameters, generics, or return value.
 - `@must_use` warns through the linter/LSP when a result is discarded.
@@ -103,6 +106,41 @@ fn header_default_should_be_zeroed() {
 supports the operation. An enum's `Default` uses its first variant. `Clone` is
 only derived for `Copy` fields: `value.clone()` never allocates, fails, or
 requires an allocator. Owned containers retain `clone_in`.
+
+`Pod` is a compiler-provided derive for byte-safe native and GPU transfers. It
+requires `@repr(C)`, rejects implicit padding, and accepts only numeric scalar
+fields, fixed arrays, or nested `Pod` structs. It implies `Copy` and `Clone`:
+
+```reimer
+@repr(C)
+@derive(Pod, Debug)
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 4],
+}
+```
+
+Raw pointers, references, `bool`, enums, and user-declared marker traits cannot
+make a layout `Pod`. This keeps APIs such as `Queue::write_buffer_pod` safe
+without exposing raw byte casts to application code.
+
+A library may expose a non-generic trait with no methods as a marker derive.
+The compiler does not generate behavior for it; it records the implementation
+and verifies every supertrait:
+
+```reimer
+pub trait Component: Copy + Send + Sync {}
+
+@derive(Copy, Component)
+struct Position {
+    x: f32,
+    y: f32,
+}
+```
+
+Traits with methods still require an explicit `impl`. This keeps derives
+declarative and prevents a library annotation from hiding runtime work,
+allocation, or FFI.
 
 ## Typed reflection
 

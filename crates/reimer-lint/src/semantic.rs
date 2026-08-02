@@ -741,6 +741,7 @@ impl HirIndexer<'_> {
                     self.expression(element);
                 }
             }
+            ExpressionKind::ArrayRepeat { value, .. } => self.expression(value),
             ExpressionKind::Enum { fields, .. } => {
                 for field in fields {
                     self.expression(field);

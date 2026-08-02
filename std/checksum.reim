@@ -1,0 +1,14 @@
+from std::slice import bytes_as_ptr, len;
+
+@link("runtime")
+extern "C" {
+    fn checksum_crc32(data: *const u8, length: usize) -> u32;
+}
+
+/// Calculates CRC-32/ISO-HDLC for a borrowed byte sequence.
+///
+/// This detects accidental corruption. It is not an authentication code and
+/// must not be used to establish trust in attacker-controlled data.
+pub fn crc32(bytes: &[u8]) -> u32 {
+    unsafe { checksum_crc32(bytes_as_ptr(bytes), len(bytes)) }
+}

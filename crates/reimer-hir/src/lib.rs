@@ -74,6 +74,11 @@ pub struct TypeDefinition {
     pub alignment: Option<u32>,
     /// Compiler-generated structural trait implementations.
     pub derives: Vec<DerivedTrait>,
+    /// Library-defined marker traits declared through `@derive(...)`.
+    ///
+    /// Marker derives do not generate methods. The resolver accepts them only
+    /// for zero-method, non-generic traits and verifies their supertraits.
+    pub marker_traits: Vec<String>,
     /// Whether discarding a value of this type should produce a diagnostic.
     pub must_use: bool,
     /// Source range for named definitions.
@@ -95,6 +100,8 @@ pub enum DerivedTrait {
     Hash,
     /// Structural zero/default construction.
     Default,
+    /// Plain initialized bytes with a stable padding-free C layout.
+    Pod,
 }
 
 impl DerivedTrait {
@@ -108,6 +115,7 @@ impl DerivedTrait {
             Self::Eq => "Eq",
             Self::Hash => "Hash",
             Self::Default => "Default",
+            Self::Pod => "Pod",
         }
     }
 }
@@ -435,6 +443,13 @@ pub enum ExpressionKind {
     Tuple(Vec<Expression>),
     /// Fixed-size array construction.
     Array(Vec<Expression>),
+    /// Fixed-size array construction from one value evaluated once.
+    ArrayRepeat {
+        /// Value copied into every element.
+        value: Box<Expression>,
+        /// Statically resolved element count.
+        length: u64,
+    },
     /// Named struct construction in declaration field order.
     Struct(Vec<Expression>),
     /// Enum variant construction.

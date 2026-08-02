@@ -1,5 +1,5 @@
 from std::alloc import Allocator, general_allocator;
-from std::fs import FileError, create, exists, open, remove_file, rename;
+from std::fs import FileError, canonicalize, create, exists, file_size, open, remove_file, rename, replace_file;
 from std::string import String;
 
 fn write_fixture(path: str) -> Result<(), FileError> {
@@ -30,7 +30,20 @@ fn exercise_filesystem(allocator: &Allocator) -> Result<i32, FileError> {
     if !text.matches("answer") {
         return Err(FileError::InvalidData);
     }
+    if file_size(source)? != 6 {
+        return Err(FileError::InvalidData);
+    }
+    let canonical = canonicalize(source, allocator)?;
+    defer canonical.deinit();
+    if canonical.len() == 0 {
+        return Err(FileError::InvalidData);
+    }
     rename(source, destination)?;
+    if exists(source) || !exists(destination) {
+        return Err(FileError::Failed);
+    }
+    write_fixture(source)?;
+    replace_file(source, destination)?;
     if exists(source) || !exists(destination) {
         return Err(FileError::Failed);
     }

@@ -1,4 +1,5 @@
 from std::alloc import Allocator, OwnedBytes, allocate_bytes;
+import std::slice as slice;
 from std::string import String, from_initialized_bytes;
 
 /// Recoverable file-system failures.
@@ -7,6 +8,7 @@ pub enum FileError {
     UnexpectedEndOfFile,
     OutOfMemory,
     InvalidData,
+    NotUnicode,
 }
 
 /// One owned native file handle.
@@ -33,6 +35,7 @@ extern "C" {
     fn file_write(handle: usize, data: *const u8, len: usize) -> isize;
     fn file_write_all(handle: usize, data: *const u8, len: usize) -> i32;
     fn file_flush(handle: usize) -> i32;
+    fn file_sync_all(handle: usize) -> i32;
     fn file_remaining_len(handle: usize) -> isize;
     fn path_exists(data: *const u8, len: usize) -> bool;
     fn path_remove_file(data: *const u8, len: usize) -> i32;
@@ -42,6 +45,28 @@ extern "C" {
         destination_data: *const u8,
         destination_len: usize,
     ) -> i32;
+    fn path_replace_file(
+        source_data: *const u8,
+        source_len: usize,
+        destination_data: *const u8,
+        destination_len: usize,
+    ) -> i32;
+    fn path_create_dir_all(data: *const u8, len: usize) -> i32;
+    fn path_file_size(data: *const u8, len: usize, size: *mut u64) -> i32;
+    fn path_is_within(
+        root_data: *const u8,
+        root_len: usize,
+        candidate_data: *const u8,
+        candidate_len: usize,
+    ) -> i32;
+    fn path_canonical_open(data: *const u8, len: usize) -> isize;
+    fn path_snapshot_len(handle: usize) -> isize;
+    fn path_snapshot_copy(
+        handle: usize,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> isize;
+    fn path_snapshot_close(handle: usize) -> i32;
 }
 
 fn path_data(path: str) -> *const u8 {
@@ -106,6 +131,120 @@ pub fn rename(source: str, destination: str) -> Result<(), FileError> {
     if status == 0 {
         Ok(())
     } else {
+        Err(FileError::Failed)
+    }
+}
+
+/// Atomically publishes `source` at `destination`, replacing an existing file.
+///
+/// The source and destination must be on the same filesystem. Successful
+/// replacement never exposes a partially written destination.
+pub fn replace_file(source: str, destination: str) -> Result<(), FileError> {
+    let status = unsafe {
+        path_replace_file(
+            path_data(source),
+            path_len(source),
+            path_data(destination),
+            path_len(destination),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(FileError::Failed)
+    }
+}
+
+/// Recursively creates a directory and every missing parent directory.
+pub fn create_dir_all(path: str) -> Result<(), FileError> {
+    let status = unsafe { path_create_dir_all(path_data(path), path_len(path)) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(FileError::Failed)
+    }
+}
+
+/// Returns the byte length of one existing regular file.
+pub fn file_size(path: str) -> Result<u64, FileError> {
+    let mut size: u64 = 0;
+    let status = unsafe {
+        path_file_size(path_data(path), path_len(path), &mut size as *mut u64)
+    };
+    if status == 0 {
+        Ok(size)
+    } else {
+        Err(FileError::Failed)
+    }
+}
+
+/// Reports whether an existing candidate resolves within an existing root.
+///
+/// Both paths are canonicalized by the operating system before complete path
+/// components are compared. This rejects traversal through `..`, symbolic
+/// links, junctions, and sibling names that only share a textual prefix.
+pub fn is_within(root: str, candidate: str) -> Result<bool, FileError> {
+    let status = unsafe {
+        path_is_within(
+            path_data(root),
+            path_len(root),
+            path_data(candidate),
+            path_len(candidate),
+        )
+    };
+    if status == 0 {
+        Ok(true)
+    } else if status == 1 {
+        Ok(false)
+    } else {
+        Err(FileError::Failed)
+    }
+}
+
+fn close_path_snapshot(handle: usize) {
+    unsafe {
+        path_snapshot_close(handle);
+    }
+}
+
+/// Resolves an existing path into an allocator-owned canonical UTF-8 path.
+pub fn canonicalize(
+    path: str,
+    allocator: &Allocator,
+) -> Result<String, FileError> {
+    let opened = unsafe { path_canonical_open(path_data(path), path_len(path)) };
+    if opened < 0 {
+        if opened == -2 {
+            return Err(FileError::NotUnicode);
+        }
+        return Err(FileError::Failed);
+    }
+    let handle = opened as usize;
+    let length = unsafe { path_snapshot_len(handle) };
+    if length < 0 {
+        close_path_snapshot(handle);
+        return Err(FileError::Failed);
+    }
+    let byte_length = length as usize;
+    let allocation = allocate_bytes(allocator, byte_length);
+    let mut bytes = match allocation {
+        Ok(value) => value,
+        Err(_) => {
+            close_path_snapshot(handle);
+            return Err(FileError::OutOfMemory);
+        },
+    };
+    let copied = unsafe {
+        path_snapshot_copy(handle, bytes.as_mut_ptr(), byte_length)
+    };
+    close_path_snapshot(handle);
+    if copied == length {
+        match from_initialized_bytes(bytes, byte_length) {
+            Ok(value) => Ok(value),
+            Err(_) => Err(FileError::NotUnicode),
+        }
+    } else {
+        bytes.deinit();
         Err(FileError::Failed)
     }
 }
@@ -230,6 +369,18 @@ impl File {
         }
     }
 
+    /// Writes every byte from a borrowed buffer.
+    pub fn write_bytes(&mut self, value: &[u8]) -> Result<(), FileError> {
+        let status = unsafe {
+            file_write_all(self.raw, slice::as_ptr(value), slice::len(value))
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FileError::Failed)
+        }
+    }
+
     /// Writes every initialized byte from a file buffer.
     pub fn write_buffer(&mut self, buffer: &FileBuffer) -> Result<(), FileError> {
         let status = unsafe {
@@ -245,6 +396,19 @@ impl File {
     /// Flushes buffered data to the operating system.
     pub fn flush(&mut self) -> Result<(), FileError> {
         let status = unsafe { file_flush(self.raw) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FileError::Failed)
+        }
+    }
+
+    /// Synchronizes file content and metadata to the filesystem.
+    ///
+    /// This is more expensive than `flush`, but is required before publishing
+    /// durable save files or other data that must survive a power loss.
+    pub fn sync_all(&self) -> Result<(), FileError> {
+        let status = unsafe { file_sync_all(self.raw) };
         if status == 0 {
             Ok(())
         } else {
@@ -276,6 +440,16 @@ impl FileBuffer {
         self.len == 0
     }
 
+    /// Borrows the initialized portion of this buffer without copying it.
+    pub fn as_bytes(&self) -> &[u8] {
+        let bytes = self.bytes.as_bytes();
+        if self.len == self.bytes.len() {
+            bytes
+        } else {
+            __slice_from_parts(self.bytes.as_ptr(), self.len)
+        }
+    }
+
     /// Validates UTF-8 and transfers the allocation into an owned `String`.
     pub fn into_string(self) -> Result<String, FileError> {
         let len = self.len;
@@ -289,6 +463,12 @@ impl FileBuffer {
     /// Releases the buffer through its original allocator.
     pub fn deinit(self) {
         self.bytes.deinit();
+    }
+
+    /// Releases the allocation in place and makes repeated cleanup a no-op.
+    pub fn release(&mut self) {
+        self.bytes.release();
+        self.len = 0;
     }
 }
 

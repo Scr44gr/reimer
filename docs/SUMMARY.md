@@ -32,6 +32,7 @@
 - [Tensors](standard-library/tensors.md)
 - [C interoperability](interoperability/c.md)
 - [Vendored SDL3 package](interoperability/vendor-sdl3.md)
+- [WebGPU with wgpu-native](interoperability/wgpu.md)
 
 # Tools and workflows
 

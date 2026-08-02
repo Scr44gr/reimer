@@ -21,14 +21,17 @@ if (-not [Environment]::Is64BitProcess) {
 }
 
 $packageRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$workspaceRoot = (Resolve-Path (Join-Path $packageRoot '..\..')).Path
 $nativeRoot = Join-Path $packageRoot 'native\windows-x86_64'
 $library = Join-Path $nativeRoot 'SDL3.lib'
 $runtime = Join-Path $nativeRoot 'SDL3.dll'
 $projectRoot = (Resolve-Path -LiteralPath $Project).Path
 
-if (-not (Test-Path -LiteralPath $library) -or -not (Test-Path -LiteralPath $runtime)) {
-    throw "The vendored SDL3 library is incomplete at '$nativeRoot'."
-}
+. (Join-Path $workspaceRoot 'scripts\assert-vendored-checksums.ps1')
+Assert-VendoredChecksums -PackageRoot $packageRoot -RelativePath @(
+    'native/windows-x86_64/SDL3.dll',
+    'native/windows-x86_64/SDL3.lib'
+)
 
 $compiler = Get-Command reimer -ErrorAction Stop
 $arguments = @($Command, $projectRoot)

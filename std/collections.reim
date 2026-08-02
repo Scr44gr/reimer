@@ -1,4 +1,5 @@
 from std::alloc import AllocError, Allocator, OwnedBytes, allocate_bytes;
+import std::slice as slice;
 
 const CONTROL_EMPTY: u8 = 0x80;
 const CONTROL_DELETED: u8 = 0xfe;
@@ -13,6 +14,11 @@ extern "C" {
         fingerprint: u8,
     ) -> u64;
     fn hash_seed() -> u64;
+    fn copy_bytes(
+        destination: *mut u8,
+        source: *const u8,
+        length: usize,
+    ) -> i32;
 }
 
 pub struct Vec<T> {
@@ -22,8 +28,17 @@ pub struct Vec<T> {
 }
 
 impl<T> Vec<T> {
+    /// Creates an empty vector without an allocation or failure path.
+    pub fn empty(allocator: &Allocator) -> Vec<T> {
+        Vec {
+            storage: OwnedBytes::empty(allocator),
+            data: 0 as usize as *mut T,
+            len: 0,
+        }
+    }
+
     pub fn new(allocator: &Allocator) -> Result<Vec<T>, AllocError> {
-        Vec::with_capacity(allocator, 0)
+        Ok(Vec::empty(allocator))
     }
 
     pub fn with_capacity(
@@ -50,6 +65,58 @@ impl<T> Vec<T> {
         self.storage.len() / __pointee_stride(self.data)
     }
 
+    /// Returns bytes currently reserved for element storage.
+    ///
+    /// This excludes allocator metadata and is intended for capacity planning,
+    /// diagnostics, and benchmark accounting.
+    pub fn allocated_bytes(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Ensures that `additional` elements fit without another allocation.
+    pub fn reserve(&mut self, additional: usize) -> Result<(), AllocError> {
+        let required = match self.len.checked_add(additional) {
+            Some(value) => value,
+            None => {
+                return Err(AllocError::OutOfMemory);
+            },
+        };
+        let stride = __pointee_stride(self.data);
+        let capacity = self.storage.len() / stride;
+        if required <= capacity {
+            return Ok(());
+        }
+        let mut next_capacity = if capacity < 4 as usize {
+            4 as usize
+        } else {
+            capacity
+        };
+        while next_capacity < required {
+            let remaining = required - next_capacity;
+            let growth = if remaining > next_capacity {
+                remaining
+            } else {
+                next_capacity
+            };
+            next_capacity = match next_capacity.checked_add(growth) {
+                Some(value) => value,
+                None => required,
+            };
+        }
+        let byte_capacity = next_capacity * stride;
+        self.storage.grow(byte_capacity)?;
+        self.data = self.storage.as_mut_ptr() as *mut T;
+        Ok(())
+    }
+
+    /// Removes every element while retaining allocated capacity.
+    pub fn clear(&mut self)
+    where
+        T: Copy,
+    {
+        self.len = 0;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -63,17 +130,7 @@ impl<T> Vec<T> {
     }
 
     pub fn push(&mut self, value: T) -> Result<(), AllocError> {
-        let stride = __pointee_stride(self.data);
-        let capacity = self.storage.len() / stride;
-        if self.len == capacity {
-            let next_capacity: usize = if self.len == 0 {
-                4
-            } else {
-                self.len * 2
-            };
-            self.storage.grow(next_capacity * stride)?;
-            self.data = self.storage.as_mut_ptr() as *mut T;
-        }
+        self.reserve(1)?;
         let offset = self.len * __pointee_stride(self.data);
         let destination = (self.data as usize + offset) as *mut T;
         unsafe {
@@ -99,6 +156,73 @@ impl<T> Vec<T> {
         }
     }
 
+    /// Inserts one `Copy` value at `index`, shifting later values right.
+    ///
+    /// Returns `false` when `index` is greater than the current length.
+    pub fn insert(
+        &mut self,
+        index: usize,
+        value: T,
+    ) -> Result<bool, AllocError>
+    where
+        T: Copy,
+    {
+        if index > self.len {
+            return Ok(false);
+        }
+        if index == self.len {
+            self.push(value)?;
+            return Ok(true);
+        }
+        self.reserve(1)?;
+        let previous_last = match self.get(self.len - 1) {
+            Some(existing) => existing,
+            None => panic("vector insert could not read its last value"),
+        };
+        if !self.push_within_capacity(previous_last) {
+            panic("reserved vector insertion capacity was unavailable")
+        }
+        let mut cursor = self.len - 1;
+        while cursor > index {
+            let previous = match self.get(cursor - 1) {
+                Some(existing) => existing,
+                None => panic("vector insert shift escaped initialized storage"),
+            };
+            if !self.set(cursor, previous) {
+                panic("vector insert shift escaped initialized storage")
+            }
+            cursor -= 1;
+        }
+        if !self.set(index, value) {
+            panic("vector insert target escaped initialized storage")
+        }
+        Ok(true)
+    }
+
+    /// Removes one `Copy` value, shifting later values left.
+    pub fn remove(&mut self, index: usize) -> Option<T>
+    where
+        T: Copy,
+    {
+        let removed = match self.get(index) {
+            Some(value) => value,
+            None => { return None; },
+        };
+        let mut cursor = index;
+        while cursor + 1 < self.len {
+            let next = match self.get(cursor + 1) {
+                Some(value) => value,
+                None => panic("vector remove shift escaped initialized storage"),
+            };
+            if !self.set(cursor, next) {
+                panic("vector remove shift escaped initialized storage")
+            }
+            cursor += 1;
+        }
+        self.len -= 1;
+        Some(removed)
+    }
+
     pub fn get(&self, index: usize) -> Option<T>
     where
         T: Copy,
@@ -107,6 +231,24 @@ impl<T> Vec<T> {
             let offset = index * __pointee_stride(self.data);
             let source = (self.data as usize + offset) as *const T;
             Some(unsafe { *source })
+        } else {
+            None
+        }
+    }
+
+    /// Borrows an element without copying or transferring ownership.
+    pub fn get_ref(&self, index: usize) -> Option<&T> {
+        if index < self.len {
+            Some(&self.as_slice()[index])
+        } else {
+            None
+        }
+    }
+
+    /// Mutably borrows an element without transferring ownership.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index < self.len {
+            Some(&mut self.as_mut_slice()[index])
         } else {
             None
         }
@@ -146,6 +288,59 @@ impl<T> Vec<T> {
         self.storage.deinit();
     }
 
+    /// Releases element storage in place and makes repeated cleanup a no-op.
+    pub fn release(&mut self) {
+        self.storage.release();
+        self.data = 0 as usize as *mut T;
+        self.len = 0;
+    }
+
+}
+
+impl Vec<u8> {
+    /// Copies a borrowed byte sequence into initialized vector storage.
+    pub fn write_bytes(&mut self, offset: usize, source: &[u8]) -> bool {
+        let source_len = slice::len(source);
+        if offset > self.len || source_len > self.len - offset {
+            return false;
+        }
+        let destination = (self.data as usize + offset) as *mut u8;
+        let status = unsafe {
+            copy_bytes(destination, slice::bytes_as_ptr(source), source_len)
+        };
+        status == 0
+    }
+
+    /// Copies two non-overlapping initialized regions within this vector.
+    pub fn copy_nonoverlapping(
+        &mut self,
+        destination: usize,
+        source: usize,
+        length: usize,
+    ) -> bool {
+        if destination > self.len
+            || source > self.len
+            || length > self.len - destination
+            || length > self.len - source
+        {
+            return false;
+        }
+        let destination_end = destination + length;
+        let source_end = source + length;
+        if length != 0
+            && destination < source_end
+            && source < destination_end
+        {
+            return false;
+        }
+        let destination_ptr =
+            (self.data as usize + destination) as *mut u8;
+        let source_ptr = (self.data as usize + source) as *const u8;
+        let status = unsafe {
+            copy_bytes(destination_ptr, source_ptr, length)
+        };
+        status == 0
+    }
 }
 
 struct Entry<K, V> {
@@ -163,6 +358,15 @@ struct HashTable<K, V> {
 }
 
 impl<K: Copy, V: Copy> HashTable<K, V> {
+    pub fn empty(allocator: &Allocator) -> HashTable<K, V> {
+        HashTable {
+            storage: OwnedBytes::empty(allocator),
+            entries: 0 as usize as *mut Entry<K, V>,
+            controls: 0 as usize as *mut u8,
+            capacity: 0,
+        }
+    }
+
     pub fn with_capacity(
         allocator: &Allocator,
         capacity: usize,
@@ -402,6 +606,13 @@ impl<K: Copy, V: Copy> HashTable<K, V> {
     pub fn deinit(self) {
         self.storage.deinit();
     }
+
+    pub fn release(&mut self) {
+        self.storage.release();
+        self.entries = 0 as usize as *mut Entry<K, V>;
+        self.controls = 0 as usize as *mut u8;
+        self.capacity = 0;
+    }
 }
 
 enum ProbeResult {
@@ -422,13 +633,22 @@ pub struct HashMap<K, V> {
 }
 
 impl<K: Copy + Eq + Hash, V: Copy> HashMap<K, V> {
+    /// Creates an empty map without an allocation or failure path.
+    pub fn empty(allocator: &Allocator) -> HashMap<K, V> {
+        HashMap {
+            allocator: *allocator,
+            table: HashTable::empty(allocator),
+            len: 0,
+            deleted: 0,
+            seed: unsafe { hash_seed() },
+        }
+    }
+
     /// Creates an empty map without allocating entry storage.
     pub fn new(
         allocator: &Allocator,
     ) -> Result<HashMap<K, V>, AllocError> {
-        let created: Result<HashMap<K, V>, AllocError> =
-            HashMap::with_capacity(allocator, 0);
-        created
+        Ok(HashMap::empty(allocator))
     }
 
     /// Creates an empty map sized for at least `capacity` entries.
@@ -576,6 +796,13 @@ impl<K: Copy + Eq + Hash, V: Copy> HashMap<K, V> {
     /// Releases the table storage through its original allocator.
     pub fn deinit(self) {
         self.table.deinit();
+    }
+
+    /// Releases table storage in place and makes repeated cleanup inert.
+    pub fn release(&mut self) {
+        self.table.release();
+        self.len = 0;
+        self.deleted = 0;
     }
 }
 

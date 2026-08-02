@@ -19,6 +19,7 @@ reimer-hir = { path = "../reimer-hir" }
 reimer-layout = { path = "../reimer-layout" }
 reimer-runtime = { path = "../reimer-runtime" }
 reimer-types = { path = "../reimer-types" }
+target-lexicon = "0.13.5"
 
 [dev-dependencies]
 reimer-lexer = { path = "../reimer-lexer" }

@@ -211,6 +211,13 @@ impl<'source, 'program> FunctionLinter<'source, 'program> {
         let Some(name) = call_name(&call.callee) else {
             return;
         };
+        if matches!(name, "Ok" | "Err" | "Some") {
+            for argument in &call.arguments {
+                if let Some(owner) = owned_root_name(argument) {
+                    self.transferred.insert(owner.to_owned());
+                }
+            }
+        }
         if let Expression::Field(field) = &call.callee
             && let Some(owner) = root_name(&field.base)
         {
@@ -301,6 +308,13 @@ impl Visitor for FunctionLinter<'_, '_> {
                     && let Some(name) = path.segments.first()
                 {
                     self.transferred.insert(name.name.clone());
+                }
+            }
+            Expression::Struct(structure) => {
+                for field in &structure.fields {
+                    if let Some(name) = owned_root_name(&field.value) {
+                        self.transferred.insert(name.to_owned());
+                    }
                 }
             }
             Expression::Unsafe(block) if block.statements.is_empty() && block.tail.is_none() => {
@@ -400,6 +414,22 @@ fn root_name(expression: &Expression) -> Option<&str> {
         Expression::Unary(unary) => root_name(&unary.operand),
         Expression::Try { value, .. } => root_name(value),
         _ => None,
+    }
+}
+
+fn owned_root_name(expression: &Expression) -> Option<&str> {
+    match expression {
+        Expression::Unary(unary)
+            if matches!(
+                unary.operator,
+                ast::UnaryOperator::Borrow | ast::UnaryOperator::BorrowMut
+            ) =>
+        {
+            None
+        }
+        Expression::Try { value, .. } => owned_root_name(value),
+        Expression::Cast(cast) => owned_root_name(&cast.value),
+        _ => root_name(expression),
     }
 }
 
@@ -649,6 +679,39 @@ mod tests {
                 };
                 defer bytes.deinit();
                 0
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_treat_owned_struct_field_as_ownership_transfer() {
+        let source = "
+            struct Buffer { storage: OwnedBytes }
+            fn create() -> Result<Buffer, AllocError> {
+                let storage = allocate_bytes(&allocator, 64)?;
+                Ok(Buffer { storage: storage })
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_treat_result_payload_as_ownership_transfer() {
+        let source = "
+            fn create() -> Result<String, AllocError> {
+                let output = String::with_capacity(&allocator, 64)?;
+                Ok(output)
             }
         ";
         let syntax =

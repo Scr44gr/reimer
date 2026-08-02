@@ -7,11 +7,12 @@ $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $nativeRoot = Join-Path $workspace 'vendor\sdl3\native\windows-x86_64'
 $library = Join-Path $nativeRoot 'SDL3.dll'
 
-if (-not (Test-Path -LiteralPath $library)) {
-    throw "The vendored SDL3.dll was not found at '$library'."
-}
+. (Join-Path $workspace 'scripts\assert-vendored-checksums.ps1')
+Assert-VendoredChecksums -PackageRoot (Join-Path $workspace 'vendor\sdl3') `
+    -RelativePath @('native/windows-x86_64/SDL3.dll')
 
-$env:PATH = "$nativeRoot;$env:PATH"
+$previousPath = $env:PATH
+$env:PATH = "$nativeRoot;$previousPath"
 Push-Location $workspace
 try {
     cargo run -p reimer-cli --locked -- run examples/m5_sdl_opengl.reim
@@ -21,4 +22,5 @@ try {
 }
 finally {
     Pop-Location
+    $env:PATH = $previousPath
 }

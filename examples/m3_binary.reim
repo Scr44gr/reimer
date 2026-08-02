@@ -1,0 +1,33 @@
+from std::binary import from_f32_bits, read_f32_le, read_u16_le, read_u32_le, to_f32_bits;
+from std::checksum import crc32;
+from std::slice import byte_range;
+
+fn main() -> i32 {
+    let bytes: [u8; 8] = [0x34, 0x12, 0x78, 0x56, 0x00, 0x00, 0x80, 0x3f];
+    match read_u16_le(&bytes, 0) {
+        Some(value) => assert(value == 0x1234),
+        None => panic("missing u16"),
+    }
+    match read_u32_le(&bytes, 0) {
+        Some(value) => assert(value == 0x5678_1234),
+        None => panic("missing u32"),
+    }
+    match read_u32_le(&bytes, 6) {
+        Some(_) => panic("out-of-bounds read succeeded"),
+        None => (),
+    }
+    match read_f32_le(&bytes, 4) {
+        Some(value) => assert(value == 1.0),
+        None => panic("missing f32"),
+    }
+    assert(to_f32_bits(from_f32_bits(0x3f80_0000)) == 0x3f80_0000);
+    let checksum_bytes: [u8; 9] = [
+        0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+    ];
+    assert(crc32(&checksum_bytes) == 0xcbf4_3926);
+    match byte_range(&bytes, 2, 4) {
+        Some(values) => assert(values[0] == 0x78 && values[3] == 0x00),
+        None => panic("valid subslice failed"),
+    }
+    0
+}

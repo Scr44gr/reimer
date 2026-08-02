@@ -1,0 +1,61 @@
+/// Returns the number of elements in any borrowed slice.
+pub fn len<T>(values: &[T]) -> usize {
+    __slice_length(values)
+}
+
+/// Returns the number of elements in an exclusively borrowed slice.
+pub fn mut_len<T>(values: &mut [T]) -> usize {
+    __slice_length(values)
+}
+
+/// Returns a pointer to the first element, or null for an empty slice.
+///
+/// The pointer remains valid only while `values` is borrowed.
+pub fn as_ptr<T>(values: &[T]) -> *const T {
+    if len(values) == 0 {
+        0 as usize as *const T
+    } else {
+        &values[0] as *const T
+    }
+}
+
+/// Returns the native stride of one slice element.
+pub fn element_size<T>(values: &[T]) -> usize {
+    __pointee_stride(as_ptr(values))
+}
+
+/// Borrows a checked contiguous byte range without allocating.
+pub fn byte_range(values: &[u8], offset: usize, count: usize) -> Option<&[u8]> {
+    let total = len(values);
+    if offset > total || count > total - offset {
+        return None;
+    }
+    if count == 0 {
+        if total == 0 {
+            return Some(values);
+        }
+        return Some(__slice_from_parts(&values[0] as *const u8, 0));
+    }
+    Some(__slice_from_parts(&values[offset] as *const u8, count))
+}
+
+/// Returns the number of bytes in a borrowed byte slice.
+pub fn byte_len(values: &[u8]) -> usize {
+    len(values)
+}
+
+/// Reports whether a borrowed byte slice is empty.
+pub fn bytes_are_empty(values: &[u8]) -> bool {
+    byte_len(values) == 0
+}
+
+/// Returns a pointer to the first byte, or null for an empty slice.
+///
+/// The pointer remains valid only while `values` is borrowed.
+pub fn bytes_as_ptr(values: &[u8]) -> *const u8 {
+    if bytes_are_empty(values) {
+        0 as usize as *const u8
+    } else {
+        as_ptr(values)
+    }
+}

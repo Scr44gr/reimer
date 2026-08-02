@@ -80,9 +80,10 @@ impl Display for Health {
 
 The compiler selects the implementation statically. A nominal type without the required trait produces a diagnostic before code generation.
 
-## Closed derives
+## Structural and marker derives
 
-`@derive` supports `Copy`, `Clone`, `Debug`, `Eq`, `Hash`, and `Default` when every stored field satisfies the corresponding structural rules.
+The compiler provides `Copy`, `Clone`, `Debug`, `Eq`, `Hash`, and `Default`
+when every stored field satisfies the corresponding structural rules.
 
 ```reimer
 @derive(Copy, Clone, Debug, Eq, Hash, Default)
@@ -93,3 +94,20 @@ struct Cell {
 ```
 
 Derived `Clone` cannot hide an allocation or allocator choice. Owned standard-library types provide explicit duplication operations instead.
+
+Libraries can also define zero-method, non-generic marker traits. Listing one
+in `@derive` declares the marker implementation after the compiler verifies
+its supertraits:
+
+```reimer
+trait Component: Copy + Send + Sync {}
+
+@derive(Copy, Component)
+struct Velocity {
+    x: f32,
+    y: f32,
+}
+```
+
+A behavioral trait cannot be derived this way. Implement it explicitly so its
+methods, costs, and failure behavior remain visible.

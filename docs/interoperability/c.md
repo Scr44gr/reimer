@@ -42,14 +42,19 @@ not own or validate the pointed-to memory. Constructing or checking the record
 is safe; dereferencing its pointer remains an `unsafe` operation governed by
 the original native API's lifetime and alignment contract.
 
-Windows x64 external declarations may also pass and return ABI-safe
-`@repr(C)` structs by value. Records of 1, 2, 4, or 8 bytes use the matching
-integer register representation; other records use caller-owned, 16-byte-aligned
-copies and structure-return storage. The backend tests both paths against real
-`extern "C"` functions, and the SDL package additionally exercises a 16-byte
-`SDL_GUID` round trip. Other native targets reject by-value aggregates during
-code generation until their C ABI classifiers are implemented; raw pointers
-remain portable across the currently supported targets.
+External declarations may pass and return ABI-safe `@repr(C)` structs by value
+on the supported 64-bit targets. The backend implements Microsoft x64, System V
+AMD64, generic AAPCS64, and Apple's AArch64 variant. This includes mixed
+integer/SSE eightbytes, register exhaustion rollback, stack aggregates,
+homogeneous floating-point aggregates, indirect large values, and hidden
+structure-return pointers. Padded temporary storage is zero-initialized so the
+lowering never reads beyond a source value or exposes uninitialized padding.
+
+The backend tests each classifier independently and exercises Microsoft x64
+against real `extern "C"` functions on Windows. Big-endian AArch64, 32-bit
+targets, and other unimplemented aggregate ABIs are rejected with a backend
+diagnostic instead of using guessed rules. Raw-pointer FFI remains available on
+every currently supported native target.
 
 `int_from_bool` and `bool_from_int` convert conventional zero/nonzero integer
 booleans. Use `Bool` only when the C declaration specifically uses `_Bool` or

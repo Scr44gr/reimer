@@ -27,11 +27,15 @@ $sdlLibrary = Join-Path $sdlNativeRoot 'SDL3.lib'
 $sdlRuntime = Join-Path $sdlNativeRoot 'SDL3.dll'
 $projectRoot = (Resolve-Path -LiteralPath $Project).Path
 
-foreach ($required in @($imguiLibrary, $imguiRuntime, $sdlLibrary, $sdlRuntime)) {
-    if (-not (Test-Path -LiteralPath $required)) {
-        throw "The required native artifact is missing at '$required'."
-    }
-}
+. (Join-Path $workspaceRoot 'scripts\assert-vendored-checksums.ps1')
+Assert-VendoredChecksums -PackageRoot $packageRoot -RelativePath @(
+    'native/windows-x86_64/imgui.dll',
+    'native/windows-x86_64/imgui.lib'
+)
+Assert-VendoredChecksums -PackageRoot (Join-Path $workspaceRoot 'vendor\sdl3') -RelativePath @(
+    'native/windows-x86_64/SDL3.dll',
+    'native/windows-x86_64/SDL3.lib'
+)
 
 $compiler = Get-Command reimer -ErrorAction Stop
 $arguments = @($Command, $projectRoot)

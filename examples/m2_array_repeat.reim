@@ -1,0 +1,9 @@
+fn filled<T: Copy, const N: usize>(value: T) -> [T; N] {
+    [value; N]
+}
+
+fn main() -> i32 {
+    let values: [i32; 4] = filled<i32, 4>(10);
+    let cleared: [i32; 4] = [0; 4];
+    values[0] + values[3] + cleared[2] + 22
+}

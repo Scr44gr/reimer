@@ -61,6 +61,19 @@ fn load(path: str, allocator: &Allocator) -> Result<String, FileError> {
 
 `open`, `create`, and `append` return an owned `File`. File methods include bounded reads, full reads, writes, flush, remaining length, and explicit cleanup.
 
+`FileBuffer::as_bytes()` exposes only the initialized portion as a borrowed `&[u8]`; it neither copies nor transfers the allocation. Use `std::binary` to decode portable little-endian fields from that view:
+
+```reimer
+from std::binary import read_u32_le;
+
+let buffer = file.read_to_end(allocator)?;
+defer buffer.deinit();
+let bytes = buffer.as_bytes();
+let magic = read_u32_le(bytes, 0);
+```
+
+The integer readers return `None` when the requested range is incomplete. `read_f32_le`, `from_f32_bits`, and their `f64` equivalents preserve the IEEE-754 bit representation without raw-pointer reinterpretation.
+
 High-level helpers cover common complete-file operations:
 
 ```reimer

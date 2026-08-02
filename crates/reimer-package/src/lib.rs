@@ -268,6 +268,49 @@ pub fn load_with_overlays(
     Loader::single(entry).with_overlays(overlays).load()
 }
 
+/// Returns whether `path` belongs to the configured standard-library source tree.
+#[must_use]
+pub fn is_standard_library_source(path: &Path) -> bool {
+    let root = standard_library_root();
+    let normalized_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let normalized_root = fs::canonicalize(&root).unwrap_or(root);
+    normalized_path.starts_with(normalized_root)
+}
+
+/// Loads one standard-library module with its canonical `std::...` identity.
+///
+/// Editor tooling uses this entry point when a standard module is opened
+/// directly. A normal single-file load would otherwise name `slice.reim` as
+/// merely `slice`, which would incorrectly reject its private intrinsics.
+///
+/// # Errors
+///
+/// Returns file-aware diagnostics for an invalid standard-library path or the
+/// same source and module failures as [`load_with_overlays`].
+pub fn load_standard_with_overlays(
+    entry: &Path,
+    overlays: &[(PathBuf, String)],
+) -> Result<Package, Vec<FileDiagnostic>> {
+    let entry = fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+    let standard_root = standard_library_root();
+    let standard_root = fs::canonicalize(&standard_root).unwrap_or(standard_root);
+    let source_root = standard_root
+        .parent()
+        .map_or_else(|| standard_root.clone(), Path::to_path_buf);
+    let overlays = overlays
+        .iter()
+        .map(|(path, source)| {
+            (
+                fs::canonicalize(path).unwrap_or_else(|_| path.clone()),
+                source.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Loader::single_with_source_root(&entry, source_root)
+        .with_overlays(&overlays)
+        .load()
+}
+
 /// Loads a resolved package graph and enforces dependency visibility per edge.
 ///
 /// # Errors
@@ -325,6 +368,11 @@ impl Loader {
         let source_root = entry
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        Self::single_with_source_root(&entry, source_root)
+    }
+
+    fn single_with_source_root(entry: &Path, source_root: PathBuf) -> Self {
+        let entry = entry.to_path_buf();
         let root_package = "root".to_owned();
         let package = SourcePackage {
             id: root_package.clone(),
@@ -1506,11 +1554,7 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
                 visit_expression_paths(element, paths);
             }
         }
-        Expression::Array(array) => {
-            for element in &array.elements {
-                visit_expression_paths(element, paths);
-            }
-        }
+        Expression::Array(array) => visit_array_expression_paths(array, paths),
         Expression::Struct(structure) => {
             paths.push(&structure.path);
             for field in &structure.fields {
@@ -1570,6 +1614,23 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
             }
         }
         Expression::Try { value, .. } => visit_expression_paths(value, paths),
+    }
+}
+
+fn visit_array_expression_paths<'ast>(
+    array: &'ast ast::ArrayExpression,
+    paths: &mut Vec<&'ast ast::Path>,
+) {
+    match &array.kind {
+        ast::ArrayExpressionKind::List(elements) => {
+            for element in elements {
+                visit_expression_paths(element, paths);
+            }
+        }
+        ast::ArrayExpressionKind::Repeat { value, length } => {
+            visit_expression_paths(value, paths);
+            visit_expression_paths(length, paths);
+        }
     }
 }
 
@@ -1688,6 +1749,7 @@ impl ItemRewriteContext<'_> {
     }
 
     fn rewrite_struct(&mut self, declaration: &mut ast::StructDeclaration) {
+        self.rewrite_derive_attributes(&mut declaration.attributes);
         rewrite_identifier(&mut declaration.name, self.module);
         self.rewrite_generics(&mut declaration.generic_parameters);
         for field in &mut declaration.fields {
@@ -1697,6 +1759,7 @@ impl ItemRewriteContext<'_> {
     }
 
     fn rewrite_enum(&mut self, declaration: &mut ast::EnumDeclaration) {
+        self.rewrite_derive_attributes(&mut declaration.attributes);
         rewrite_identifier(&mut declaration.name, self.module);
         self.rewrite_generics(&mut declaration.generic_parameters);
         for variant in &mut declaration.variants {
@@ -1715,6 +1778,33 @@ impl ItemRewriteContext<'_> {
             }
         }
         self.rewrite_predicates(&mut declaration.where_predicates);
+    }
+
+    fn rewrite_derive_attributes(&mut self, attributes: &mut [ast::Attribute]) {
+        for attribute in attributes {
+            if attribute.name.name != "derive" {
+                continue;
+            }
+            for argument in &mut attribute.arguments {
+                let ast::AttributeArgument::Identifier(identifier) = argument else {
+                    continue;
+                };
+                if matches!(
+                    identifier.name.as_str(),
+                    "Copy" | "Clone" | "Debug" | "Eq" | "Hash" | "Default" | "Pod"
+                ) {
+                    continue;
+                }
+                let mut path = ast::Path {
+                    segments: vec![identifier.clone()],
+                    span: identifier.span,
+                };
+                rewrite_path(&mut path, self.scope, self.apis, self.diagnostics);
+                if let [rewritten] = path.segments.as_slice() {
+                    identifier.name.clone_from(&rewritten.name);
+                }
+            }
+        }
     }
 
     fn rewrite_trait(&mut self, declaration: &mut ast::TraitDeclaration) {
@@ -1934,11 +2024,7 @@ fn rewrite_expression(
                 rewrite_expression(element, scope, apis, diagnostics);
             }
         }
-        Expression::Array(array) => {
-            for element in &mut array.elements {
-                rewrite_expression(element, scope, apis, diagnostics);
-            }
-        }
+        Expression::Array(array) => rewrite_array_expression(array, scope, apis, diagnostics),
         Expression::Struct(structure) => {
             rewrite_path(&mut structure.path, scope, apis, diagnostics);
             for field in &mut structure.fields {
@@ -2011,6 +2097,25 @@ fn rewrite_expression(
         }
         Expression::Try { value, .. } => {
             rewrite_expression(value, scope, apis, diagnostics);
+        }
+    }
+}
+
+fn rewrite_array_expression(
+    array: &mut ast::ArrayExpression,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+) {
+    match &mut array.kind {
+        ast::ArrayExpressionKind::List(elements) => {
+            for element in elements {
+                rewrite_expression(element, scope, apis, diagnostics);
+            }
+        }
+        ast::ArrayExpressionKind::Repeat { value, length } => {
+            rewrite_expression(value, scope, apis, diagnostics);
+            rewrite_expression(length, scope, apis, diagnostics);
         }
     }
 }
@@ -2760,6 +2865,31 @@ mod tests {
 
         reimer_resolver::resolve(&package.program)
             .expect("a public trait method should be callable across modules");
+    }
+
+    #[test]
+    fn resolver_should_resolve_imported_marker_derives_across_modules() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.reim",
+            "from ecs import Component, require_component;
+             @derive(Copy, Component)
+             struct Position { x: f32, y: f32 }
+             fn main() -> i32 {
+                 let position = require_component(Position { x: 1.0, y: 2.0 });
+                 if position.x == 1.0 { 42 } else { 0 }
+             }",
+        );
+        fixture.write(
+            "ecs.reim",
+            "pub trait Component: Copy + Send + Sync {}
+             pub fn require_component<T: Component>(value: T) -> T { value }",
+        );
+
+        let package = load(&fixture.path("main.reim")).expect("package should load");
+
+        reimer_resolver::resolve(&package.program)
+            .expect("an imported marker derive should satisfy its canonical trait bound");
     }
 
     #[test]

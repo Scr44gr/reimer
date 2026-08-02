@@ -67,12 +67,31 @@ pub fn bytes_len(bytes: &OwnedBytes) -> usize {
 }
 
 impl OwnedBytes {
+    /// Creates an empty owner tied to `allocator` without allocating.
+    pub fn empty(allocator: &Allocator) -> OwnedBytes {
+        OwnedBytes {
+            data: 0 as usize as *mut u8,
+            len: 0,
+            allocator: (*allocator).raw,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
 
     pub fn as_ptr(&self) -> *const u8 {
         self.data as *const u8
+    }
+
+    /// Borrows every byte in this owned allocation without copying it.
+    pub fn as_bytes(&self) -> &[u8] {
+        __slice_from_parts(self.data as *const u8, self.len)
+    }
+
+    /// Borrows every byte in this owned allocation for exclusive mutation.
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        __slice_from_parts(self.data, self.len)
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -127,6 +146,17 @@ impl OwnedBytes {
     pub fn deinit(self) {
         deinit_bytes(self);
     }
+
+    /// Releases this region in place and makes repeated cleanup a no-op.
+    pub fn release(&mut self) {
+        if self.len != 0 {
+            unsafe {
+                __deallocate_bytes(self.allocator, self.data, self.len);
+            }
+            self.data = 0 as usize as *mut u8;
+            self.len = 0;
+        }
+    }
 }
 
 impl ArenaAllocator {
@@ -143,6 +173,28 @@ impl ArenaAllocator {
 
     pub fn allocator(&self) -> &Allocator {
         &self.allocator
+    }
+
+    /// Copies the arena's lightweight allocation handle.
+    ///
+    /// The returned handle remains valid only while this arena is alive. It is
+    /// useful for owners that keep the arena and its child containers in the
+    /// same aggregate without retaining a borrow of the arena field.
+    pub fn allocator_value(&self) -> Allocator {
+        self.allocator
+    }
+
+    /// Releases every child allocation and invalidates this arena handle.
+    ///
+    /// Calling `release` again is a no-op. Prefer this method when the arena is
+    /// a field of a larger owner that also stores containers allocated from it.
+    pub fn release(&mut self) {
+        if self.allocator.raw != 0 {
+            unsafe {
+                arena_allocator_deinit(self.allocator.raw);
+            }
+            self.allocator.raw = 0;
+        }
     }
 
     pub fn deinit(self) {
@@ -166,6 +218,24 @@ impl FixedBufferAllocator {
 
     pub fn allocator(&self) -> &Allocator {
         &self.allocator
+    }
+
+    /// Copies the fixed-buffer allocator's lightweight handle.
+    ///
+    /// The returned handle remains valid only while this fixed buffer is alive.
+    pub fn allocator_value(&self) -> Allocator {
+        self.allocator
+    }
+
+    /// Invalidates this fixed-buffer allocator without freeing the caller's
+    /// backing byte region.
+    pub fn release(&mut self) {
+        if self.allocator.raw != 0 {
+            unsafe {
+                fixed_buffer_allocator_deinit(self.allocator.raw);
+            }
+            self.allocator.raw = 0;
+        }
     }
 
     pub fn deinit(self) {

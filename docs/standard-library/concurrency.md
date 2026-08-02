@@ -58,13 +58,20 @@ transfers the result to the caller.
 ```reimer
 from std::alloc import general_allocator;
 from std::job import JobPool, JobPoolConfig;
+from std::thread import available_parallelism;
 
 let allocator = general_allocator();
+let workers = available_parallelism();
 let pool = JobPool::init(
     &allocator,
-    JobPoolConfig::fixed(4),
+    JobPoolConfig::fixed(workers),
 )?;
 ```
+
+`available_parallelism()` reports the operating system's current estimate of
+useful worker threads and always returns at least one. Capture it when creating
+a long-lived scheduler; the estimate can change when CPU quotas or topology
+change.
 
 `parallel_for_mut` splits a slice into nonoverlapping exclusive regions. The
 array variant preserves static length, while `tensor::parallel_for_mut`
@@ -81,11 +88,14 @@ The type checker rejects:
 
 ## Runtime isolation
 
-Each JIT execution receives its own session. Threads, jobs, and pools preserve
-that identity, including resources created from a worker. When a program ends,
-the backend waits for and retires only that program's resources. Tests and
-tools can therefore execute several programs concurrently without one
-cleanup closing another program's handles.
+Each JIT execution receives a session used to scope arguments and to group the
+cleanup of threads, jobs, and pools, including resources created by a worker.
+This is lifecycle bookkeeping, not an authorization boundary or sandbox:
+runtime handles and the native process are shared, and Reimer programs can use
+FFI and process APIs. Do not run mutually untrusted programs in one compiler
+process. Isolate such executions in separate operating-system processes or
+containers with dedicated permissions, environment, network policy, resource
+limits, and timeouts.
 
 Async/await, fibers, an ECS scheduler, and configurable atomic orderings remain
 outside Reimer v0.1.

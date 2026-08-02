@@ -11,6 +11,16 @@ use std::thread::JoinHandle;
 
 #[expect(
     unsafe_code,
+    reason = "bit conversion helpers expose stable symbols to generated native code"
+)]
+mod binary;
+#[expect(
+    unsafe_code,
+    reason = "checksum helpers validate bounded byte regions at the generated-code boundary"
+)]
+mod checksum;
+#[expect(
+    unsafe_code,
     reason = "hash collections use SIMD and validate raw control-byte groups at the ABI boundary"
 )]
 mod collections;
@@ -55,6 +65,12 @@ mod temporal;
 )]
 mod text;
 
+pub use binary::{
+    BINARY_F32_FROM_BITS_SYMBOL, BINARY_F32_TO_BITS_SYMBOL, BINARY_F64_FROM_BITS_SYMBOL,
+    BINARY_F64_TO_BITS_SYMBOL, binary_f32_from_bits, binary_f32_to_bits, binary_f64_from_bits,
+    binary_f64_to_bits,
+};
+pub use checksum::{CHECKSUM_CRC32_SYMBOL, checksum_crc32};
 pub use collections::{
     CONTROL_GROUP_MASKS_SYMBOL, HASH_BYTES_SYMBOL, HASH_SEED_SYMBOL, control_group_masks,
     hash_bytes, hash_seed,
@@ -92,11 +108,15 @@ pub use environment::{
 };
 pub use filesystem::{
     FILE_APPEND_SYMBOL, FILE_CLOSE_SYMBOL, FILE_CREATE_SYMBOL, FILE_FLUSH_SYMBOL, FILE_OPEN_SYMBOL,
-    FILE_READ_EXACT_SYMBOL, FILE_READ_SYMBOL, FILE_REMAINING_LEN_SYMBOL, FILE_UNEXPECTED_EOF,
-    FILE_WRITE_ALL_SYMBOL, FILE_WRITE_SYMBOL, PATH_EXISTS_SYMBOL, PATH_REMOVE_FILE_SYMBOL,
-    PATH_RENAME_SYMBOL, file_append, file_close, file_create, file_flush, file_open, file_read,
-    file_read_exact, file_remaining_len, file_write, file_write_all, path_exists, path_remove_file,
-    path_rename,
+    FILE_READ_EXACT_SYMBOL, FILE_READ_SYMBOL, FILE_REMAINING_LEN_SYMBOL, FILE_SYNC_ALL_SYMBOL,
+    FILE_UNEXPECTED_EOF, FILE_WRITE_ALL_SYMBOL, FILE_WRITE_SYMBOL, PATH_CANONICAL_OPEN_SYMBOL,
+    PATH_CREATE_DIR_ALL_SYMBOL, PATH_EXISTS_SYMBOL, PATH_FILE_SIZE_SYMBOL, PATH_IS_WITHIN_SYMBOL,
+    PATH_REMOVE_FILE_SYMBOL, PATH_RENAME_SYMBOL, PATH_REPLACE_FILE_SYMBOL,
+    PATH_SNAPSHOT_CLOSE_SYMBOL, PATH_SNAPSHOT_COPY_SYMBOL, PATH_SNAPSHOT_LEN_SYMBOL, file_append,
+    file_close, file_create, file_flush, file_open, file_read, file_read_exact, file_remaining_len,
+    file_sync_all, file_write, file_write_all, path_canonical_open, path_create_dir_all,
+    path_exists, path_file_size, path_is_within, path_remove_file, path_rename, path_replace_file,
+    path_snapshot_close, path_snapshot_copy, path_snapshot_len,
 };
 pub use job::{
     JOB_JOIN_INVALID_HANDLE, JOB_JOIN_OK, JOB_JOIN_RESULT_MISMATCH, JOB_JOIN_WORKER_PANICKED,
@@ -217,6 +237,8 @@ pub const UTF8_DECODE_NEXT_SYMBOL: &str = "utf8_decode_next";
 pub const THREAD_SPAWN_SYMBOL: &str = "thread_spawn";
 /// ABI symbol used to join one native worker thread.
 pub const THREAD_JOIN_SYMBOL: &str = "thread_join";
+/// ABI symbol used to query the operating system's available parallelism.
+pub const THREAD_AVAILABLE_PARALLELISM_SYMBOL: &str = "thread_available_parallelism";
 
 /// Thread join completed and copied the worker result.
 pub const THREAD_JOIN_OK: i32 = 0;
@@ -278,8 +300,11 @@ struct ThreadRecord {
     session: usize,
 }
 
-/// Identifies one live JIT execution so its native resources are isolated from
-/// other programs running in the same compiler process.
+/// Identifies one live JIT execution for argument scoping and cleanup of tagged
+/// native resources.
+///
+/// This session is lifecycle bookkeeping, not a security boundary. Runtime
+/// handles and the native host process remain shared between executions.
 pub struct ExecutionSession {
     id: usize,
     previous: usize,
@@ -422,6 +447,20 @@ pub unsafe extern "C" fn thread_spawn(
         },
     );
     handle
+}
+
+/// Returns the operating system's current estimate of available worker threads.
+///
+/// The result is always at least one, including on platforms where the query
+/// is unavailable.
+#[must_use]
+#[unsafe(no_mangle)]
+#[expect(
+    unsafe_code,
+    reason = "the runtime exports this fixed symbol through its private ABI"
+)]
+pub extern "C" fn thread_available_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
 /// Joins a native thread and copies its result into compiler-owned storage.
@@ -1263,8 +1302,9 @@ mod tests {
         Failure, GENERAL_ALLOCATOR, PAGE_ALLOCATOR, PAGE_GRANULARITY, THREAD_JOIN_OK,
         allocate_bytes, arena_allocator_deinit, arena_allocator_init, buffer_equals, copy_bytes,
         deallocate_bytes, failure_message, fixed_buffer_allocator_deinit,
-        fixed_buffer_allocator_init, read_line_into, read_to_end_into, target_os_code, thread_join,
-        thread_spawn, utf8_decode_next, utf8_is_valid, write_all_with_optional_newline,
+        fixed_buffer_allocator_init, read_line_into, read_to_end_into, target_os_code,
+        thread_available_parallelism, thread_join, thread_spawn, utf8_decode_next, utf8_is_valid,
+        write_all_with_optional_newline,
     };
 
     #[expect(
@@ -1342,6 +1382,11 @@ mod tests {
         let status = unsafe { thread_join(handle, (&raw mut result).cast(), size_of::<i32>()) };
 
         assert_eq!((status, result), (THREAD_JOIN_OK, 42));
+    }
+
+    #[test]
+    fn available_parallelism_should_never_be_zero() {
+        assert!(thread_available_parallelism() >= 1);
     }
 
     #[test]

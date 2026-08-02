@@ -1,0 +1,72 @@
+from std::io import eprintln, println;
+
+from sdl3 import Subsystems, Window;
+import sdl3::init as init;
+import sdl3::raw::constants as sdl;
+from wgpu import Instance;
+from wgpu_sdl3 import create_surface;
+
+fn run() -> bool {
+    let subsystems = match Subsystems::init(init::VIDEO | init::EVENTS) {
+        Ok(value) => value,
+        Err(_) => {
+            return false;
+        },
+    };
+    defer subsystems.deinit();
+
+    let window = match Window::create(
+        c"Reimer wgpu surface",
+        640,
+        360,
+        sdl::SDL_WINDOW_RESIZABLE | sdl::SDL_WINDOW_HIGH_PIXEL_DENSITY,
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            return false;
+        },
+    };
+    defer window.deinit();
+
+    let instance = match Instance::create() {
+        Ok(value) => value,
+        Err(_) => {
+            return false;
+        },
+    };
+
+    let window_surface = match create_surface(&window, instance) {
+        Ok(value) => value,
+        Err(_) => {
+            return false;
+        },
+    };
+    defer window_surface.deinit();
+
+    let adapter = match window_surface.request_adapter() {
+        Ok(value) => value,
+        Err(_) => {
+            return false;
+        },
+    };
+    defer adapter.deinit();
+
+    let device = match adapter.request_device() {
+        Ok(value) => value,
+        Err(_) => {
+            return false;
+        },
+    };
+    defer device.deinit();
+    true
+}
+
+fn main() -> i32 {
+    if run() {
+        println("SDL3 created a WebGPU-compatible native surface and device.");
+        0
+    } else {
+        eprintln("SDL3 WebGPU surface initialization failed.");
+        1
+    }
+}

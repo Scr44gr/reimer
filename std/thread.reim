@@ -59,6 +59,7 @@ pub struct ThreadLocal<T> {
 
 @link("runtime")
 extern "C" {
+    fn thread_available_parallelism() -> usize;
     fn mutex_clone(handle: usize) -> usize;
     fn mutex_destroy(handle: usize) -> i32;
     fn rwlock_clone(handle: usize) -> usize;
@@ -90,6 +91,19 @@ extern "C" {
     fn atomic_destroy(handle: usize) -> i32;
     fn thread_local_clone(handle: usize) -> usize;
     fn thread_local_destroy(handle: usize) -> i32;
+}
+
+/// Returns the operating system's current estimate of useful worker threads.
+///
+/// The result is always at least one. It may change when process CPU limits or
+/// system topology change, so long-lived schedulers should capture it once.
+pub fn available_parallelism() -> usize {
+    unsafe { thread_available_parallelism() }
+}
+
+@test
+fn available_parallelism_should_never_be_zero() {
+    assert(available_parallelism() >= 1);
 }
 
 impl<T: Send> Thread<T> {

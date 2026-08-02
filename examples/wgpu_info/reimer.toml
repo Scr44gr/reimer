@@ -1,0 +1,13 @@
+[package]
+name = "wgpu-info"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+wgpu = { path = "../../vendor/wgpu", version = "^29.0" }
+
+[profile.debug]
+optimization = 0
+
+[profile.release]
+optimization = 3

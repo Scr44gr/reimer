@@ -1,0 +1,22 @@
+format = 1
+
+[[package]]
+id = "60ec0204befc100c713e4c0a"
+name = "wgpu-info"
+version = "0.1.0"
+source = "path+."
+checksum = "68d6ee18581aee6fed23a8acced17e30a91cb2ba076888d5f57e10081abc7db9"
+
+[[package.dependencies]]
+alias = "wgpu"
+request = "path+../../vendor/wgpu"
+package = "ba665127e4683f3f1dee0e46"
+
+[[package]]
+id = "ba665127e4683f3f1dee0e46"
+name = "wgpu"
+version = "29.0.1"
+source = "path+../../vendor/wgpu"
+checksum = "0f9d8daf9c1f30d6ecdf8ebe290261f17370c009f70e78d4b3841d83b90ccb65"
+dependencies = []
+

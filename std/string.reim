@@ -1,4 +1,5 @@
 from std::alloc import AllocError, Allocator, OwnedBytes, allocate_bytes;
+import std::slice as slice;
 
 pub enum StringError {
     InvalidUtf8,
@@ -16,6 +17,13 @@ pub type FormatError = AllocError;
 pub struct String {
     bytes: OwnedBytes,
     len: usize,
+}
+
+/// Returns a pointer to the first UTF-8 byte in a string view.
+///
+/// The pointer remains valid only while `value` is borrowed.
+pub fn as_ptr(value: str) -> *const u8 {
+    __string_data(value)
 }
 
 @link("runtime")
@@ -77,6 +85,14 @@ extern "C" {
 }
 
 impl String {
+    /// Creates an empty string without allocating or failing.
+    pub fn empty(allocator: &Allocator) -> String {
+        String {
+            bytes: OwnedBytes::empty(allocator),
+            len: 0,
+        }
+    }
+
     /// Creates an empty string with room for at least `capacity` UTF-8 bytes.
     pub fn with_capacity(
         allocator: &Allocator,
@@ -382,6 +398,12 @@ impl String {
     pub fn deinit(self) {
         self.bytes.deinit();
     }
+
+    /// Releases owned UTF-8 storage in place. Repeated calls are no-ops.
+    pub fn release(&mut self) {
+        self.bytes.release();
+        self.len = 0;
+    }
 }
 
 /// Safe formatting destination passed to user-defined `Display` code.
@@ -562,6 +584,41 @@ pub fn join_strings(
 /// Returns the UTF-8 byte length of a borrowed string.
 pub fn byte_len(value: str) -> usize {
     __string_length(value)
+}
+
+/// Borrows a checked UTF-8 byte range when both bounds are scalar boundaries.
+pub fn byte_slice(value: str, start: usize, count: usize) -> Option<str> {
+    let selected = match slice::byte_range(value.bytes(), start, count) {
+        Some(result) => result,
+        None => { return None; },
+    };
+    match from_utf8(selected) {
+        Ok(result) => Some(result),
+        Err(_) => None,
+    }
+}
+
+/// Compares two UTF-8 string views by their encoded bytes.
+pub fn equals(left: str, right: str) -> bool {
+    unsafe {
+        buffer_equals(
+            __string_data(left),
+            __string_length(left),
+            __string_data(right),
+            __string_length(right),
+        )
+    }
+}
+
+/// Validates borrowed UTF-8 bytes and returns a zero-copy string view.
+pub fn from_utf8(bytes: &[u8]) -> Result<str, StringError> {
+    let length = slice::len(bytes);
+    let valid = unsafe { utf8_is_valid(slice::bytes_as_ptr(bytes), length) };
+    if valid {
+        Ok(__str_from_parts(slice::bytes_as_ptr(bytes), length))
+    } else {
+        Err(StringError::InvalidUtf8)
+    }
 }
 
 /// Counts Unicode scalar values rather than UTF-8 bytes.

@@ -1,0 +1,85 @@
+from std::slice import len;
+
+@link("runtime")
+extern "C" {
+    fn binary_f32_from_bits(bits: u32) -> f32;
+    fn binary_f32_to_bits(value: f32) -> u32;
+    fn binary_f64_from_bits(bits: u64) -> f64;
+    fn binary_f64_to_bits(value: f64) -> u64;
+}
+
+/// Reads a little-endian `u16`, returning `None` for an incomplete range.
+pub fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    let end = match offset.checked_add(2) {
+        Some(value) => value,
+        None => { return None; },
+    };
+    if end > len(bytes) {
+        return None;
+    }
+    let low = bytes[offset] as u16;
+    let high = bytes[offset + 1] as u16;
+    Some(low | (high << 8))
+}
+
+/// Reads a little-endian `u32`, returning `None` for an incomplete range.
+pub fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = match offset.checked_add(4) {
+        Some(value) => value,
+        None => { return None; },
+    };
+    if end > len(bytes) {
+        return None;
+    }
+    let first = bytes[offset] as u32;
+    let second = bytes[offset + 1] as u32;
+    let third = bytes[offset + 2] as u32;
+    let fourth = bytes[offset + 3] as u32;
+    Some(first | (second << 8) | (third << 16) | (fourth << 24))
+}
+
+/// Reads a little-endian `u64`, returning `None` for an incomplete range.
+pub fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    let high_offset = match offset.checked_add(4) {
+        Some(value) => value,
+        None => { return None; },
+    };
+    let low = match read_u32_le(bytes, offset) {
+        Some(value) => value as u64,
+        None => { return None; },
+    };
+    let high = match read_u32_le(bytes, high_offset) {
+        Some(value) => value as u64,
+        None => { return None; },
+    };
+    Some(low | (high << 32))
+}
+
+/// Reads an IEEE-754 little-endian `f32` without changing its bit pattern.
+pub fn read_f32_le(bytes: &[u8], offset: usize) -> Option<f32> {
+    let bits = match read_u32_le(bytes, offset) {
+        Some(value) => value,
+        None => { return None; },
+    };
+    Some(from_f32_bits(bits))
+}
+
+/// Reconstructs an `f32` from its IEEE-754 representation.
+pub fn from_f32_bits(bits: u32) -> f32 {
+    unsafe { binary_f32_from_bits(bits) }
+}
+
+/// Returns the IEEE-754 representation of an `f32`.
+pub fn to_f32_bits(value: f32) -> u32 {
+    unsafe { binary_f32_to_bits(value) }
+}
+
+/// Reconstructs an `f64` from its IEEE-754 representation.
+pub fn from_f64_bits(bits: u64) -> f64 {
+    unsafe { binary_f64_from_bits(bits) }
+}
+
+/// Returns the IEEE-754 representation of an `f64`.
+pub fn to_f64_bits(value: f64) -> u64 {
+    unsafe { binary_f64_to_bits(value) }
+}

@@ -4,19 +4,26 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use reimer_cli::{
     check_file, check_graph, compile_file_to_object, compile_file_to_object_with_options,
-    compile_graph_to_object, execute_file_test, execute_file_with_arguments, execute_graph,
-    execute_graph_test, execute_graph_with_arguments, file_test_names, graph_test_names,
+    compile_graph_to_object, execute_file_test, execute_file_tests_with_progress,
+    execute_file_with_arguments, execute_graph, execute_graph_test,
+    execute_graph_tests_with_progress, execute_graph_with_arguments, file_test_names,
+    graph_test_names,
 };
 use reimer_codegen_native::OptimizationLevel;
 use reimer_project::{BuildProfile, LockMode, Project};
 
 mod documentation;
+mod generated_output;
 mod native_linker;
 
 const MANIFEST_FILE: &str = "reimer.toml";
+const MAX_UNIT_TEST_WORKERS: usize = 4;
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -50,6 +57,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
             options,
             test_index,
         } => run_unit_test(&options, test_index),
+        Invocation::RunUnitTests(options) => run_unit_tests(&options),
         Invocation::Format { path, check } => format_sources(&path, check),
         Invocation::Clean { path } => clean(&path),
         Invocation::Add(options) => add_dependency(&options),
@@ -90,6 +98,7 @@ fn document(options: &ProjectOptions, output: Option<&Path>) -> Result<(), Strin
             .and_then(|name| name.to_str())
             .unwrap_or("Reimer package");
         let rendered = documentation::render(&package, source_root, title);
+        let generated = output.is_none();
         let output = output.map_or_else(
             || {
                 source_root
@@ -100,7 +109,7 @@ fn document(options: &ProjectOptions, output: Option<&Path>) -> Result<(), Strin
             },
             Path::to_path_buf,
         );
-        write_output(&output, rendered.as_bytes())?;
+        write_selected_output(source_root, &output, rendered.as_bytes(), generated)?;
         println!("documented {title}\noutput: {}", output.display());
         return Ok(());
     }
@@ -118,6 +127,7 @@ fn document(options: &ProjectOptions, output: Option<&Path>) -> Result<(), Strin
     resolved.map_err(|diagnostics| render_diagnostics(&package.map_diagnostics(diagnostics)))?;
     let title = format!("{} {}", project.package_name(), display_version(&project));
     let rendered = documentation::render(&package, &project.root_directory().join("src"), &title);
+    let generated = output.is_none();
     let output = output.map_or_else(
         || {
             project
@@ -129,7 +139,12 @@ fn document(options: &ProjectOptions, output: Option<&Path>) -> Result<(), Strin
         },
         Path::to_path_buf,
     );
-    write_output(&output, rendered.as_bytes())?;
+    write_selected_output(
+        project.root_directory(),
+        &output,
+        rendered.as_bytes(),
+        generated,
+    )?;
     println!(
         "documented {} {}\noutput: {}",
         project.package_name(),
@@ -143,11 +158,17 @@ fn emit_object(source: &Path, output: Option<&Path>) -> Result<(), String> {
     validate_source_path(source)?;
     let object =
         compile_file_to_object(source).map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+    let generated = output.is_none();
     let output = output.map_or_else(
         || source.with_extension(object_extension()),
         Path::to_path_buf,
     );
-    write_output(&output, &object)?;
+    write_selected_output(
+        source.parent().unwrap_or_else(|| Path::new(".")),
+        &output,
+        &object,
+        generated,
+    )?;
     println!("emitted {}", output.display());
     Ok(())
 }
@@ -161,20 +182,28 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
         )
         .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
         if is_library_source(&options.path) {
+            let generated = output.is_none();
             let output = output.map_or_else(
                 || default_source_object_output(&options.path),
                 Path::to_path_buf,
             );
-            write_output(&output, &object)?;
+            write_selected_output(Path::new("."), &output, &object, generated)?;
             println!("emitted library object {}", output.display());
             return Ok(());
         }
+        let generated = output.is_none();
         let output = output.map_or_else(
             || default_source_executable_output(&options.path),
             Path::to_path_buf,
         );
         let artifact_directory = source_artifact_directory(&options.path, options.profile);
-        let object_path = native_linker::link_executable(&object, &output, &artifact_directory)?;
+        let object_path = native_linker::link_executable(
+            &object,
+            &output,
+            &artifact_directory,
+            Path::new("."),
+            generated,
+        )?;
         println!(
             "built executable {}\nobject: {}",
             output.display(),
@@ -189,11 +218,12 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
     let object = compile_graph_to_object(&project.source_graph(&entry), optimization)
         .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
     if is_library_source(&entry) {
+        let generated = output.is_none();
         let output = output.map_or_else(
             || default_project_object_output(&project, options.profile),
             Path::to_path_buf,
         );
-        write_output(&output, &object)?;
+        write_selected_output(project.root_directory(), &output, &object, generated)?;
         println!(
             "built {} {} ({})\nobject: {}\nlockfile: {}",
             project.package_name(),
@@ -204,12 +234,19 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
         );
         return Ok(());
     }
+    let generated = output.is_none();
     let output = output.map_or_else(
         || default_project_executable_output(&project, options.profile),
         Path::to_path_buf,
     );
     let artifact_directory = project_artifact_directory(&project, options.profile);
-    let object_path = native_linker::link_executable(&object, &output, &artifact_directory)?;
+    let object_path = native_linker::link_executable(
+        &object,
+        &output,
+        &artifact_directory,
+        project.root_directory(),
+        generated,
+    )?;
     println!(
         "built {} {} ({})\nexecutable: {}\nobject: {}\nlockfile: {}",
         project.package_name(),
@@ -296,13 +333,42 @@ fn test(options: &ProjectOptions) -> Result<(), String> {
             }
         }
     }
-    for (test_index, name) in unit_tests.iter().enumerate() {
-        let status = spawn_unit_test(options, test_index)?;
-        if status.success() {
-            println!("pass {name}");
+    if !unit_tests.is_empty() {
+        println!(
+            "running {} unit test(s) in one compiled suite",
+            unit_tests.len()
+        );
+        let suite = spawn_unit_test_suite(options)?;
+        if suite.status.success() {
+            for name in &unit_tests {
+                println!("pass {name}");
+            }
         } else {
-            println!("fail {name} ({status})");
-            failures.push(format!("{name} terminated with {status}"));
+            std::io::stdout()
+                .write_all(&suite.stdout)
+                .map_err(|error| format!("failed to forward unit-test output: {error}"))?;
+            std::io::stderr()
+                .write_all(&suite.stderr)
+                .map_err(|error| format!("failed to forward unit-test diagnostics: {error}"))?;
+            let worker_count = unit_test_worker_count(unit_tests.len());
+            println!(
+                "suite terminated with {}; retrying with {worker_count} isolated worker(s)",
+                suite.status
+            );
+            for (test_index, result) in spawn_unit_tests(options, unit_tests.len(), worker_count) {
+                let name = &unit_tests[test_index];
+                match result {
+                    Ok(status) if status.success() => println!("pass {name}"),
+                    Ok(status) => {
+                        println!("fail {name} ({status})");
+                        failures.push(format!("{name} terminated with {status}"));
+                    }
+                    Err(error) => {
+                        println!("fail {name} ({error})");
+                        failures.push(format!("{name} could not run: {error}"));
+                    }
+                }
+            }
         }
     }
     let total = entries.len() + unit_tests.len();
@@ -311,7 +377,7 @@ fn test(options: &ProjectOptions) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{} integration test(s) failed:\n{}",
+            "{} test(s) failed:\n{}",
             failures.len(),
             failures.join("\n")
         ))
@@ -335,6 +401,74 @@ fn run_unit_test(options: &ProjectOptions, test_index: usize) -> Result<(), Stri
         .map_err(|diagnostics| render_diagnostics(&diagnostics))
 }
 
+fn run_unit_tests(options: &ProjectOptions) -> Result<(), String> {
+    if is_source_file(&options.path) {
+        validate_source_path(&options.path)?;
+        return execute_file_tests_with_progress(
+            &options.path,
+            profile_optimization(options.profile),
+            report_test_start,
+        )
+        .map_err(|diagnostics| render_diagnostics(&diagnostics));
+    }
+    let project = open_project(options)?;
+    let entry = project.entry().map_err(|error| error.to_string())?;
+    let optimization = selected_optimization(&project, options.profile)?;
+    execute_graph_tests_with_progress(
+        &project.source_graph(&entry),
+        optimization,
+        report_test_start,
+    )
+    .map_err(|diagnostics| render_diagnostics(&diagnostics))
+}
+
+fn report_test_start(test_index: usize, name: &str) {
+    eprintln!("test {test_index}: {name}");
+}
+
+fn unit_test_worker_count(test_count: usize) -> usize {
+    if test_count == 0 {
+        return 0;
+    }
+    thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_UNIT_TEST_WORKERS)
+        .min(test_count)
+}
+
+fn spawn_unit_tests(
+    options: &ProjectOptions,
+    test_count: usize,
+    worker_count: usize,
+) -> Vec<(usize, Result<std::process::ExitStatus, String>)> {
+    let next_test = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next_test = &next_test;
+            scope.spawn(move || {
+                loop {
+                    let test_index = next_test.fetch_add(1, Ordering::Relaxed);
+                    if test_index >= test_count {
+                        break;
+                    }
+                    if sender
+                        .send((test_index, spawn_unit_test(options, test_index)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+    });
+    let mut outcomes: Vec<_> = receiver.into_iter().collect();
+    outcomes.sort_unstable_by_key(|(test_index, _)| *test_index);
+    outcomes
+}
+
 fn spawn_unit_test(
     options: &ProjectOptions,
     test_index: usize,
@@ -342,25 +476,44 @@ fn spawn_unit_test(
     let executable =
         env::current_exe().map_err(|error| format!("failed to locate the test runner: {error}"))?;
     let mut command = Command::new(executable);
-    command
-        .arg("__run-unit-test")
-        .arg(test_index.to_string())
-        .arg(&options.path);
-    if options.profile == BuildProfile::Release {
-        command.arg("--release");
-    }
-    match options.lock_mode {
-        LockMode::Use => {}
-        LockMode::Locked => {
-            command.arg("--locked");
-        }
-        LockMode::Refresh => {
-            command.arg("--refresh");
-        }
-    }
+    command.arg("__run-unit-test").arg(test_index.to_string());
+    append_isolated_test_options(&mut command, options);
     command
         .status()
         .map_err(|error| format!("failed to start isolated unit test: {error}"))
+}
+
+fn spawn_unit_test_suite(options: &ProjectOptions) -> Result<std::process::Output, String> {
+    let executable =
+        env::current_exe().map_err(|error| format!("failed to locate the test runner: {error}"))?;
+    let mut command = Command::new(executable);
+    command.arg("__run-unit-tests");
+    append_isolated_test_options(&mut command, options);
+    command
+        .output()
+        .map_err(|error| format!("failed to start compiled unit-test suite: {error}"))
+}
+
+fn append_isolated_test_options(command: &mut Command, options: &ProjectOptions) {
+    command.arg(&options.path);
+    if options.profile == BuildProfile::Release {
+        command.arg("--release");
+    }
+    if is_source_file(&options.path) {
+        match options.lock_mode {
+            LockMode::Use => {}
+            LockMode::Locked => {
+                command.arg("--locked");
+            }
+            LockMode::Refresh => {
+                command.arg("--refresh");
+            }
+        }
+    } else {
+        // The parent resolved and, when needed, refreshed the project before
+        // spawning workers. Children only consume that immutable resolution.
+        command.arg("--locked");
+    }
 }
 
 fn profile_optimization(profile: BuildProfile) -> OptimizationLevel {
@@ -449,18 +602,28 @@ fn clean(path: &Path) -> Result<(), String> {
         )
     })?;
     let target = root.join("target").join("reimer");
-    if !target.starts_with(&root) {
-        return Err(format!(
-            "refusing to clean path outside project: `{}`",
-            target.display()
-        ));
-    }
     if target.exists() {
-        fs::remove_dir_all(&target)
-            .map_err(|error| format!("failed to remove `{}`: {error}", target.display()))?;
-        println!("removed {}", target.display());
+        let resolved_target = target
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve `{}`: {error}", target.display()))?;
+        validate_clean_target(&target, &resolved_target)?;
+        fs::remove_dir_all(&resolved_target).map_err(|error| {
+            format!("failed to remove `{}`: {error}", resolved_target.display())
+        })?;
+        println!("removed {}", resolved_target.display());
     } else {
         println!("nothing to clean");
+    }
+    Ok(())
+}
+
+fn validate_clean_target(requested: &Path, resolved: &Path) -> Result<(), String> {
+    if resolved != requested {
+        return Err(format!(
+            "refusing to clean linked or external path `{}` (resolved to `{}`)",
+            requested.display(),
+            resolved.display()
+        ));
     }
     Ok(())
 }
@@ -814,6 +977,19 @@ fn write_output(path: &Path, contents: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("failed to write `{}`: {error}", path.display()))
 }
 
+fn write_selected_output(
+    generated_root: &Path,
+    path: &Path,
+    contents: &[u8],
+    generated: bool,
+) -> Result<(), String> {
+    if generated {
+        generated_output::write(generated_root, path, contents)
+    } else {
+        write_output(path, contents)
+    }
+}
+
 fn default_source_object_output(source: &Path) -> PathBuf {
     let stem = source.file_stem().unwrap_or(source.as_os_str()).to_owned();
     PathBuf::from("target")
@@ -934,6 +1110,7 @@ enum Invocation {
         options: ProjectOptions,
         test_index: usize,
     },
+    RunUnitTests(ProjectOptions),
     Format {
         path: PathBuf,
         check: bool,
@@ -982,6 +1159,9 @@ impl Invocation {
                 Ok(Self::Document { options, output })
             }
             "__run-unit-test" => parse_unit_test(arguments),
+            "__run-unit-tests" => Ok(Self::RunUnitTests(
+                parse_project_options(arguments, false)?.0,
+            )),
             "fmt" => parse_format(arguments),
             "clean" => Ok(Self::Clean {
                 path: parse_optional_path(arguments, Path::new("."))?,
@@ -1367,6 +1547,7 @@ mod tests {
 
     use super::{
         AddSource, BuildProfile, Invocation, LockMode, dependency_section, insert_dependency,
+        validate_clean_target,
     };
 
     #[test]
@@ -1468,5 +1649,14 @@ mod tests {
         let bounds = dependency_section(source).expect("section should exist");
 
         assert_eq!(&source[bounds.0..bounds.1], "a = { path = \"a\" }\n\n");
+    }
+
+    #[test]
+    fn clean_target_should_match_the_requested_canonical_directory() {
+        let requested = Path::new("project/target/reimer");
+
+        assert!(validate_clean_target(requested, requested).is_ok());
+        assert!(validate_clean_target(requested, Path::new("project/src")).is_err());
+        assert!(validate_clean_target(requested, Path::new("outside/reimer")).is_err());
     }
 }

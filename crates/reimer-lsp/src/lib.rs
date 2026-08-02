@@ -448,48 +448,9 @@ impl Document {
             return;
         };
         let overlays = overlays_with_document(&path, &self.text, overlays);
-        let package = match Project::open(&path, LockMode::Use) {
-            Ok(project) => {
-                reimer_package::load_graph_with_overlays(&project.source_graph(&path), &overlays)
-            }
-            Err(ProjectError::ManifestNotFound { .. }) => {
-                reimer_package::load_with_overlays(&path, &overlays)
-            }
-            Err(error) => {
-                self.analysis
-                    .findings
-                    .retain(|finding| finding.severity != Severity::Error);
-                self.analysis.findings.push(Finding {
-                    code: "E4011".to_owned(),
-                    severity: Severity::Error,
-                    message: error.to_string(),
-                    span: reimer_diagnostics::Span::empty(0),
-                    help: Some("fix the nearest reimer.toml or regenerate reimer.lock".to_owned()),
-                    fixes: Vec::new(),
-                });
-                return;
-            }
+        let Some(package) = self.load_package_for_document(&path, &overlays) else {
+            return;
         };
-        let package = match package {
-            Ok(package) => package,
-            Err(diagnostics) => {
-                self.source_paths
-                    .extend(diagnostics.iter().map(|diagnostic| diagnostic.path.clone()));
-                self.analysis
-                    .findings
-                    .retain(|finding| finding.severity != Severity::Error);
-                self.analysis.findings.extend(
-                    diagnostics
-                        .into_iter()
-                        .filter(|diagnostic| diagnostic.path == path)
-                        .map(|diagnostic| compiler_finding(diagnostic.diagnostic)),
-                );
-                return;
-            }
-        };
-        self.package_loaded = true;
-        self.source_paths
-            .extend(package.source_paths().map(Path::to_path_buf));
         let resolved = if syntax_has_main(&self.analysis) {
             reimer_resolver::resolve(&package.program)
         } else {
@@ -542,6 +503,62 @@ impl Document {
                 }
             }
         }
+    }
+
+    fn load_package_for_document(
+        &mut self,
+        path: &Path,
+        overlays: &[(PathBuf, String)],
+    ) -> Option<reimer_package::Package> {
+        let result = if reimer_package::is_standard_library_source(path) {
+            reimer_package::load_standard_with_overlays(path, overlays)
+        } else {
+            match Project::open(path, LockMode::Use) {
+                Ok(project) => {
+                    reimer_package::load_graph_with_overlays(&project.source_graph(path), overlays)
+                }
+                Err(ProjectError::ManifestNotFound { .. }) => {
+                    reimer_package::load_with_overlays(path, overlays)
+                }
+                Err(error) => {
+                    self.analysis
+                        .findings
+                        .retain(|finding| finding.severity != Severity::Error);
+                    self.analysis.findings.push(Finding {
+                        code: "E4011".to_owned(),
+                        severity: Severity::Error,
+                        message: error.to_string(),
+                        span: reimer_diagnostics::Span::empty(0),
+                        help: Some(
+                            "fix the nearest reimer.toml or regenerate reimer.lock".to_owned(),
+                        ),
+                        fixes: Vec::new(),
+                    });
+                    return None;
+                }
+            }
+        };
+        let package = match result {
+            Ok(package) => package,
+            Err(diagnostics) => {
+                self.source_paths
+                    .extend(diagnostics.iter().map(|diagnostic| diagnostic.path.clone()));
+                self.analysis
+                    .findings
+                    .retain(|finding| finding.severity != Severity::Error);
+                self.analysis.findings.extend(
+                    diagnostics
+                        .into_iter()
+                        .filter(|diagnostic| diagnostic.path == path)
+                        .map(|diagnostic| compiler_finding(diagnostic.diagnostic)),
+                );
+                return None;
+            }
+        };
+        self.package_loaded = true;
+        self.source_paths
+            .extend(package.source_paths().map(Path::to_path_buf));
+        Some(package)
     }
 
     fn rename_target(&self, position: Position) -> Option<reimer_diagnostics::Span> {
@@ -1491,6 +1508,7 @@ fn language_completions() -> Vec<CompletionItem> {
         .collect::<Vec<_>>();
     for (label, insertion) in [
         ("@derive", "@derive(${1:Copy, Eq})"),
+        ("@derive(Pod)", "@repr(C)\n@derive(Pod)"),
         ("@repr", "@repr(${1:C})"),
         ("@align", "@align(${1:16})"),
         ("@inline", "@inline"),
@@ -1602,7 +1620,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Url};
+    use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Position, Url};
 
     use super::{Document, LineIndex, Workspace};
 
@@ -2342,6 +2360,83 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(errors.is_empty(), "unexpected diagnostics: {errors:#?}");
         }
+    }
+
+    #[test]
+    fn standard_slice_document_should_keep_its_trusted_module_identity() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("std")
+            .join("slice.reim");
+        let source = fs::read_to_string(&path).expect("standard slice module should be readable");
+        let document = Document::new(
+            Url::from_file_path(path).expect("standard slice URL should be created"),
+            source,
+        );
+        let diagnostics = document
+            .diagnostics()
+            .into_iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    Some(NumberOrString::String(ref code)) if code == "E3154" || code == "L2010"
+                )
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected standard-library diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn standard_library_documents_should_not_report_internal_access_or_ownership_leaks() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("std");
+        let mut paths = fs::read_dir(&root)
+            .expect("standard library directory should be readable")
+            .map(|entry| {
+                entry
+                    .expect("standard library entry should be readable")
+                    .path()
+            })
+            .filter(|path| {
+                path.extension().and_then(|extension| extension.to_str()) == Some("reim")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        let mut unexpected = Vec::new();
+        for path in paths {
+            let source = fs::read_to_string(&path).expect("standard module should be readable");
+            let document = Document::new(
+                Url::from_file_path(&path).expect("standard module URL should be created"),
+                source,
+            );
+            for diagnostic in document.diagnostics() {
+                let is_internal_access_error = matches!(
+                    diagnostic.code,
+                    Some(NumberOrString::String(ref code))
+                        if matches!(code.as_str(), "E3149" | "E3150" | "E3151" | "E3154")
+                );
+                let is_false_owner_warning = matches!(
+                    diagnostic.code,
+                    Some(NumberOrString::String(ref code)) if code == "L2010"
+                );
+                if is_internal_access_error || is_false_owner_warning {
+                    unexpected.push(format!("{}: {}", path.display(), diagnostic.message));
+                }
+            }
+        }
+
+        assert!(
+            unexpected.is_empty(),
+            "unexpected standard-library diagnostics: {unexpected:#?}"
+        );
     }
 
     #[test]

@@ -190,11 +190,17 @@ impl<'function> Estimator<'function> {
                     self.scan_expression(element, loop_depth);
                 }
             }
-            Expression::Array(array) => {
-                for element in &array.elements {
-                    self.scan_expression(element, loop_depth);
+            Expression::Array(array) => match &array.kind {
+                reimer_ast::ArrayExpressionKind::List(elements) => {
+                    for element in elements {
+                        self.scan_expression(element, loop_depth);
+                    }
                 }
-            }
+                reimer_ast::ArrayExpressionKind::Repeat { value, length } => {
+                    self.scan_expression(value, loop_depth);
+                    self.scan_expression(length, loop_depth);
+                }
+            },
             Expression::Struct(structure) => {
                 for field in &structure.fields {
                     self.scan_expression(&field.value, loop_depth);
