@@ -8174,15 +8174,18 @@ fn backend_error(message: impl Into<String>) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
-    use cranelift_object::object::{File, Object, ObjectSection, ObjectSymbol};
+    #[cfg(target_os = "windows")]
+    use cranelift_object::object::ObjectSection;
+    use cranelift_object::object::{File, Object, ObjectSymbol};
     use reimer_lexer::lex;
     use reimer_parser::parse;
     use reimer_resolver::resolve;
 
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    use super::execute_internal_with_symbols;
     use super::{
         OptimizationLevel, coff_library_filename, emit_object, emit_object_with_options, execute,
-        execute_internal_with_symbols, execute_test, execute_tests_with_options,
-        execute_with_options,
+        execute_test, execute_tests_with_options, execute_with_options,
     };
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
