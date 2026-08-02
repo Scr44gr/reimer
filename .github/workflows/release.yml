@@ -153,6 +153,7 @@ jobs:
           if ($LASTEXITCODE -ne 42) {
             throw "native smoke test returned $LASTEXITCODE instead of 42"
           }
+          $global:LASTEXITCODE = 0
 
       - name: Package release archive
         id: package
@@ -193,6 +194,7 @@ jobs:
           if ($LASTEXITCODE -ne 42) {
             throw "packaged native smoke test returned $LASTEXITCODE instead of 42"
           }
+          $global:LASTEXITCODE = 0
 
       - name: Install Node.js for VS Code package
         if: runner.os == 'Windows'

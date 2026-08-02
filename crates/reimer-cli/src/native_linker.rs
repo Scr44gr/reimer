@@ -10,6 +10,7 @@ use crate::generated_output;
 
 const RUNTIME_ARCHIVE: &[u8] = include_bytes!(env!("REIMER_RUNTIME_ARCHIVE"));
 const STARTUP_SOURCE: &str = include_str!("../native/startup.rs");
+#[cfg(windows)]
 const HOST_TARGET: &str = env!("REIMER_HOST_TARGET");
 
 /// Links one generated object and the bundled runtime into a native executable.
@@ -46,15 +47,20 @@ pub fn link_executable(
     };
 
     let (compiler, linker) = native_toolchain()?;
-    let output = Command::new(&compiler)
+    let mut command = Command::new(&compiler);
+    command
         .arg(&startup_path)
         .arg("--edition=2024")
         .arg("--extern")
         .arg(format!("reimer_runtime={}", runtime_path.display()))
         .arg("-C")
-        .arg(format!("link-arg={}", object_path.display()))
-        .arg("-C")
-        .arg(format!("linker={}", linker.display()))
+        .arg(format!("link-arg={}", object_path.display()));
+    if let Some(linker) = linker {
+        command
+            .arg("-C")
+            .arg(format!("linker={}", linker.display()));
+    }
+    let output = command
         .arg("-o")
         .arg(&executable)
         .output()
@@ -73,9 +79,22 @@ pub fn link_executable(
     Ok(object_path)
 }
 
-fn native_toolchain() -> Result<(OsString, PathBuf), String> {
+fn native_toolchain() -> Result<(OsString, Option<PathBuf>), String> {
     let compiler = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
-    let output = Command::new(&compiler)
+    let linker = native_linker(&compiler)?;
+    Ok((compiler, linker))
+}
+
+#[cfg(not(windows))]
+fn native_linker(_compiler: &OsString) -> Result<Option<PathBuf>, String> {
+    // The system driver supplies platform search paths and libraries that a
+    // direct rust-lld invocation cannot discover by itself.
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn native_linker(compiler: &OsString) -> Result<Option<PathBuf>, String> {
+    let output = Command::new(compiler)
         .args(["--print", "sysroot"])
         .output()
         .map_err(|error| {
@@ -105,7 +124,7 @@ fn native_toolchain() -> Result<(OsString, PathBuf), String> {
             linker.display()
         ));
     }
-    Ok((compiler, linker))
+    Ok(Some(linker))
 }
 
 const fn object_extension() -> &'static str {
