@@ -46,7 +46,13 @@ pub fn link_executable(
         executable.to_path_buf()
     };
 
-    let (compiler, linker) = native_toolchain()?;
+    let compiler = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    #[cfg(windows)]
+    let linker = Some(bundled_windows_linker(&compiler)?);
+    // Unix needs the system driver to supply platform search paths and
+    // libraries that a direct rust-lld invocation cannot discover by itself.
+    #[cfg(not(windows))]
+    let linker: Option<PathBuf> = None;
     let mut command = Command::new(&compiler);
     command
         .arg(&startup_path)
@@ -79,21 +85,8 @@ pub fn link_executable(
     Ok(object_path)
 }
 
-fn native_toolchain() -> Result<(OsString, Option<PathBuf>), String> {
-    let compiler = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
-    let linker = native_linker(&compiler)?;
-    Ok((compiler, linker))
-}
-
-#[cfg(not(windows))]
-fn native_linker(_compiler: &OsString) -> Result<Option<PathBuf>, String> {
-    // The system driver supplies platform search paths and libraries that a
-    // direct rust-lld invocation cannot discover by itself.
-    Ok(None)
-}
-
 #[cfg(windows)]
-fn native_linker(compiler: &OsString) -> Result<Option<PathBuf>, String> {
+fn bundled_windows_linker(compiler: &OsString) -> Result<PathBuf, String> {
     let output = Command::new(compiler)
         .args(["--print", "sysroot"])
         .output()
@@ -124,7 +117,7 @@ fn native_linker(compiler: &OsString) -> Result<Option<PathBuf>, String> {
             linker.display()
         ));
     }
-    Ok(Some(linker))
+    Ok(linker)
 }
 
 const fn object_extension() -> &'static str {
