@@ -256,11 +256,12 @@ fn build_should_accept_a_library_package_without_main() {
     assert_success(&invoke(&["check", &library]));
     assert_success(&invoke(&["build", &library, "--locked"]));
 
-    assert!(
-        fixture
-            .path("library/target/reimer/debug/utility.obj")
-            .is_file()
-    );
+    let object = if cfg!(windows) {
+        "library/target/reimer/debug/utility.obj"
+    } else {
+        "library/target/reimer/debug/utility.o"
+    };
+    assert!(fixture.path(object).is_file());
 }
 
 #[test]
