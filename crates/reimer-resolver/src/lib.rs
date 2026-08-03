@@ -4806,10 +4806,10 @@ struct FunctionAnalyzer<'context> {
     loops: Vec<LoopContext>,
     unsafe_depth: usize,
     parameter_count: u32,
-    borrow_states: HashMap<LocalId, BorrowState>,
+    borrow_states: HashMap<MovedField, BorrowState>,
     scoped_roots: HashMap<LocalId, LocalId>,
     scoped_expression_roots: HashMap<Span, LocalId>,
-    borrow_scopes: Vec<Vec<(LocalId, bool)>>,
+    borrow_scopes: Vec<Vec<(MovedField, bool)>>,
     persistent_borrow: bool,
     defer_depth: usize,
     moved_locals: HashMap<LocalId, Span>,
@@ -6054,6 +6054,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 .with_help("access it through a public method or function"),
             );
         }
+        self.check_field_borrow(field, ty);
         if self.field_base_depth == 0
             && let Some(place) = self.moved_field_from_field(field)
         {
@@ -6074,6 +6075,39 @@ impl<'context> FunctionAnalyzer<'context> {
             },
             ty,
             span: field.span,
+        }
+    }
+
+    fn check_field_borrow(&mut self, field: &ast::FieldExpression, ty: Type) {
+        if self.field_base_depth != 0 {
+            return;
+        }
+        let Some(place) = self.moved_field_from_field(field) else {
+            return;
+        };
+        let borrow_state = self.borrow_state_for(&place);
+        if borrow_state.mutable {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3138",
+                    "cannot read a field while it is mutably borrowed",
+                    field.span,
+                )
+                .with_help("read through the mutable reference instead"),
+            );
+        }
+        if self.consuming_value
+            && !self.types.is_copy(ty)
+            && (borrow_state.mutable || borrow_state.shared != 0)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3138",
+                    "cannot move a field while it is borrowed",
+                    field.span,
+                )
+                .with_help("let the field reference scope end before moving the value"),
+            );
         }
     }
 
@@ -6321,11 +6355,15 @@ impl<'context> FunctionAnalyzer<'context> {
 
     fn analyze_local_path(&mut self, binding: Binding, span: Span) -> Expression {
         self.require_local_available(binding, span, self.field_base_depth == 0);
-        let borrow_state = self
-            .borrow_states
-            .get(&binding.local)
-            .copied()
-            .unwrap_or_default();
+        let place = MovedField {
+            local: binding.local,
+            projections: Vec::new(),
+        };
+        let borrow_state = if self.field_base_depth == 0 {
+            self.borrow_state_for(&place)
+        } else {
+            BorrowState::default()
+        };
         if borrow_state.mutable {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -6512,6 +6550,34 @@ impl<'context> FunctionAnalyzer<'context> {
             }
             _ => None,
         }
+    }
+
+    fn borrowed_place(&self, expression: &AstExpression) -> Option<MovedField> {
+        if let Some((local, projections)) = self.field_place(expression) {
+            return Some(MovedField { local, projections });
+        }
+        let path = assignment_root_path(expression)?;
+        let binding = single_path_name(path).and_then(|name| self.lookup(name))?;
+        Some(MovedField {
+            local: binding.local,
+            projections: Vec::new(),
+        })
+    }
+
+    fn borrow_state_for(&self, requested: &MovedField) -> BorrowState {
+        let mut combined = BorrowState::default();
+        for (borrowed, state) in &self.borrow_states {
+            if borrowed.local != requested.local {
+                continue;
+            }
+            let overlaps = borrowed.projections.starts_with(&requested.projections)
+                || requested.projections.starts_with(&borrowed.projections);
+            if overlaps {
+                combined.shared = combined.shared.saturating_add(state.shared);
+                combined.mutable |= state.mutable;
+            }
+        }
+        combined
     }
 
     fn consume_field(&mut self, place: MovedField, ty: Type, span: Span) {
@@ -6701,17 +6767,10 @@ impl<'context> FunctionAnalyzer<'context> {
     }
 
     fn check_and_record_borrow(&mut self, operand: &AstExpression, mutable: bool, span: Span) {
-        let Some(path) = assignment_root_path(operand) else {
+        let Some(place) = self.borrowed_place(operand) else {
             return;
         };
-        let Some(binding) = single_path_name(path).and_then(|name| self.lookup(name)) else {
-            return;
-        };
-        let state = self
-            .borrow_states
-            .get(&binding.local)
-            .copied()
-            .unwrap_or_default();
+        let state = self.borrow_state_for(&place);
         let conflicts = if mutable {
             state.mutable || state.shared != 0
         } else {
@@ -6731,14 +6790,14 @@ impl<'context> FunctionAnalyzer<'context> {
         if !self.persistent_borrow {
             return;
         }
-        let state = self.borrow_states.entry(binding.local).or_default();
+        let state = self.borrow_states.entry(place.clone()).or_default();
         if mutable {
             state.mutable = true;
         } else {
             state.shared = state.shared.saturating_add(1);
         }
         if let Some(scope) = self.borrow_scopes.last_mut() {
-            scope.push((binding.local, mutable));
+            scope.push((place, mutable));
         }
     }
 
@@ -11657,11 +11716,12 @@ impl<'context> FunctionAnalyzer<'context> {
         let Some(binding) = self.lookup(name) else {
             return;
         };
-        if self
-            .borrow_states
-            .get(&binding.local)
-            .is_some_and(|state| state.mutable || state.shared != 0)
-        {
+        let requested = self.borrowed_place(expression).unwrap_or(MovedField {
+            local: binding.local,
+            projections: Vec::new(),
+        });
+        let borrow_state = self.borrow_state_for(&requested);
+        if borrow_state.mutable || borrow_state.shared != 0 {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E3138",
@@ -11851,8 +11911,8 @@ impl<'context> FunctionAnalyzer<'context> {
             }
         }
         if let Some(borrows) = self.borrow_scopes.pop() {
-            for (local, mutable) in borrows {
-                let Some(state) = self.borrow_states.get_mut(&local) else {
+            for (place, mutable) in borrows {
+                let Some(state) = self.borrow_states.get_mut(&place) else {
                     continue;
                 };
                 if mutable {
@@ -11861,7 +11921,7 @@ impl<'context> FunctionAnalyzer<'context> {
                     state.shared = state.shared.saturating_sub(1);
                 }
                 if state.shared == 0 && !state.mutable {
-                    self.borrow_states.remove(&local);
+                    self.borrow_states.remove(&place);
                 }
             }
         }
@@ -14522,6 +14582,44 @@ mod tests {
         }";
 
         let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3138")
+        );
+    }
+
+    #[test]
+    fn resolve_should_allow_disjoint_mutable_field_borrows() {
+        let source = "
+            struct Pair { left: i32, right: i32 }
+            fn main() -> i32 {
+                let mut pair = Pair { left: 19, right: 23 };
+                let left = &mut pair.left;
+                let right = &mut pair.right;
+                *left += 1;
+                *right += 1;
+                *left + *right
+            }";
+
+        let program = resolve_fixture(source).expect("disjoint fields should resolve");
+
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn resolve_should_reject_overlapping_parent_and_field_borrows() {
+        let source = "
+            struct Pair { left: i32, right: i32 }
+            fn main() -> i32 {
+                let mut pair = Pair { left: 19, right: 23 };
+                let left = &mut pair.left;
+                let whole = &pair;
+                *left + whole.right
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("parent borrow should conflict");
 
         assert!(
             diagnostics
