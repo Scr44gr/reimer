@@ -7115,6 +7115,9 @@ impl<'context> FunctionAnalyzer<'context> {
         if method.name == "assert_unique_types" {
             return self.analyze_tuple_unique_types(call, field);
         }
+        if method.name == "take_type" {
+            return self.analyze_tuple_type_take(call, field, method, expected_return);
+        }
         let (mutable_first, returns_tuple) = match method.name.as_str() {
             "get_type" => (false, false),
             "get_type_mut" => (true, false),
@@ -7184,6 +7187,50 @@ impl<'context> FunctionAnalyzer<'context> {
             ty: result_type,
             span: call.span,
         })
+    }
+
+    fn analyze_tuple_type_take(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        let receiver_type = self.place_expression_type(&field.base)?;
+        let tuple_elements = self.tuple_elements(receiver_type)?;
+        if !call.arguments.is_empty() {
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6022",
+                    "`take_type` accepts only a compile-time type argument",
+                    call.span,
+                )
+                .with_help("write `tuple.take_type<Type>()`"),
+            );
+            return Some(invalid_composite_expression(call.span));
+        }
+        let Some(requested) = self.resolve_tuple_type_requests(call, method, false) else {
+            return Some(invalid_composite_expression(call.span));
+        };
+        let Some(selected) = self.select_tuple_type_fields(&tuple_elements, &requested, call.span)
+        else {
+            return Some(invalid_composite_expression(call.span));
+        };
+        let field_index = u32::try_from(selected[0]).ok()?;
+        let element = AstExpression::Field(Box::new(ast::FieldExpression {
+            base: field.base.clone(),
+            field: ast::FieldName::TupleIndex {
+                index: field_index,
+                span: call.span,
+            },
+            span: call.span,
+        }));
+        let mut result = self.analyze_expression_expected(&element, expected_return);
+        result.span = call.span;
+        Some(result)
     }
 
     fn analyze_tuple_unique_types(
@@ -15047,6 +15094,43 @@ mod tests {
             }";
 
         resolve_fixture(source).expect("disjoint fields should move independently");
+    }
+
+    #[test]
+    fn resolve_should_take_independent_tuple_fields_by_type() {
+        let source = "struct First { value: i32 }
+            struct Second { value: i32 }
+            fn main() -> i32 {
+                let values: (First, bool, Second) = (
+                    First { value: 20 },
+                    true,
+                    Second { value: 22 },
+                );
+                let first = values.take_type<First>();
+                let second = values.take_type<Second>();
+                first.value + second.value
+            }";
+
+        resolve_fixture(source).expect("disjoint tuple fields should move independently");
+    }
+
+    #[test]
+    fn resolve_should_reject_taking_the_same_tuple_field_twice() {
+        let source = "struct Resource { value: i32 }
+            fn main() -> i32 {
+                let values: (Resource, bool) = (Resource { value: 42 }, true);
+                let resource = values.take_type<Resource>();
+                let duplicate = values.take_type<Resource>();
+                resource.value + duplicate.value
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("a taken field should be unavailable");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3143")
+        );
     }
 
     #[test]

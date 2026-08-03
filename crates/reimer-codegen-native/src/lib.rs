@@ -8799,6 +8799,28 @@ mod tests {
     }
 
     #[test]
+    fn execute_should_take_heterogeneous_tuple_fields_by_type() {
+        let program = compile_fixture(
+            "struct First { value: i32 }
+             struct Second { value: i32 }
+             fn main() -> i32 {
+                 let values: (First, bool, Second) = (
+                     First { value: 20 },
+                     true,
+                     Second { value: 22 },
+                 );
+                 let first = values.take_type<First>();
+                 let second = values.take_type<Second>();
+                 first.value + second.value
+             }",
+        );
+
+        let result = execute(&program).expect("tuple take fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
     fn execute_should_lower_all_enum_constructor_forms() {
         let program = compile_fixture(
             "enum Value {
