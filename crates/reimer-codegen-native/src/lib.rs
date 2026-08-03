@@ -8758,6 +8758,28 @@ mod tests {
     }
 
     #[test]
+    fn execute_should_chain_type_changing_generic_methods() {
+        let program = compile_fixture(
+            "struct Pipeline<T> { value: T }
+             impl<T> Pipeline<T> {
+                 fn map<U>(self, mapper: fn(T) -> U) -> Pipeline<U> {
+                     Pipeline { value: mapper(self.value) }
+                 }
+             }
+             fn pipeline() -> Pipeline<i32> { Pipeline { value: 40 } }
+             fn add_one(value: i32) -> i32 { value + 1 }
+             fn main() -> i32 {
+                 let result = pipeline().map(add_one).map(add_one);
+                 result.value
+             }",
+        );
+
+        let result = execute(&program).expect("generic method chain should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
     fn execute_should_split_heterogeneous_tuples_by_type() {
         let program = compile_fixture(
             "fn main() -> i32 {

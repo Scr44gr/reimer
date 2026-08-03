@@ -4769,6 +4769,25 @@ struct DeferredUse {
     consuming: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FieldProjection {
+    Named(String),
+    Tuple(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MovedField {
+    local: LocalId,
+    projections: Vec<FieldProjection>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum PlaceAvailability {
+    #[default]
+    InitializedOnly,
+    AllowReinitialization,
+}
+
 struct ValueSymbols<'context> {
     functions: &'context mut HashMap<String, Signature>,
     statics: &'context HashMap<String, StaticSymbol>,
@@ -4794,10 +4813,13 @@ struct FunctionAnalyzer<'context> {
     persistent_borrow: bool,
     defer_depth: usize,
     moved_locals: HashMap<LocalId, Span>,
+    moved_fields: HashMap<MovedField, Span>,
     deferred_uses: HashMap<LocalId, DeferredUse>,
     deferred_use_scopes: Vec<Vec<LocalId>>,
     consuming_value: bool,
     reborrow_argument: bool,
+    field_base_depth: usize,
+    place_availability: PlaceAvailability,
     module_identity: Option<String>,
 }
 
@@ -4832,10 +4854,13 @@ impl<'context> FunctionAnalyzer<'context> {
             persistent_borrow: false,
             defer_depth: 0,
             moved_locals: HashMap::new(),
+            moved_fields: HashMap::new(),
             deferred_uses: HashMap::new(),
             deferred_use_scopes: vec![Vec::new()],
             consuming_value: true,
             reborrow_argument: false,
+            field_base_depth: 0,
+            place_availability: PlaceAvailability::default(),
             module_identity,
         }
     }
@@ -5973,7 +5998,9 @@ impl<'context> FunctionAnalyzer<'context> {
     }
 
     fn analyze_field(&mut self, field: &ast::FieldExpression) -> Expression {
+        self.field_base_depth += 1;
         let base = self.analyze_expression_non_consuming(&field.base);
+        self.field_base_depth = self.field_base_depth.saturating_sub(1);
         let (base, aggregate_type) =
             if let Some((target, _, false)) = self.types.pointer_shape(base.ty) {
                 (
@@ -6027,8 +6054,18 @@ impl<'context> FunctionAnalyzer<'context> {
                 .with_help("access it through a public method or function"),
             );
         }
-        if self.consuming_value {
-            self.consume_expression_root(&field.base, ty, field.span);
+        if self.field_base_depth == 0
+            && let Some(place) = self.moved_field_from_field(field)
+        {
+            if self.consuming_value {
+                self.consume_field(place, ty, field.span);
+            } else {
+                self.require_field_available(
+                    &place,
+                    field.span,
+                    self.place_availability == PlaceAvailability::AllowReinitialization,
+                );
+            }
         }
         Expression {
             kind: ExpressionKind::Field {
@@ -6283,7 +6320,7 @@ impl<'context> FunctionAnalyzer<'context> {
     }
 
     fn analyze_local_path(&mut self, binding: Binding, span: Span) -> Expression {
-        self.require_local_available(binding, span);
+        self.require_local_available(binding, span, self.field_base_depth == 0);
         let borrow_state = self
             .borrow_states
             .get(&binding.local)
@@ -6347,8 +6384,22 @@ impl<'context> FunctionAnalyzer<'context> {
         Some(constant)
     }
 
-    fn require_local_available(&mut self, binding: Binding, span: Span) {
-        let Some(moved_at) = self.moved_locals.get(&binding.local).copied() else {
+    fn require_local_available(
+        &mut self,
+        binding: Binding,
+        span: Span,
+        include_partial_moves: bool,
+    ) {
+        let moved_at = self.moved_locals.get(&binding.local).copied().or_else(|| {
+            if !include_partial_moves {
+                return None;
+            }
+            self.moved_fields
+                .iter()
+                .find(|(field, _)| field.local == binding.local)
+                .map(|(_, moved_at)| *moved_at)
+        });
+        let Some(moved_at) = moved_at else {
             return;
         };
         self.diagnostics.push(
@@ -6428,12 +6479,91 @@ impl<'context> FunctionAnalyzer<'context> {
         let Some(binding) = self.lookup(name) else {
             return;
         };
-        self.require_local_available(binding, span);
+        self.require_local_available(binding, span, true);
         if self.defer_depth > 0 {
             self.record_deferred_use(binding.local, span, true);
         } else if self.require_not_reserved_by_defer(binding.local, span) {
             self.moved_locals.insert(binding.local, span);
         }
+    }
+
+    fn moved_field_from_field(&self, field: &ast::FieldExpression) -> Option<MovedField> {
+        let (local, mut projections) = self.field_place(&field.base)?;
+        projections.push(match &field.field {
+            ast::FieldName::Named(name) => FieldProjection::Named(name.name.clone()),
+            ast::FieldName::TupleIndex { index, .. } => FieldProjection::Tuple(*index),
+        });
+        Some(MovedField { local, projections })
+    }
+
+    fn field_place(&self, expression: &AstExpression) -> Option<(LocalId, Vec<FieldProjection>)> {
+        match expression {
+            AstExpression::Path(path) => {
+                let binding = single_path_name(path).and_then(|name| self.lookup(name))?;
+                Some((binding.local, Vec::new()))
+            }
+            AstExpression::Field(field) => {
+                let (local, mut projections) = self.field_place(&field.base)?;
+                projections.push(match &field.field {
+                    ast::FieldName::Named(name) => FieldProjection::Named(name.name.clone()),
+                    ast::FieldName::TupleIndex { index, .. } => FieldProjection::Tuple(*index),
+                });
+                Some((local, projections))
+            }
+            _ => None,
+        }
+    }
+
+    fn consume_field(&mut self, place: MovedField, ty: Type, span: Span) {
+        self.require_field_available(&place, span, false);
+        if self.types.is_copy(ty) {
+            return;
+        }
+        if self.defer_depth > 0 {
+            self.record_deferred_use(place.local, span, true);
+        } else if self.require_not_reserved_by_defer(place.local, span) {
+            self.moved_fields.insert(place, span);
+        }
+    }
+
+    fn require_field_available(
+        &mut self,
+        place: &MovedField,
+        span: Span,
+        allow_reinitialization: bool,
+    ) {
+        let moved_at = self.moved_locals.get(&place.local).copied().or_else(|| {
+            self.moved_fields.iter().find_map(|(moved, moved_at)| {
+                if moved.local != place.local {
+                    return None;
+                }
+                let moved_is_parent = place.projections.starts_with(&moved.projections);
+                let requested_is_parent = moved.projections.starts_with(&place.projections);
+                let unavailable = if allow_reinitialization {
+                    moved_is_parent && moved.projections != place.projections
+                } else {
+                    moved_is_parent || requested_is_parent
+                };
+                unavailable.then_some(*moved_at)
+            })
+        });
+        let Some(moved_at) = moved_at else {
+            return;
+        };
+        self.diagnostics.push(
+            Diagnostic::error("E3143", "use of a value after it was moved", span).with_help(
+                format!(
+                    "the earlier consuming use starts at source byte {}; borrow the value or create a new owned value",
+                    moved_at.start
+                ),
+            ),
+        );
+    }
+
+    fn restore_field(&mut self, place: &MovedField) {
+        self.moved_fields.retain(|moved, _| {
+            moved.local != place.local || !moved.projections.starts_with(&place.projections)
+        });
     }
 
     fn require_expression_root_available(&mut self, expression: &AstExpression, span: Span) {
@@ -6443,7 +6573,7 @@ impl<'context> FunctionAnalyzer<'context> {
         let Some(binding) = single_path_name(path).and_then(|name| self.lookup(name)) else {
             return;
         };
-        self.require_local_available(binding, span);
+        self.require_local_available(binding, span, true);
     }
 
     fn analyze_unary(
@@ -10505,16 +10635,22 @@ impl<'context> FunctionAnalyzer<'context> {
             "if condition",
         );
         let moves_before_branches = self.moved_locals.clone();
+        let field_moves_before_branches = self.moved_fields.clone();
         let then_branch = self.analyze_block(&expression.then_branch, expected);
         let then_moves = self.moved_locals.clone();
+        let then_field_moves = self.moved_fields.clone();
         self.moved_locals.clone_from(&moves_before_branches);
+        self.moved_fields.clone_from(&field_moves_before_branches);
         let else_branch = expression
             .else_branch
             .as_ref()
             .map(|branch| Box::new(self.analyze_expression_expected(branch, expected)));
         let else_moves = self.moved_locals.clone();
+        let else_field_moves = self.moved_fields.clone();
         self.moved_locals = then_moves;
         self.moved_locals.extend(else_moves);
+        self.moved_fields = then_field_moves;
+        self.moved_fields.extend(else_field_moves);
         let ty = if let Some(else_branch) = &else_branch {
             self.unify_branch_types(then_branch.ty, else_branch.ty, expression.span)
         } else {
@@ -10546,11 +10682,14 @@ impl<'context> FunctionAnalyzer<'context> {
         let scrutinee_root = self.scoped_source_local(&expression.scrutinee);
         let scrutinee = self.analyze_expression(&expression.scrutinee);
         let moves_before_arms = self.moved_locals.clone();
+        let field_moves_before_arms = self.moved_fields.clone();
         let mut moves_after_arms = moves_before_arms.clone();
+        let mut field_moves_after_arms = field_moves_before_arms.clone();
         let mut arms = Vec::with_capacity(expression.arms.len());
         let mut result_type = None;
         for arm in &expression.arms {
             self.moved_locals.clone_from(&moves_before_arms);
+            self.moved_fields.clone_from(&field_moves_before_arms);
             self.push_scope();
             let pattern = self.analyze_pattern(&arm.pattern, scrutinee.ty);
             if let Some(root) = scrutinee_root {
@@ -10567,6 +10706,7 @@ impl<'context> FunctionAnalyzer<'context> {
             }));
             self.pop_scope();
             moves_after_arms.extend(self.moved_locals.clone());
+            field_moves_after_arms.extend(self.moved_fields.clone());
             arms.push(hir::MatchArm {
                 pattern,
                 guard,
@@ -10575,6 +10715,7 @@ impl<'context> FunctionAnalyzer<'context> {
             });
         }
         self.moved_locals = moves_after_arms;
+        self.moved_fields = field_moves_after_arms;
         self.validate_match_coverage(scrutinee.ty, &arms, expression.span);
         let ty = result_type.unwrap_or(Type::Never);
         Expression {
@@ -11049,7 +11190,15 @@ impl<'context> FunctionAnalyzer<'context> {
             }
             return self.analyze_index_method_call(index, "set_index", Some(&assignment.value));
         }
-        let Some(target) = self.analyze_place(&assignment.target) else {
+        let previous_place_availability = self.place_availability;
+        self.place_availability = if assignment.operator == AstAssignmentOperator::Assign {
+            PlaceAvailability::AllowReinitialization
+        } else {
+            PlaceAvailability::InitializedOnly
+        };
+        let target = self.analyze_place(&assignment.target);
+        self.place_availability = previous_place_availability;
+        let Some(target) = target else {
             self.analyze_expression(&assignment.value);
             return invalid_composite_expression(assignment.span);
         };
@@ -11073,6 +11222,7 @@ impl<'context> FunctionAnalyzer<'context> {
             if operator == AssignmentOperator::Assign {
                 if available_to_update {
                     self.moved_locals.remove(local);
+                    self.moved_fields.retain(|field, _| field.local != *local);
                 }
             } else {
                 self.require_local_available(
@@ -11082,7 +11232,15 @@ impl<'context> FunctionAnalyzer<'context> {
                         mutable: true,
                     },
                     target.span,
+                    true,
                 );
+            }
+        } else if operator == AssignmentOperator::Assign
+            && let Some((local, projections)) = self.field_place(&assignment.target)
+        {
+            let place = MovedField { local, projections };
+            if self.require_not_reserved_by_defer(local, target.span) {
+                self.restore_field(&place);
             }
         }
         self.require_type(target.ty, value.ty, value.span, "assignment value");
@@ -11234,7 +11392,7 @@ impl<'context> FunctionAnalyzer<'context> {
         }
     }
 
-    fn temporary_method_receiver_type(&self, expression: &AstExpression) -> Option<Type> {
+    fn temporary_method_receiver_type(&mut self, expression: &AstExpression) -> Option<Type> {
         let AstExpression::Call(call) = expression else {
             return None;
         };
@@ -11250,9 +11408,130 @@ impl<'context> FunctionAnalyzer<'context> {
                 let ast::FieldName::Named(method) = &field.field else {
                     return None;
                 };
+                let resolved_name = format!("{owner}::{}", method.name);
                 self.signatures
-                    .get(&format!("{owner}::{}", method.name))
+                    .get(&resolved_name)
                     .map(|signature| signature.return_type)
+                    .or_else(|| {
+                        self.temporary_generic_method_return_type(
+                            call,
+                            method,
+                            receiver,
+                            &resolved_name,
+                        )
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn temporary_generic_method_return_type(
+        &mut self,
+        call: &ast::CallExpression,
+        method: &ast::Identifier,
+        receiver_type: Type,
+        resolved_name: &str,
+    ) -> Option<Type> {
+        let nominal_receiver = self
+            .types
+            .pointer_shape(receiver_type)
+            .filter(|(_, _, raw)| !raw)
+            .map_or(receiver_type, |(target, _, _)| target);
+        let template_name = self.types.generic_instance(nominal_receiver).map_or_else(
+            || resolved_name.to_owned(),
+            |instance| format!("{}::{}", instance.base_name, method.name),
+        );
+        let template = self
+            .generic_functions
+            .templates
+            .get(&template_name)
+            .cloned()?;
+        let diagnostic_count = self.diagnostics.len();
+        let result = self.infer_temporary_generic_method_signature(call, receiver_type, &template);
+        if result.is_none() {
+            self.diagnostics.truncate(diagnostic_count);
+        }
+        result.map(|signature| signature.return_type)
+    }
+
+    fn infer_temporary_generic_method_signature(
+        &mut self,
+        call: &ast::CallExpression,
+        receiver_type: Type,
+        template: &GenericFunctionTemplate,
+    ) -> Option<Signature> {
+        let receiver_parameter = template.function.parameters.first()?;
+        let receiver_argument_type = match &receiver_parameter.ty.kind {
+            TypeNameKind::Reference { mutable, .. } => match self
+                .types
+                .pointer_shape(receiver_type)
+                .filter(|(_, _, raw)| !raw)
+            {
+                Some((_, actual_mutable, _)) if actual_mutable == *mutable => receiver_type,
+                Some((target, true, _)) if !*mutable => {
+                    self.types
+                        .intern_reference(target, false, call.span, self.diagnostics)?
+                }
+                Some(_) => receiver_type,
+                None => self.types.intern_reference(
+                    receiver_type,
+                    *mutable,
+                    call.span,
+                    self.diagnostics,
+                )?,
+            },
+            _ => receiver_type,
+        };
+        let mut argument_types = Vec::with_capacity(call.arguments.len() + 1);
+        argument_types.push(receiver_argument_type);
+        for argument in &call.arguments {
+            argument_types.push(self.temporary_expression_type(argument)?);
+        }
+        if argument_types.len() != template.function.parameters.len() {
+            return None;
+        }
+
+        let mut environment = self.types.base_environment();
+        let explicit_parameters = template
+            .parameters
+            .get(template.explicit_parameter_start..)
+            .unwrap_or_default();
+        self.bind_explicit_generic_arguments(call, explicit_parameters, &mut environment);
+        for (parameter, actual) in template.function.parameters.iter().zip(argument_types) {
+            if !self.types.infer_type_pattern(
+                &parameter.ty,
+                actual,
+                &template.parameters,
+                &mut environment,
+            ) {
+                return None;
+            }
+        }
+        let values = self.complete_generic_environment(
+            &template.parameters,
+            &template.where_predicates,
+            &mut environment,
+            call.span,
+        )?;
+        self.instantiate_generic_function(template, values, &environment, call.span)
+    }
+
+    fn temporary_expression_type(&mut self, expression: &AstExpression) -> Option<Type> {
+        if let Some(ty) = self.place_expression_type(expression) {
+            return Some(ty);
+        }
+        match expression {
+            AstExpression::Call(_) => self.temporary_method_receiver_type(expression),
+            AstExpression::Path(path) => {
+                let signature = function_path_name(path)
+                    .and_then(|name| self.signatures.get(&name))
+                    .cloned()?;
+                self.types.intern_function(
+                    signature.parameter_types,
+                    signature.return_type,
+                    path.span,
+                    self.diagnostics,
+                )
             }
             _ => None,
         }
@@ -14751,6 +15030,64 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "E3143")
         );
+    }
+
+    #[test]
+    fn resolve_should_track_moves_of_independent_struct_fields() {
+        let source = "struct Resource { id: i32 }
+            struct Pair { first: Resource, second: Resource }
+            fn consume(resource: Resource) -> i32 { resource.id }
+            fn main() -> i32 {
+                let pair = Pair {
+                    first: Resource { id: 20 },
+                    second: Resource { id: 22 },
+                };
+                let first = pair.first;
+                consume(pair.second) + consume(first)
+            }";
+
+        resolve_fixture(source).expect("disjoint fields should move independently");
+    }
+
+    #[test]
+    fn resolve_should_reject_reusing_a_moved_struct_field() {
+        let source = "struct Resource { id: i32 }
+            struct Pair { first: Resource, second: Resource }
+            fn consume(resource: Resource) -> i32 { resource.id }
+            fn main() -> i32 {
+                let pair = Pair {
+                    first: Resource { id: 20 },
+                    second: Resource { id: 22 },
+                };
+                let first = pair.first;
+                consume(pair.first) + consume(first)
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("a moved field should be unavailable");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3143")
+        );
+    }
+
+    #[test]
+    fn resolve_should_allow_reinitializing_a_moved_struct_field() {
+        let source = "struct Resource { id: i32 }
+            struct Pair { first: Resource, second: Resource }
+            fn consume(resource: Resource) -> i32 { resource.id }
+            fn main() -> i32 {
+                let mut pair = Pair {
+                    first: Resource { id: 20 },
+                    second: Resource { id: 22 },
+                };
+                let first = pair.first;
+                pair.first = Resource { id: 21 };
+                consume(pair.first) + consume(pair.second) + consume(first)
+            }";
+
+        resolve_fixture(source).expect("an assigned field should become available again");
     }
 
     #[test]

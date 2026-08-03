@@ -1758,7 +1758,18 @@ impl ItemRewriteContext<'_> {
         self.rewrite_parameters(&mut function.parameters);
         self.rewrite_optional_type(&mut function.return_type);
         self.rewrite_predicates(&mut function.where_predicates);
-        rewrite_block(&mut function.body, self.scope, self.apis, self.diagnostics);
+        let bindings = function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.name.clone())
+            .collect::<Vec<_>>();
+        rewrite_block_with_bindings(
+            &mut function.body,
+            self.scope,
+            self.apis,
+            self.diagnostics,
+            &bindings,
+        );
     }
 
     fn rewrite_extern_function(&mut self, function: &mut ast::ExternFunction) {
@@ -1856,7 +1867,18 @@ impl ItemRewriteContext<'_> {
             self.rewrite_parameters(&mut method.parameters);
             self.rewrite_optional_type(&mut method.return_type);
             self.rewrite_predicates(&mut method.where_predicates);
-            rewrite_block(&mut method.body, self.scope, self.apis, self.diagnostics);
+            let bindings = method
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.name.clone())
+                .collect::<Vec<_>>();
+            rewrite_block_with_bindings(
+                &mut method.body,
+                self.scope,
+                self.apis,
+                self.diagnostics,
+                &bindings,
+            );
         }
     }
 
@@ -1995,45 +2017,117 @@ fn rewrite_block(
     apis: &ModuleApis,
     diagnostics: &mut Vec<FileDiagnostic>,
 ) {
+    rewrite_block_with_bindings(block, scope, apis, diagnostics, &[]);
+}
+
+fn rewrite_block_with_bindings(
+    block: &mut ast::Block,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    bindings: &[String],
+) {
+    let mut local_scopes = Vec::new();
+    rewrite_scoped_block(block, scope, apis, diagnostics, &mut local_scopes, bindings);
+}
+
+fn rewrite_scoped_block(
+    block: &mut ast::Block,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
+    bindings: &[String],
+) {
+    local_scopes.push(bindings.iter().cloned().collect());
     for statement in &mut block.statements {
         match statement {
             Statement::Let(statement) => {
                 if let Some(ty) = &mut statement.ty {
                     rewrite_type(ty, scope, apis, diagnostics);
                 }
-                rewrite_expression(&mut statement.initializer, scope, apis, diagnostics);
+                rewrite_scoped_expression(
+                    &mut statement.initializer,
+                    scope,
+                    apis,
+                    diagnostics,
+                    local_scopes,
+                );
+                if let Some(current) = local_scopes.last_mut() {
+                    current.insert(statement.name.name.clone());
+                }
             }
             Statement::Expression(statement) => {
-                rewrite_expression(&mut statement.expression, scope, apis, diagnostics);
+                rewrite_scoped_expression(
+                    &mut statement.expression,
+                    scope,
+                    apis,
+                    diagnostics,
+                    local_scopes,
+                );
             }
             Statement::Defer(statement) => {
-                rewrite_expression(&mut statement.action, scope, apis, diagnostics);
+                rewrite_scoped_expression(
+                    &mut statement.action,
+                    scope,
+                    apis,
+                    diagnostics,
+                    local_scopes,
+                );
             }
             Statement::Return(statement) => {
                 if let Some(value) = &mut statement.value {
-                    rewrite_expression(value, scope, apis, diagnostics);
+                    rewrite_scoped_expression(value, scope, apis, diagnostics, local_scopes);
                 }
             }
             Statement::While(statement) => {
-                rewrite_expression(&mut statement.condition, scope, apis, diagnostics);
-                rewrite_block(&mut statement.body, scope, apis, diagnostics);
+                rewrite_scoped_expression(
+                    &mut statement.condition,
+                    scope,
+                    apis,
+                    diagnostics,
+                    local_scopes,
+                );
+                rewrite_scoped_block(
+                    &mut statement.body,
+                    scope,
+                    apis,
+                    diagnostics,
+                    local_scopes,
+                    &[],
+                );
             }
             Statement::For(statement) => {
+                rewrite_scoped_expression(
+                    &mut statement.iterable,
+                    scope,
+                    apis,
+                    diagnostics,
+                    local_scopes,
+                );
                 rewrite_pattern(&mut statement.pattern, scope, apis, diagnostics);
-                rewrite_expression(&mut statement.iterable, scope, apis, diagnostics);
-                rewrite_block(&mut statement.body, scope, apis, diagnostics);
+                let bindings = pattern_bindings(&statement.pattern);
+                rewrite_scoped_block(
+                    &mut statement.body,
+                    scope,
+                    apis,
+                    diagnostics,
+                    local_scopes,
+                    &bindings,
+                );
             }
             Statement::Break(statement) => {
                 if let Some(value) = &mut statement.value {
-                    rewrite_expression(value, scope, apis, diagnostics);
+                    rewrite_scoped_expression(value, scope, apis, diagnostics, local_scopes);
                 }
             }
             Statement::Continue(_) => {}
         }
     }
     if let Some(tail) = &mut block.tail {
-        rewrite_expression(tail, scope, apis, diagnostics);
+        rewrite_scoped_expression(tail, scope, apis, diagnostics, local_scopes);
     }
+    local_scopes.pop();
 }
 
 fn rewrite_expression(
@@ -2041,6 +2135,17 @@ fn rewrite_expression(
     scope: &Scope,
     apis: &ModuleApis,
     diagnostics: &mut Vec<FileDiagnostic>,
+) {
+    let mut local_scopes = Vec::new();
+    rewrite_scoped_expression(expression, scope, apis, diagnostics, &mut local_scopes);
+}
+
+fn rewrite_scoped_expression(
+    expression: &mut Expression,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
 ) {
     match expression {
         Expression::Integer(_)
@@ -2051,95 +2156,174 @@ fn rewrite_expression(
         | Expression::Boolean(_)
         | Expression::Unit(_) => {}
         Expression::FormattedString(formatted) => {
-            rewrite_formatted_fragments(formatted, scope, apis, diagnostics);
+            rewrite_formatted_fragments(formatted, scope, apis, diagnostics, local_scopes);
         }
         Expression::Tuple(tuple) => {
             for element in &mut tuple.elements {
-                rewrite_expression(element, scope, apis, diagnostics);
+                rewrite_scoped_expression(element, scope, apis, diagnostics, local_scopes);
             }
         }
         Expression::PackExpansion(expansion) => {
-            rewrite_expression(&mut expansion.template, scope, apis, diagnostics);
+            rewrite_scoped_expression(
+                &mut expansion.template,
+                scope,
+                apis,
+                diagnostics,
+                local_scopes,
+            );
         }
-        Expression::Array(array) => rewrite_array_expression(array, scope, apis, diagnostics),
+        Expression::Array(array) => {
+            rewrite_array_expression(array, scope, apis, diagnostics, local_scopes);
+        }
         Expression::Struct(structure) => {
             rewrite_path(&mut structure.path, scope, apis, diagnostics);
             for field in &mut structure.fields {
-                rewrite_expression(&mut field.value, scope, apis, diagnostics);
+                rewrite_scoped_expression(&mut field.value, scope, apis, diagnostics, local_scopes);
             }
         }
-        Expression::Path(path) => rewrite_path(path, scope, apis, diagnostics),
+        Expression::Path(path) => {
+            rewrite_scoped_path(path, scope, apis, diagnostics, local_scopes);
+        }
         Expression::Unary(unary) => {
-            rewrite_expression(&mut unary.operand, scope, apis, diagnostics);
+            rewrite_scoped_expression(&mut unary.operand, scope, apis, diagnostics, local_scopes);
         }
         Expression::Binary(binary) => {
-            rewrite_expression(&mut binary.left, scope, apis, diagnostics);
-            rewrite_expression(&mut binary.right, scope, apis, diagnostics);
+            rewrite_scoped_expression(&mut binary.left, scope, apis, diagnostics, local_scopes);
+            rewrite_scoped_expression(&mut binary.right, scope, apis, diagnostics, local_scopes);
         }
         Expression::Call(call) => {
-            rewrite_expression(&mut call.callee, scope, apis, diagnostics);
-            for argument in &mut call.generic_arguments {
-                match argument {
-                    ast::GenericArgument::Type(ty) => {
-                        rewrite_type(ty, scope, apis, diagnostics);
-                    }
-                    ast::GenericArgument::Const(value) => {
-                        rewrite_expression(value, scope, apis, diagnostics);
-                    }
-                    ast::GenericArgument::Pack { template, .. } => {
-                        if let Some(template) = template {
-                            rewrite_type(template, scope, apis, diagnostics);
-                        }
-                    }
-                }
-            }
-            for argument in &mut call.arguments {
-                rewrite_expression(argument, scope, apis, diagnostics);
-            }
+            rewrite_scoped_call(call, scope, apis, diagnostics, local_scopes);
         }
         Expression::If(conditional) => {
-            rewrite_expression(&mut conditional.condition, scope, apis, diagnostics);
-            rewrite_block(&mut conditional.then_branch, scope, apis, diagnostics);
-            if let Some(alternative) = &mut conditional.else_branch {
-                rewrite_expression(alternative, scope, apis, diagnostics);
-            }
+            rewrite_scoped_if(conditional, scope, apis, diagnostics, local_scopes);
         }
         Expression::Match(matched) => {
-            rewrite_expression(&mut matched.scrutinee, scope, apis, diagnostics);
-            for arm in &mut matched.arms {
-                rewrite_pattern(&mut arm.pattern, scope, apis, diagnostics);
-                if let Some(guard) = &mut arm.guard {
-                    rewrite_expression(guard, scope, apis, diagnostics);
-                }
-                rewrite_expression(&mut arm.body, scope, apis, diagnostics);
-            }
+            rewrite_scoped_match(matched, scope, apis, diagnostics, local_scopes);
         }
         Expression::Loop(loop_expression) => {
-            rewrite_block(&mut loop_expression.body, scope, apis, diagnostics);
+            rewrite_scoped_block(
+                &mut loop_expression.body,
+                scope,
+                apis,
+                diagnostics,
+                local_scopes,
+                &[],
+            );
         }
         Expression::Unsafe(block) | Expression::Block(block) => {
-            rewrite_block(block, scope, apis, diagnostics);
+            rewrite_scoped_block(block, scope, apis, diagnostics, local_scopes, &[]);
         }
         Expression::Assignment(assignment) => {
-            rewrite_expression(&mut assignment.target, scope, apis, diagnostics);
-            rewrite_expression(&mut assignment.value, scope, apis, diagnostics);
+            rewrite_scoped_expression(
+                &mut assignment.target,
+                scope,
+                apis,
+                diagnostics,
+                local_scopes,
+            );
+            rewrite_scoped_expression(
+                &mut assignment.value,
+                scope,
+                apis,
+                diagnostics,
+                local_scopes,
+            );
         }
         Expression::Cast(cast) => {
-            rewrite_expression(&mut cast.value, scope, apis, diagnostics);
+            rewrite_scoped_expression(&mut cast.value, scope, apis, diagnostics, local_scopes);
             rewrite_type(&mut cast.target, scope, apis, diagnostics);
         }
         Expression::Field(field) => {
-            rewrite_expression(&mut field.base, scope, apis, diagnostics);
+            rewrite_scoped_expression(&mut field.base, scope, apis, diagnostics, local_scopes);
         }
         Expression::Index(index) => {
-            rewrite_expression(&mut index.base, scope, apis, diagnostics);
+            rewrite_scoped_expression(&mut index.base, scope, apis, diagnostics, local_scopes);
             for value in &mut index.indices {
-                rewrite_expression(value, scope, apis, diagnostics);
+                rewrite_scoped_expression(value, scope, apis, diagnostics, local_scopes);
             }
         }
         Expression::Try { value, .. } => {
-            rewrite_expression(value, scope, apis, diagnostics);
+            rewrite_scoped_expression(value, scope, apis, diagnostics, local_scopes);
         }
+    }
+}
+
+fn rewrite_scoped_call(
+    call: &mut ast::CallExpression,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
+) {
+    rewrite_scoped_expression(&mut call.callee, scope, apis, diagnostics, local_scopes);
+    for argument in &mut call.generic_arguments {
+        match argument {
+            ast::GenericArgument::Type(ty) => rewrite_type(ty, scope, apis, diagnostics),
+            ast::GenericArgument::Const(value) => {
+                rewrite_scoped_expression(value, scope, apis, diagnostics, local_scopes);
+            }
+            ast::GenericArgument::Pack { template, .. } => {
+                if let Some(template) = template {
+                    rewrite_type(template, scope, apis, diagnostics);
+                }
+            }
+        }
+    }
+    for argument in &mut call.arguments {
+        rewrite_scoped_expression(argument, scope, apis, diagnostics, local_scopes);
+    }
+}
+
+fn rewrite_scoped_if(
+    conditional: &mut ast::IfExpression,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
+) {
+    rewrite_scoped_expression(
+        &mut conditional.condition,
+        scope,
+        apis,
+        diagnostics,
+        local_scopes,
+    );
+    rewrite_scoped_block(
+        &mut conditional.then_branch,
+        scope,
+        apis,
+        diagnostics,
+        local_scopes,
+        &[],
+    );
+    if let Some(alternative) = &mut conditional.else_branch {
+        rewrite_scoped_expression(alternative, scope, apis, diagnostics, local_scopes);
+    }
+}
+
+fn rewrite_scoped_match(
+    matched: &mut ast::MatchExpression,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
+) {
+    rewrite_scoped_expression(
+        &mut matched.scrutinee,
+        scope,
+        apis,
+        diagnostics,
+        local_scopes,
+    );
+    for arm in &mut matched.arms {
+        rewrite_pattern(&mut arm.pattern, scope, apis, diagnostics);
+        let bindings = pattern_bindings(&arm.pattern);
+        local_scopes.push(bindings.into_iter().collect());
+        if let Some(guard) = &mut arm.guard {
+            rewrite_scoped_expression(guard, scope, apis, diagnostics, local_scopes);
+        }
+        rewrite_scoped_expression(&mut arm.body, scope, apis, diagnostics, local_scopes);
+        local_scopes.pop();
     }
 }
 
@@ -2148,16 +2332,17 @@ fn rewrite_array_expression(
     scope: &Scope,
     apis: &ModuleApis,
     diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
 ) {
     match &mut array.kind {
         ast::ArrayExpressionKind::List(elements) => {
             for element in elements {
-                rewrite_expression(element, scope, apis, diagnostics);
+                rewrite_scoped_expression(element, scope, apis, diagnostics, local_scopes);
             }
         }
         ast::ArrayExpressionKind::Repeat { value, length } => {
-            rewrite_expression(value, scope, apis, diagnostics);
-            rewrite_expression(length, scope, apis, diagnostics);
+            rewrite_scoped_expression(value, scope, apis, diagnostics, local_scopes);
+            rewrite_scoped_expression(length, scope, apis, diagnostics, local_scopes);
         }
     }
 }
@@ -2167,13 +2352,47 @@ fn rewrite_formatted_fragments(
     scope: &Scope,
     apis: &ModuleApis,
     diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
 ) {
     for fragment in &mut formatted.fragments {
         if let ast::FormattedStringFragment::Display(expression)
         | ast::FormattedStringFragment::Debug(expression) = fragment
         {
-            rewrite_expression(expression, scope, apis, diagnostics);
+            rewrite_scoped_expression(expression, scope, apis, diagnostics, local_scopes);
         }
+    }
+}
+
+fn pattern_bindings(pattern: &Pattern) -> Vec<String> {
+    let mut bindings = Vec::new();
+    collect_pattern_bindings(pattern, &mut bindings);
+    bindings
+}
+
+fn collect_pattern_bindings(pattern: &Pattern, bindings: &mut Vec<String>) {
+    match pattern {
+        Pattern::Identifier { name, .. } => bindings.push(name.name.clone()),
+        Pattern::Tuple { elements, .. } => {
+            for element in elements {
+                collect_pattern_bindings(element, bindings);
+            }
+        }
+        Pattern::EnumTuple { fields, .. } => {
+            for field in fields {
+                collect_pattern_bindings(field, bindings);
+            }
+        }
+        Pattern::EnumStruct { fields, .. } => {
+            for field in fields {
+                collect_pattern_bindings(&field.pattern, bindings);
+            }
+        }
+        Pattern::Wildcard(_)
+        | Pattern::Integer { .. }
+        | Pattern::Float { .. }
+        | Pattern::Character(_)
+        | Pattern::Boolean(_)
+        | Pattern::Path(_) => {}
     }
 }
 
@@ -2209,6 +2428,24 @@ fn rewrite_pattern(
             }
         }
     }
+}
+
+fn rewrite_scoped_path(
+    path: &mut ast::Path,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &[HashSet<String>],
+) {
+    if let [segment] = path.segments.as_slice()
+        && local_scopes
+            .iter()
+            .rev()
+            .any(|locals| locals.contains(&segment.name))
+    {
+        return;
+    }
+    rewrite_path(path, scope, apis, diagnostics);
 }
 
 fn rewrite_path(
@@ -2770,6 +3007,28 @@ mod tests {
             reimer_resolver::resolve(&package.program).expect("merged package should resolve");
 
         assert_eq!(program.functions.len(), 2);
+    }
+
+    #[test]
+    fn load_should_preserve_locals_that_shadow_package_symbols() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.reim",
+            "struct World { value: i32 }
+             impl World {
+                 fn value(&self) -> i32 { self.value }
+             }
+             fn world() -> World { World { value: 42 } }
+             fn main() -> i32 {
+                 let world = world();
+                 world.value()
+             }",
+        );
+
+        let package = load(&fixture.path("main.reim")).expect("package should load");
+
+        reimer_resolver::resolve(&package.program)
+            .expect("a local should shadow a package-level constructor");
     }
 
     #[test]
