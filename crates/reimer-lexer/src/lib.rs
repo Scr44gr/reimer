@@ -102,6 +102,8 @@ pub enum TokenKind {
     Trait,
     /// `where`
     Where,
+    /// `...`
+    Ellipsis,
     /// `true`
     True,
     /// `false`
@@ -299,6 +301,10 @@ impl<'source> Lexer<'source> {
                 '*' => self.push(TokenKind::Star, start),
                 '%' if self.take_char('=') => self.push(TokenKind::PercentEqual, start),
                 '%' => self.push(TokenKind::Percent, start),
+                '.' if self.source[self.cursor..].starts_with("..") => {
+                    self.cursor += 2;
+                    self.push(TokenKind::Ellipsis, start);
+                }
                 '.' => self.push(TokenKind::Dot, start),
                 '(' => self.push(TokenKind::LeftParen, start),
                 ')' => self.push(TokenKind::RightParen, start),
@@ -1276,5 +1282,20 @@ mod tests {
         let diagnostics = lex(r#"let title = c"bad\0title";"#).expect_err("fixture should fail");
 
         assert_eq!(diagnostics[0].code, "E0007");
+    }
+
+    #[test]
+    fn lex_should_keep_ellipsis_distinct_from_field_access() {
+        let tokens = lex("struct Bundle<...Types> { values: (...Types) }")
+            .expect("variadic fixture should lex");
+
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::Ellipsis)
+                .count(),
+            2
+        );
+        assert!(!tokens.iter().any(|token| token.kind == TokenKind::Dot));
     }
 }

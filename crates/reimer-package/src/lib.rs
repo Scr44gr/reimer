@@ -1437,7 +1437,17 @@ fn visit_type_paths<'ast>(ty: &'ast TypeName, paths: &mut Vec<&'ast ast::Path>) 
                 match argument {
                     ast::GenericArgument::Type(ty) => visit_type_paths(ty, paths),
                     ast::GenericArgument::Const(value) => visit_expression_paths(value, paths),
+                    ast::GenericArgument::Pack { template, .. } => {
+                        if let Some(template) = template {
+                            visit_type_paths(template, paths);
+                        }
+                    }
                 }
+            }
+        }
+        TypeNameKind::PackExpansion { template, .. } => {
+            if let Some(template) = template {
+                visit_type_paths(template, paths);
             }
         }
         TypeNameKind::Tuple(elements) => {
@@ -1471,6 +1481,7 @@ fn visit_generic_parameters<'ast>(
                     visit_type_paths(default, paths);
                 }
             }
+            ast::GenericParameter::TypePack { bounds, .. } => paths.extend(bounds),
             ast::GenericParameter::Const { ty, default, .. } => {
                 visit_type_paths(ty, paths);
                 if let Some(default) = default {
@@ -1554,6 +1565,9 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
                 visit_expression_paths(element, paths);
             }
         }
+        Expression::PackExpansion(expansion) => {
+            visit_expression_paths(&expansion.template, paths);
+        }
         Expression::Array(array) => visit_array_expression_paths(array, paths),
         Expression::Struct(structure) => {
             paths.push(&structure.path);
@@ -1573,6 +1587,11 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
                 match argument {
                     ast::GenericArgument::Type(ty) => visit_type_paths(ty, paths),
                     ast::GenericArgument::Const(value) => visit_expression_paths(value, paths),
+                    ast::GenericArgument::Pack { template, .. } => {
+                        if let Some(template) = template {
+                            visit_type_paths(template, paths);
+                        }
+                    }
                 }
             }
             for argument in &call.arguments {
@@ -1893,7 +1912,17 @@ fn rewrite_type(
                     ast::GenericArgument::Const(value) => {
                         rewrite_expression(value, scope, apis, diagnostics);
                     }
+                    ast::GenericArgument::Pack { template, .. } => {
+                        if let Some(template) = template {
+                            rewrite_type(template, scope, apis, diagnostics);
+                        }
+                    }
                 }
+            }
+        }
+        TypeNameKind::PackExpansion { template, .. } => {
+            if let Some(template) = template {
+                rewrite_type(template, scope, apis, diagnostics);
             }
         }
         TypeNameKind::Tuple(elements) => {
@@ -1929,6 +1958,11 @@ fn rewrite_generic_parameters(
                 }
                 if let Some(default) = default {
                     rewrite_type(default, scope, apis, diagnostics);
+                }
+            }
+            ast::GenericParameter::TypePack { bounds, .. } => {
+                for bound in bounds {
+                    rewrite_path(bound, scope, apis, diagnostics);
                 }
             }
             ast::GenericParameter::Const { ty, default, .. } => {
@@ -2024,6 +2058,9 @@ fn rewrite_expression(
                 rewrite_expression(element, scope, apis, diagnostics);
             }
         }
+        Expression::PackExpansion(expansion) => {
+            rewrite_expression(&mut expansion.template, scope, apis, diagnostics);
+        }
         Expression::Array(array) => rewrite_array_expression(array, scope, apis, diagnostics),
         Expression::Struct(structure) => {
             rewrite_path(&mut structure.path, scope, apis, diagnostics);
@@ -2048,6 +2085,11 @@ fn rewrite_expression(
                     }
                     ast::GenericArgument::Const(value) => {
                         rewrite_expression(value, scope, apis, diagnostics);
+                    }
+                    ast::GenericArgument::Pack { template, .. } => {
+                        if let Some(template) = template {
+                            rewrite_type(template, scope, apis, diagnostics);
+                        }
                     }
                 }
             }

@@ -8739,6 +8739,44 @@ mod tests {
     }
 
     #[test]
+    fn execute_should_lower_variadic_generic_expansions() {
+        let program = compile_fixture(
+            "struct Marker<T> { value: i32 }
+             fn make_marker<T>() -> Marker<T> { Marker { value: 21 } }
+             fn markers<...Types>() -> (...Types => Marker<Types>) {
+                 (...Types => make_marker<Types>(),)
+             }
+             fn main() -> i32 {
+                 let values: (Marker<i32>, Marker<bool>) = markers<i32, bool>();
+                 values.0.value + values.1.value
+             }",
+        );
+
+        let result = execute(&program).expect("variadic fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_split_heterogeneous_tuples_by_type() {
+        let program = compile_fixture(
+            "fn main() -> i32 {
+                 let mut values: (i32, bool, u8) = (40, true, 7);
+                 {
+                     let selected: (&mut i32, &bool) =
+                         values.split_type_mut<i32, bool>();
+                     *selected.0 += if *selected.1 { 2 } else { 0 };
+                 };
+                 *values.get_type<i32>()
+             }",
+        );
+
+        let result = execute(&program).expect("heterogeneous tuple fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
     fn execute_should_lower_all_enum_constructor_forms() {
         let program = compile_fixture(
             "enum Value {

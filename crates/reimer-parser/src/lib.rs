@@ -11,9 +11,9 @@ use reimer_ast::{
     FloatLiteral, ForStatement, FormattedStringExpression, FormattedStringFragment, Function,
     GenericArgument, GenericParameter, Identifier, IfExpression, ImplDeclaration,
     ImportDeclaration, ImportKind, ImportedName, IndexExpression, IntegerLiteral, Item,
-    LetStatement, LoopExpression, MatchArm, MatchExpression, Parameter, Path, Pattern,
-    PatternField, Program, ReturnStatement, Statement, StaticDeclaration, StringLiteral,
-    StructDeclaration, StructExpression, StructField, TraitDeclaration, TraitMethod,
+    LetStatement, LoopExpression, MatchArm, MatchExpression, PackExpansionExpression, Parameter,
+    Path, Pattern, PatternField, Program, ReturnStatement, Statement, StaticDeclaration,
+    StringLiteral, StructDeclaration, StructExpression, StructField, TraitDeclaration, TraitMethod,
     TupleExpression, TypeAliasDeclaration, TypeName, TypeNameKind, UnaryExpression, UnaryOperator,
     WherePredicate, WhileStatement,
 };
@@ -992,7 +992,20 @@ impl<'tokens> Parser<'tokens> {
         let mut parameters = Vec::new();
         loop {
             let start = self.current().span.start;
-            let parameter = if self.take(&TokenKind::Const).is_some() {
+            let parameter = if self.take(&TokenKind::Ellipsis).is_some() {
+                let name = self.expect_identifier("type pack parameter name")?;
+                let bounds = if self.take(&TokenKind::Colon).is_some() {
+                    self.parse_trait_bounds()?
+                } else {
+                    Vec::new()
+                };
+                let end = bounds.last().map_or(name.span.end, |bound| bound.span.end);
+                GenericParameter::TypePack {
+                    name,
+                    bounds,
+                    span: Span::new(start, end),
+                }
+            } else if self.take(&TokenKind::Const).is_some() {
                 let name = self.expect_identifier("const generic parameter name")?;
                 self.expect_symbol(&TokenKind::Colon, "`:` after const parameter name")?;
                 let ty = self.parse_type_name()?;
@@ -1104,6 +1117,19 @@ impl<'tokens> Parser<'tokens> {
 
     fn parse_type_name_inner(&mut self) -> Option<TypeName> {
         let type_start = self.current().span.start;
+        if self.take(&TokenKind::Ellipsis).is_some() {
+            let pack = self.expect_identifier("type pack name after `...`")?;
+            let template = if self.take(&TokenKind::FatArrow).is_some() {
+                Some(Box::new(self.parse_type_name()?))
+            } else {
+                None
+            };
+            let end = template.as_ref().map_or(pack.span.end, |ty| ty.span.end);
+            return Some(TypeName {
+                kind: TypeNameKind::PackExpansion { pack, template },
+                span: Span::new(type_start, end),
+            });
+        }
         if self.at(&TokenKind::Fn) {
             return self.parse_function_type();
         }
@@ -1713,7 +1739,20 @@ impl<'tokens> Parser<'tokens> {
     fn parse_generic_argument_list(&mut self) -> Option<Vec<GenericArgument>> {
         let mut arguments = Vec::new();
         loop {
-            let argument = if matches!(
+            let argument = if let Some(start) = self.take(&TokenKind::Ellipsis) {
+                let pack = self.expect_identifier("type pack name after `...`")?;
+                let template = if self.take(&TokenKind::FatArrow).is_some() {
+                    Some(self.parse_type_name()?)
+                } else {
+                    None
+                };
+                let end = template.as_ref().map_or(pack.span.end, |ty| ty.span.end);
+                GenericArgument::Pack {
+                    pack,
+                    template,
+                    span: Span::new(start.span.start, end),
+                }
+            } else if matches!(
                 self.current().kind,
                 TokenKind::Integer(_)
                     | TokenKind::True
@@ -1832,6 +1871,7 @@ impl<'tokens> Parser<'tokens> {
                     Some(Expression::Path(path))
                 }
             }
+            TokenKind::Ellipsis => self.parse_pack_expansion_expression(),
             TokenKind::If => self.parse_if_expression(),
             TokenKind::Match => self.parse_match_expression(),
             TokenKind::Loop => self.parse_loop_expression(),
@@ -1877,6 +1917,21 @@ impl<'tokens> Parser<'tokens> {
                 None
             }
         }
+    }
+
+    fn parse_pack_expansion_expression(&mut self) -> Option<Expression> {
+        let start = self.advance();
+        let pack = self.expect_identifier("type pack name after `...`")?;
+        self.expect_symbol(&TokenKind::FatArrow, "`=>` after the type pack name")?;
+        let template = self.parse_expression()?;
+        let span = Span::new(start.span.start, template.span().end);
+        Some(Expression::PackExpansion(Box::new(
+            PackExpansionExpression {
+                pack,
+                template,
+                span,
+            },
+        )))
     }
 
     fn parse_formatted_string(
@@ -2431,8 +2486,8 @@ fn binary_expression(operator: BinaryOperator, left: Expression, right: Expressi
 mod tests {
     use reimer_ast::{
         ArrayExpressionKind, AssignmentOperator, BinaryOperator, Expression,
-        FormattedStringFragment, GenericArgument, ImportKind, Item, Statement, TypeName,
-        TypeNameKind,
+        FormattedStringFragment, GenericArgument, GenericParameter, ImportKind, Item, Statement,
+        TypeName, TypeNameKind,
     };
     use reimer_lexer::lex;
 
@@ -3154,6 +3209,39 @@ mod tests {
                 return_type,
             } if parameters.len() == 2
                 && matches!(return_type.kind, TypeNameKind::Path(_))
+        ));
+    }
+
+    #[test]
+    fn parse_should_build_variadic_parameters_and_mapped_expansions() {
+        let source = "
+            struct Slot<T> { value: T }
+            struct Registry<...Types> {
+                stores: (...Types => Slot<Types>),
+            }";
+        let tokens = lex(source).expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+
+        let Item::Struct(registry) = &program.items[1] else {
+            panic!("expected registry declaration");
+        };
+        assert!(matches!(
+            registry.generic_parameters.as_slice(),
+            [GenericParameter::TypePack { name, .. }] if name.name == "Types"
+        ));
+        let TypeNameKind::Tuple(elements) = &registry.fields[0].ty.kind else {
+            panic!("expected tuple storage");
+        };
+        assert!(matches!(
+            elements.as_slice(),
+            [TypeName {
+                kind: TypeNameKind::PackExpansion {
+                    pack,
+                    template: Some(_),
+                },
+                ..
+            }] if pack.name == "Types"
         ));
     }
 }

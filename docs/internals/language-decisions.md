@@ -413,3 +413,22 @@ ownership to a move-only `Child`; `wait` consumes and collects it, while
 cleanup. Exit codes are optional because signal-style termination does not
 always have a numeric code. All public APIs are safe; raw buffers and native
 handles remain private to the runtime boundary.
+
+## D-019: monomorphized type packs and static heterogeneous storage
+
+Variadic generics use a final `<...Types>` type pack. Direct expansion is
+written `...Types`; mapped expansion is written
+`...Types => Template<Types>`. Both forms are resolved before HIR lowering, so
+the backend receives ordinary concrete tuples and monomorphized functions.
+There is no runtime pack object, type-name hash, or dynamic dispatch.
+
+Tuple type access follows the same rule. `get_type`, `get_type_mut`, and
+`split_type_mut` resolve requested concrete types to constant field indices.
+Ambiguous or absent types are rejected. `split_type_mut` validates uniqueness
+before creating one mutable field borrow and any number of disjoint shared
+field borrows, preserving the normal scoped-reference rules.
+
+This facility is deliberately structural rather than an `Any` registry. It
+keeps heterogeneous ECS storage safe and allocation-free while allowing
+libraries to expose APIs such as `Registry<Position, Velocity>` and typed
+queries without compiler knowledge of the engine.

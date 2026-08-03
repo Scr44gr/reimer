@@ -190,6 +190,9 @@ impl<'function> Estimator<'function> {
                     self.scan_expression(element, loop_depth);
                 }
             }
+            Expression::PackExpansion(expansion) => {
+                self.scan_expression(&expansion.template, loop_depth);
+            }
             Expression::Array(array) => match &array.kind {
                 reimer_ast::ArrayExpressionKind::List(elements) => {
                     for element in elements {

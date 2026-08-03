@@ -1,0 +1,21 @@
+struct Marker<T> {
+    value: i32,
+}
+
+fn make_marker<T>() -> Marker<T> {
+    Marker { value: 21 }
+}
+
+fn markers<...Types>() -> (...Types => Marker<Types>) {
+    (...Types => make_marker<Types>(),)
+}
+
+fn main() -> i32 {
+    let mut values: (Marker<i32>, Marker<bool>) = markers<i32, bool>();
+    values.assert_unique_types();
+    {
+        let selected = values.get_type_mut<Marker<i32>>();
+        selected.value += 21;
+    };
+    values.get_type<Marker<i32>>().value
+}

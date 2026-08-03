@@ -2195,6 +2195,50 @@ mod tests {
     }
 
     #[test]
+    fn document_should_show_variadic_struct_documentation_on_values() {
+        let source = "trait Component {}\n\
+                      struct Position { x: i32 }\n\
+                      struct Velocity { x: i32 }\n\
+                      impl Component for Position {}\n\
+                      impl Component for Velocity {}\n\
+                      /// Owns one store for every component type.\n\
+                      struct Registry<...Components: Component> { stores: (...Components) }\n\
+                      fn main() -> i32 {\n\
+                          let registry: Registry<Position, Velocity> = Registry {\n\
+                              stores: (Position { x: 20 }, Velocity { x: 22 }),\n\
+                          };\n\
+                          let _ = registry;\n\
+                          42\n\
+                      }\n"
+        .to_owned();
+        let use_offset = source.rfind("registry;").expect("local use should exist");
+        let position = LineIndex::new(Arc::from(source.as_str())).position(use_offset);
+        let document = Document::new(
+            Url::parse("untitled:documented-variadic-struct.reim").expect("URL should parse"),
+            source,
+        );
+
+        let hover = document
+            .hover(position)
+            .expect("variadic struct value should have hover information");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("hover should use markdown");
+        };
+
+        assert!(
+            contents.value.contains("Registry<Position, Velocity>"),
+            "unexpected hover contents: {}",
+            contents.value
+        );
+        assert!(
+            contents
+                .value
+                .contains("Owns one store for every component type.")
+        );
+        assert!(!contents.value.contains("__module_"));
+    }
+
+    #[test]
     fn document_should_show_static_signatures_and_documentation() {
         let source = "/// Stores the canonical answer at a stable address.\n\
                       static ANSWER: i32 = 42;\n\

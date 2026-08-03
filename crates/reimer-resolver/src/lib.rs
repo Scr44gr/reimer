@@ -2,7 +2,7 @@
 
 mod comptime;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem::size_of;
 
 use reimer_ast::{
@@ -131,6 +131,7 @@ struct GenericFunctionTemplate {
 struct GenericFunctionKey {
     resolved_name: String,
     arguments: Vec<GenericValue>,
+    pack_lengths: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +255,7 @@ struct TraitImplementation {
 #[derive(Debug, Clone, Default)]
 struct GenericEnvironment {
     types: HashMap<String, Type>,
+    type_packs: HashMap<String, Vec<Type>>,
     constants: HashMap<String, u64>,
 }
 
@@ -277,6 +279,7 @@ impl TypeRegistry {
     fn base_environment(&self) -> GenericEnvironment {
         GenericEnvironment {
             types: HashMap::new(),
+            type_packs: HashMap::new(),
             constants: self.constant_integers.clone(),
         }
     }
@@ -784,14 +787,8 @@ impl TypeRegistry {
                 parameters: parameter_names,
                 return_type,
             } => {
-                let mut parameters = Vec::with_capacity(parameter_names.len());
-                for parameter in parameter_names {
-                    parameters.push(self.resolve_type_name_in(
-                        parameter,
-                        environment,
-                        diagnostics,
-                    )?);
-                }
+                let parameters =
+                    self.resolve_type_sequence(parameter_names, environment, diagnostics)?;
                 let return_type =
                     self.resolve_type_name_in(return_type, environment, diagnostics)?;
                 self.intern_function(parameters, return_type, type_name.span, diagnostics)
@@ -805,11 +802,20 @@ impl TypeRegistry {
                 diagnostics,
             ),
             TypeNameKind::Tuple(element_names) => {
-                let mut elements = Vec::with_capacity(element_names.len());
-                for element in element_names {
-                    elements.push(self.resolve_type_name_in(element, environment, diagnostics)?);
-                }
+                let elements =
+                    self.resolve_type_sequence(element_names, environment, diagnostics)?;
                 self.intern_tuple(elements, type_name.span, diagnostics)
+            }
+            TypeNameKind::PackExpansion { .. } => {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "E6020",
+                        "a type pack can only expand inside a tuple, function type, or generic argument list",
+                        type_name.span,
+                    )
+                    .with_help("wrap the expansion in a type list such as `(...Types)`"),
+                );
+                None
             }
             TypeNameKind::Array { element, length } => {
                 let element = self.resolve_type_name_in(element, environment, diagnostics)?;
@@ -866,6 +872,53 @@ impl TypeRegistry {
                 ty
             }
         }
+    }
+
+    fn resolve_type_sequence(
+        &mut self,
+        type_names: &[ast::TypeName],
+        environment: &GenericEnvironment,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Vec<Type>> {
+        let mut resolved = Vec::new();
+        for type_name in type_names {
+            match &type_name.kind {
+                TypeNameKind::PackExpansion { pack, template } => {
+                    let Some(types) = environment.type_packs.get(&pack.name).cloned() else {
+                        diagnostics.push(
+                            Diagnostic::error(
+                                "E6020",
+                                format!("unknown type pack `{}`", pack.name),
+                                pack.span,
+                            )
+                            .with_help("declare the pack with `<...Types>`"),
+                        );
+                        return None;
+                    };
+                    for ty in types {
+                        if let Some(template) = template {
+                            let mut element_environment = environment.clone();
+                            element_environment.types.insert(pack.name.clone(), ty);
+                            resolved.push(self.resolve_type_name_in(
+                                template,
+                                &element_environment,
+                                diagnostics,
+                            )?);
+                        } else {
+                            resolved.push(ty);
+                        }
+                    }
+                }
+                _ => {
+                    resolved.push(self.resolve_type_name_in(
+                        type_name,
+                        environment,
+                        diagnostics,
+                    )?);
+                }
+            }
+        }
+        Some(resolved)
     }
 
     fn resolve_generic_type_name(
@@ -1078,19 +1131,27 @@ impl TypeRegistry {
         span: Span,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Option<(Vec<GenericValue>, GenericEnvironment)> {
+        let pack_position = parameters
+            .iter()
+            .position(|parameter| matches!(parameter, ast::GenericParameter::TypePack { .. }));
         let required = parameters
             .iter()
             .filter(|parameter| match parameter {
                 ast::GenericParameter::Type { default, .. } => default.is_none(),
                 ast::GenericParameter::Const { default, .. } => default.is_none(),
+                ast::GenericParameter::TypePack { .. } => false,
             })
             .count();
-        if arguments.len() < required || arguments.len() > parameters.len() {
+        let maximum = pack_position.is_none().then_some(parameters.len());
+        if arguments.len() < required || maximum.is_some_and(|maximum| arguments.len() > maximum) {
+            let accepted = maximum.map_or_else(
+                || format!("at least {required}"),
+                |maximum| format!("between {required} and {maximum}"),
+            );
             diagnostics.push(Diagnostic::error(
                 "E6003",
                 format!(
-                    "generic type expects between {required} and {} argument(s), but {} were provided",
-                    parameters.len(),
+                    "generic type expects {accepted} argument(s), but {} were provided",
                     arguments.len()
                 ),
                 span,
@@ -1099,19 +1160,23 @@ impl TypeRegistry {
         }
         let mut environment = outer_environment.clone();
         let mut values = Vec::with_capacity(parameters.len());
-        for (index, parameter) in parameters.iter().enumerate() {
-            let argument = arguments.get(index);
+        let supplied =
+            self.resolve_generic_argument_values(arguments, outer_environment, diagnostics)?;
+        let mut argument_index = 0;
+        for parameter in parameters {
+            let argument = supplied.get(argument_index).copied();
             match parameter {
                 ast::GenericParameter::Type { name, default, .. } => {
                     let ty = match argument {
-                        Some(ast::GenericArgument::Type(ty)) => {
-                            self.resolve_type_name_in(ty, &environment, diagnostics)?
+                        Some(GenericValue::Type(ty)) => {
+                            argument_index += 1;
+                            ty
                         }
-                        Some(ast::GenericArgument::Const(value)) => {
+                        Some(GenericValue::Const(_)) => {
                             diagnostics.push(Diagnostic::error(
                                 "E6003",
                                 format!("type parameter `{}` received a const argument", name.name),
-                                value.span(),
+                                span,
                             ));
                             return None;
                         }
@@ -1122,41 +1187,39 @@ impl TypeRegistry {
                     environment.types.insert(name.name.clone(), ty);
                     values.push(GenericValue::Type(ty));
                 }
+                ast::GenericParameter::TypePack { name, .. } => {
+                    let mut types = Vec::new();
+                    for value in &supplied[argument_index..] {
+                        let GenericValue::Type(ty) = value else {
+                            diagnostics.push(
+                                Diagnostic::error(
+                                    "E6020",
+                                    format!("type pack `{}` received a const argument", name.name),
+                                    span,
+                                )
+                                .with_help("type packs accept only type arguments"),
+                            );
+                            return None;
+                        };
+                        types.push(*ty);
+                        values.push(GenericValue::Type(*ty));
+                    }
+                    argument_index = supplied.len();
+                    environment.type_packs.insert(name.name.clone(), types);
+                }
                 ast::GenericParameter::Const { name, default, .. } => {
                     let value = match argument {
-                        Some(ast::GenericArgument::Const(value)) => {
-                            evaluate_array_length_in(value, &environment, diagnostics)?
-                        }
-                        Some(ast::GenericArgument::Type(ty)) => {
-                            let TypeNameKind::Path(path) = &ty.kind else {
-                                diagnostics.push(Diagnostic::error(
-                                    "E6003",
-                                    format!(
-                                        "const parameter `{}` received a type argument",
-                                        name.name
-                                    ),
-                                    ty.span,
-                                ));
-                                return None;
-                            };
-                            let Some(constant_name) = single_path_name(path) else {
-                                diagnostics.push(Diagnostic::error(
-                                    "E6003",
-                                    "const argument must be an integer expression",
-                                    ty.span,
-                                ));
-                                return None;
-                            };
-                            let Some(value) = environment.constants.get(constant_name).copied()
-                            else {
-                                diagnostics.push(Diagnostic::error(
-                                    "E6003",
-                                    format!("unknown const argument `{constant_name}`"),
-                                    ty.span,
-                                ));
-                                return None;
-                            };
+                        Some(GenericValue::Const(value)) => {
+                            argument_index += 1;
                             value
+                        }
+                        Some(GenericValue::Type(_)) => {
+                            diagnostics.push(Diagnostic::error(
+                                "E6003",
+                                format!("const parameter `{}` received a type argument", name.name),
+                                span,
+                            ));
+                            return None;
                         }
                         None => {
                             evaluate_array_length_in(default.as_ref()?, &environment, diagnostics)?
@@ -1168,6 +1231,67 @@ impl TypeRegistry {
             }
         }
         Some((values, environment))
+    }
+
+    fn resolve_generic_argument_values(
+        &mut self,
+        arguments: &[ast::GenericArgument],
+        environment: &GenericEnvironment,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Vec<GenericValue>> {
+        let mut values = Vec::new();
+        for argument in arguments {
+            match argument {
+                ast::GenericArgument::Type(ty) => {
+                    if let TypeNameKind::Path(path) = &ty.kind
+                        && let Some(name) = single_path_name(path)
+                        && let Some(value) = environment.constants.get(name)
+                    {
+                        values.push(GenericValue::Const(*value));
+                    } else {
+                        values.push(GenericValue::Type(self.resolve_type_name_in(
+                            ty,
+                            environment,
+                            diagnostics,
+                        )?));
+                    }
+                }
+                ast::GenericArgument::Const(value) => {
+                    values.push(GenericValue::Const(evaluate_array_length_in(
+                        value,
+                        environment,
+                        diagnostics,
+                    )?));
+                }
+                ast::GenericArgument::Pack { pack, template, .. } => {
+                    let Some(types) = environment.type_packs.get(&pack.name).cloned() else {
+                        diagnostics.push(
+                            Diagnostic::error(
+                                "E6020",
+                                format!("unknown type pack `{}`", pack.name),
+                                pack.span,
+                            )
+                            .with_help("declare the pack with `<...Types>`"),
+                        );
+                        return None;
+                    };
+                    for ty in types {
+                        if let Some(template) = template {
+                            let mut element_environment = environment.clone();
+                            element_environment.types.insert(pack.name.clone(), ty);
+                            values.push(GenericValue::Type(self.resolve_type_name_in(
+                                template,
+                                &element_environment,
+                                diagnostics,
+                            )?));
+                        } else {
+                            values.push(GenericValue::Type(ty));
+                        }
+                    }
+                }
+            }
+        }
+        Some(values)
     }
 
     fn resolve_fields_in(
@@ -1280,14 +1404,12 @@ impl TypeRegistry {
                 let Some((actual_parameters, actual_return)) = self.function_shape(actual) else {
                     return false;
                 };
-                parameter_patterns.len() == actual_parameters.len()
-                    && parameter_patterns
-                        .iter()
-                        .zip(actual_parameters)
-                        .all(|(pattern, actual)| {
-                            self.infer_type_pattern(pattern, *actual, parameters, environment)
-                        })
-                    && self.infer_type_pattern(return_type, actual_return, parameters, environment)
+                self.infer_type_sequence(
+                    parameter_patterns,
+                    actual_parameters,
+                    parameters,
+                    environment,
+                ) && self.infer_type_pattern(return_type, actual_return, parameters, environment)
             }
             TypeNameKind::Unit => actual == Type::Unit,
             TypeNameKind::Path(path) => {
@@ -1335,13 +1457,7 @@ impl TypeRegistry {
                 else {
                     return false;
                 };
-                elements.len() == actual_elements.len()
-                    && elements
-                        .iter()
-                        .zip(actual_elements)
-                        .all(|(element, actual)| {
-                            self.infer_type_pattern(element, *actual, parameters, environment)
-                        })
+                self.infer_type_sequence(elements, actual_elements, parameters, environment)
             }
             TypeNameKind::Array { element, length } => {
                 let Some(definition) = self.definition(actual) else {
@@ -1360,7 +1476,82 @@ impl TypeRegistry {
             TypeNameKind::Generic { path, arguments } => {
                 self.infer_generic_type_pattern(path, arguments, actual, parameters, environment)
             }
+            TypeNameKind::PackExpansion { .. } => false,
         }
+    }
+
+    fn infer_type_sequence(
+        &self,
+        patterns: &[ast::TypeName],
+        actual: &[Type],
+        parameters: &[ast::GenericParameter],
+        environment: &mut GenericEnvironment,
+    ) -> bool {
+        let expansions = patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pattern)| {
+                matches!(pattern.kind, TypeNameKind::PackExpansion { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [] = expansions.as_slice() else {
+            let [expansion_index] = expansions.as_slice() else {
+                return false;
+            };
+            if actual.len() < patterns.len().saturating_sub(1) {
+                return false;
+            }
+            let suffix_len = patterns.len() - expansion_index - 1;
+            let pack_end = actual.len() - suffix_len;
+            if !patterns[..*expansion_index]
+                .iter()
+                .zip(&actual[..*expansion_index])
+                .all(|(pattern, actual)| {
+                    self.infer_type_pattern(pattern, *actual, parameters, environment)
+                })
+            {
+                return false;
+            }
+            let TypeNameKind::PackExpansion { pack, template } = &patterns[*expansion_index].kind
+            else {
+                return false;
+            };
+            let mut inferred = Vec::with_capacity(pack_end - expansion_index);
+            for actual_type in &actual[*expansion_index..pack_end] {
+                if let Some(template) = template {
+                    let mut element_environment = environment.clone();
+                    element_environment.types.remove(&pack.name);
+                    if !self.infer_type_pattern(
+                        template,
+                        *actual_type,
+                        parameters,
+                        &mut element_environment,
+                    ) {
+                        return false;
+                    }
+                    let Some(inferred_type) = element_environment.types.get(&pack.name).copied()
+                    else {
+                        return false;
+                    };
+                    inferred.push(inferred_type);
+                } else {
+                    inferred.push(*actual_type);
+                }
+            }
+            if !bind_type_pack_argument(environment, &pack.name, inferred) {
+                return false;
+            }
+            return patterns[expansion_index + 1..]
+                .iter()
+                .zip(&actual[pack_end..])
+                .all(|(pattern, actual)| {
+                    self.infer_type_pattern(pattern, *actual, parameters, environment)
+                });
+        };
+        patterns.len() == actual.len()
+            && patterns.iter().zip(actual).all(|(pattern, actual)| {
+                self.infer_type_pattern(pattern, *actual, parameters, environment)
+            })
     }
 
     fn infer_borrowed_type_pattern(
@@ -1424,13 +1615,89 @@ impl TypeRegistry {
             return false;
         };
         instance.base_name == name
-            && arguments.len() == instance.arguments.len()
-            && arguments
+            && self.infer_generic_argument_sequence(
+                arguments,
+                &instance.arguments,
+                parameters,
+                environment,
+            )
+    }
+
+    fn infer_generic_argument_sequence(
+        &self,
+        patterns: &[ast::GenericArgument],
+        actual: &[GenericValue],
+        parameters: &[ast::GenericParameter],
+        environment: &mut GenericEnvironment,
+    ) -> bool {
+        let expansions = patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pattern)| {
+                matches!(pattern, ast::GenericArgument::Pack { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [] = expansions.as_slice() else {
+            let [expansion_index] = expansions.as_slice() else {
+                return false;
+            };
+            if actual.len() < patterns.len().saturating_sub(1) {
+                return false;
+            }
+            let suffix_len = patterns.len() - expansion_index - 1;
+            let pack_end = actual.len() - suffix_len;
+            if !patterns[..*expansion_index]
                 .iter()
-                .zip(&instance.arguments)
-                .all(|(argument, actual)| {
-                    self.infer_generic_argument(argument, *actual, parameters, environment)
+                .zip(&actual[..*expansion_index])
+                .all(|(pattern, actual)| {
+                    self.infer_generic_argument(pattern, *actual, parameters, environment)
                 })
+            {
+                return false;
+            }
+            let ast::GenericArgument::Pack { pack, template, .. } = &patterns[*expansion_index]
+            else {
+                return false;
+            };
+            let mut inferred = Vec::with_capacity(pack_end - expansion_index);
+            for actual_value in &actual[*expansion_index..pack_end] {
+                let GenericValue::Type(actual_type) = actual_value else {
+                    return false;
+                };
+                if let Some(template) = template {
+                    let mut element_environment = environment.clone();
+                    element_environment.types.remove(&pack.name);
+                    if !self.infer_type_pattern(
+                        template,
+                        *actual_type,
+                        parameters,
+                        &mut element_environment,
+                    ) {
+                        return false;
+                    }
+                    let Some(inferred_type) = element_environment.types.get(&pack.name).copied()
+                    else {
+                        return false;
+                    };
+                    inferred.push(inferred_type);
+                } else {
+                    inferred.push(*actual_type);
+                }
+            }
+            if !bind_type_pack_argument(environment, &pack.name, inferred) {
+                return false;
+            }
+            return patterns[expansion_index + 1..]
+                .iter()
+                .zip(&actual[pack_end..])
+                .all(|(pattern, actual)| {
+                    self.infer_generic_argument(pattern, *actual, parameters, environment)
+                });
+        };
+        patterns.len() == actual.len()
+            && patterns.iter().zip(actual).all(|(pattern, actual)| {
+                self.infer_generic_argument(pattern, *actual, parameters, environment)
+            })
     }
 
     fn infer_generic_argument(
@@ -1471,17 +1738,61 @@ impl TypeRegistry {
     ) -> bool {
         let mut valid = true;
         for parameter in parameters {
-            let ast::GenericParameter::Type { name, bounds, .. } = parameter else {
-                continue;
-            };
-            let Some(ty) = environment.types.get(&name.name).copied() else {
-                continue;
-            };
-            for bound in bounds {
-                valid &= self.validate_bound(ty, bound, span, diagnostics);
+            match parameter {
+                ast::GenericParameter::Type { name, bounds, .. } => {
+                    let Some(ty) = environment.types.get(&name.name).copied() else {
+                        continue;
+                    };
+                    for bound in bounds {
+                        valid &= self.validate_bound(ty, bound, span, diagnostics);
+                    }
+                }
+                ast::GenericParameter::TypePack { name, bounds, .. } => {
+                    let Some(types) = environment.type_packs.get(&name.name) else {
+                        continue;
+                    };
+                    for ty in types {
+                        for bound in bounds {
+                            valid &= self.validate_bound(*ty, bound, span, diagnostics);
+                        }
+                    }
+                }
+                ast::GenericParameter::Const { .. } => {}
             }
         }
         for predicate in where_predicates {
+            if let TypeNameKind::PackExpansion { pack, template } = &predicate.ty.kind {
+                let Some(types) = environment.type_packs.get(&pack.name).cloned() else {
+                    diagnostics.push(Diagnostic::error(
+                        "E6020",
+                        format!("unknown type pack `{}`", pack.name),
+                        pack.span,
+                    ));
+                    valid = false;
+                    continue;
+                };
+                for pack_type in types {
+                    let ty = if let Some(template) = template {
+                        let mut element_environment = environment.clone();
+                        element_environment
+                            .types
+                            .insert(pack.name.clone(), pack_type);
+                        let Some(ty) =
+                            self.resolve_type_name_in(template, &element_environment, diagnostics)
+                        else {
+                            valid = false;
+                            continue;
+                        };
+                        ty
+                    } else {
+                        pack_type
+                    };
+                    for bound in &predicate.bounds {
+                        valid &= self.validate_bound(ty, bound, predicate.span, diagnostics);
+                    }
+                }
+                continue;
+            }
             let Some(ty) = self.resolve_type_name_in(&predicate.ty, environment, diagnostics)
             else {
                 valid = false;
@@ -1911,27 +2222,41 @@ impl TypeRegistry {
                 let name = single_path_name(path)?;
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
-                    let value = match argument {
+                    match argument {
                         ast::GenericArgument::Type(ty) => {
                             if let TypeNameKind::Path(path) = &ty.kind
                                 && let Some(name) = single_path_name(path)
                                 && let Some(value) = environment.constants.get(name)
                             {
-                                GenericValue::Const(*value)
+                                values.push(GenericValue::Const(*value));
                             } else {
-                                GenericValue::Type(self.resolve_existing_type(ty, environment)?)
+                                values.push(GenericValue::Type(
+                                    self.resolve_existing_type(ty, environment)?,
+                                ));
                             }
                         }
                         ast::GenericArgument::Const(value) => {
                             let mut diagnostics = Vec::new();
-                            GenericValue::Const(evaluate_array_length_in(
+                            values.push(GenericValue::Const(evaluate_array_length_in(
                                 value,
                                 environment,
                                 &mut diagnostics,
-                            )?)
+                            )?));
                         }
-                    };
-                    values.push(value);
+                        ast::GenericArgument::Pack { pack, template, .. } => {
+                            for ty in environment.type_packs.get(&pack.name)? {
+                                if let Some(template) = template {
+                                    let mut element_environment = environment.clone();
+                                    element_environment.types.insert(pack.name.clone(), *ty);
+                                    values.push(GenericValue::Type(
+                                        self.resolve_existing_type(template, &element_environment)?,
+                                    ));
+                                } else {
+                                    values.push(GenericValue::Type(*ty));
+                                }
+                            }
+                        }
+                    }
                 }
                 self.generic_instances
                     .get(&GenericTypeKey {
@@ -1941,7 +2266,8 @@ impl TypeRegistry {
                     .copied()
             }
             TypeNameKind::Unit => Some(Type::Unit),
-            TypeNameKind::Tuple(_)
+            TypeNameKind::PackExpansion { .. }
+            | TypeNameKind::Tuple(_)
             | TypeNameKind::Array { .. }
             | TypeNameKind::Slice(_)
             | TypeNameKind::Reference { .. }
@@ -2505,6 +2831,11 @@ impl TypeRegistry {
                         self.type_name_may_be_scoped_at_depth(ty, depth + 1)
                     }
                     ast::GenericArgument::Const(_) => false,
+                    ast::GenericArgument::Pack { template, .. } => {
+                        template.as_ref().is_some_and(|template| {
+                            self.type_name_may_be_scoped_at_depth(template, depth + 1)
+                        })
+                    }
                 }) {
                     return true;
                 }
@@ -2542,6 +2873,9 @@ impl TypeRegistry {
             TypeNameKind::Tuple(elements) => elements
                 .iter()
                 .any(|element| self.type_name_may_be_scoped_at_depth(element, depth + 1)),
+            TypeNameKind::PackExpansion { template, .. } => template
+                .as_ref()
+                .is_some_and(|template| self.type_name_may_be_scoped_at_depth(template, depth + 1)),
             TypeNameKind::Array { element, .. } => {
                 self.type_name_may_be_scoped_at_depth(element, depth + 1)
             }
@@ -4035,7 +4369,13 @@ impl Resolver {
         explicit_parameter_start: usize,
         is_public: bool,
     ) {
-        validate_generic_parameter_names(&parameters, &mut self.diagnostics);
+        if explicit_parameter_start == 0 {
+            validate_generic_parameter_names(&parameters, &mut self.diagnostics);
+        } else {
+            let (implicit, explicit) = parameters.split_at(explicit_parameter_start);
+            validate_generic_parameter_names(implicit, &mut self.diagnostics);
+            validate_generic_parameter_names(explicit, &mut self.diagnostics);
+        }
         if self.signatures.contains_key(&resolved_name)
             || self
                 .generic_functions
@@ -5104,6 +5444,19 @@ impl<'context> FunctionAnalyzer<'context> {
             AstExpression::Assignment(expression) => self.analyze_assignment(expression),
             AstExpression::Cast(expression) => self.analyze_cast(expression),
             AstExpression::Tuple(expression) => self.analyze_tuple(expression, expected),
+            AstExpression::PackExpansion(expansion) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6021",
+                        "a value pack can only expand directly inside a tuple or array",
+                        expansion.span,
+                    )
+                    .with_help(
+                        "place the expansion in `( ...Pack => expression, )` or `[...Pack => expression]`",
+                    ),
+                );
+                invalid_composite_expression(expansion.span)
+            }
             AstExpression::Array(expression) => self.analyze_array(expression, expected),
             AstExpression::Struct(expression) => self.analyze_struct(expression, expected),
             AstExpression::Field(expression) => self.analyze_field(expression),
@@ -5212,32 +5565,64 @@ impl<'context> FunctionAnalyzer<'context> {
             };
             Some(elements.clone())
         });
-        if let Some(elements) = &expected_elements
-            && elements.len() != tuple.elements.len()
+        let mut elements = Vec::new();
+        for element in &tuple.elements {
+            if let AstExpression::PackExpansion(expansion) = element {
+                let Some(pack_types) = self
+                    .generic_environment
+                    .type_packs
+                    .get(&expansion.pack.name)
+                    .cloned()
+                else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "E6021",
+                            format!("unknown type pack `{}`", expansion.pack.name),
+                            expansion.pack.span,
+                        )
+                        .with_help("declare the pack with `<...Types>`"),
+                    );
+                    continue;
+                };
+                for pack_type in pack_types {
+                    let previous = self
+                        .generic_environment
+                        .types
+                        .insert(expansion.pack.name.clone(), pack_type);
+                    let expected_element = expected_elements
+                        .as_ref()
+                        .and_then(|types| types.get(elements.len()).copied());
+                    elements.push(
+                        self.analyze_expression_expected(&expansion.template, expected_element),
+                    );
+                    if let Some(previous) = previous {
+                        self.generic_environment
+                            .types
+                            .insert(expansion.pack.name.clone(), previous);
+                    } else {
+                        self.generic_environment.types.remove(&expansion.pack.name);
+                    }
+                }
+            } else {
+                let expected_element = expected_elements
+                    .as_ref()
+                    .and_then(|types| types.get(elements.len()).copied());
+                elements.push(self.analyze_expression_expected(element, expected_element));
+            }
+        }
+        if let Some(expected_elements) = &expected_elements
+            && expected_elements.len() != elements.len()
         {
             self.diagnostics.push(Diagnostic::error(
                 "E3115",
                 format!(
                     "tuple requires {} element(s), found {}",
-                    elements.len(),
-                    tuple.elements.len()
+                    expected_elements.len(),
+                    elements.len()
                 ),
                 tuple.span,
             ));
         }
-        let elements: Vec<_> = tuple
-            .elements
-            .iter()
-            .enumerate()
-            .map(|(index, element)| {
-                self.analyze_expression_expected(
-                    element,
-                    expected_elements
-                        .as_ref()
-                        .and_then(|types| types.get(index).copied()),
-                )
-            })
-            .collect();
         let ty = expected
             .filter(|ty| matches!(ty, Type::Tuple(_)))
             .or_else(|| {
@@ -5283,28 +5668,65 @@ impl<'context> FunctionAnalyzer<'context> {
             };
             Some((element, length))
         });
+        let mut elements = Vec::with_capacity(array_elements.len());
+        let mut element_type = expected_shape.map(|shape| shape.0);
+        for element in array_elements {
+            if let AstExpression::PackExpansion(expansion) = element {
+                let Some(pack_types) = self
+                    .generic_environment
+                    .type_packs
+                    .get(&expansion.pack.name)
+                    .cloned()
+                else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E6021",
+                        format!("unknown type pack `{}`", expansion.pack.name),
+                        expansion.pack.span,
+                    ));
+                    continue;
+                };
+                for pack_type in pack_types {
+                    let previous = self
+                        .generic_environment
+                        .types
+                        .insert(expansion.pack.name.clone(), pack_type);
+                    let analyzed =
+                        self.analyze_expression_expected(&expansion.template, element_type);
+                    if let Some(expected) = element_type {
+                        self.require_type(expected, analyzed.ty, analyzed.span, "array element");
+                    } else {
+                        element_type = Some(analyzed.ty);
+                    }
+                    elements.push(analyzed);
+                    if let Some(previous) = previous {
+                        self.generic_environment
+                            .types
+                            .insert(expansion.pack.name.clone(), previous);
+                    } else {
+                        self.generic_environment.types.remove(&expansion.pack.name);
+                    }
+                }
+            } else {
+                let analyzed = self.analyze_expression_expected(element, element_type);
+                if let Some(expected) = element_type {
+                    self.require_type(expected, analyzed.ty, analyzed.span, "array element");
+                } else {
+                    element_type = Some(analyzed.ty);
+                }
+                elements.push(analyzed);
+            }
+        }
         if let Some((_, length)) = expected_shape
-            && usize::try_from(length).ok() != Some(array_elements.len())
+            && usize::try_from(length).ok() != Some(elements.len())
         {
             self.diagnostics.push(Diagnostic::error(
                 "E3116",
                 format!(
                     "array requires {length} element(s), found {}",
-                    array_elements.len()
+                    elements.len()
                 ),
                 span,
             ));
-        }
-        let mut elements = Vec::with_capacity(array_elements.len());
-        let mut element_type = expected_shape.map(|shape| shape.0);
-        for element in array_elements {
-            let analyzed = self.analyze_expression_expected(element, element_type);
-            if let Some(expected) = element_type {
-                self.require_type(expected, analyzed.ty, analyzed.span, "array element");
-            } else {
-                element_type = Some(analyzed.ty);
-            }
-            elements.push(analyzed);
         }
         let Some(element_type) = element_type else {
             self.diagnostics.push(
@@ -5321,7 +5743,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 span,
             };
         };
-        let length = u64::try_from(array_elements.len()).unwrap_or(u64::MAX);
+        let length = u64::try_from(elements.len()).unwrap_or(u64::MAX);
         let ty = expected
             .filter(|ty| matches!(ty, Type::Array(_)))
             .or_else(|| {
@@ -6526,6 +6948,11 @@ impl<'context> FunctionAnalyzer<'context> {
         expected_return: Option<Type>,
     ) -> Option<Expression> {
         if let Some(expression) =
+            self.analyze_tuple_type_access_method(call, field, method, expected_return)
+        {
+            return Some(expression);
+        }
+        if let Some(expression) =
             self.analyze_format_push_method(call, field, method, expected_return)
         {
             return Some(expression);
@@ -6546,6 +6973,266 @@ impl<'context> FunctionAnalyzer<'context> {
             return Some(expression);
         }
         self.analyze_slice_access_method(call, field, method, expected_return)
+    }
+
+    fn analyze_tuple_type_access_method(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        if method.name == "assert_unique_types" {
+            return self.analyze_tuple_unique_types(call, field);
+        }
+        let (mutable_first, returns_tuple) = match method.name.as_str() {
+            "get_type" => (false, false),
+            "get_type_mut" => (true, false),
+            "split_type_mut" => (true, true),
+            _ => return None,
+        };
+        let receiver_type = self.place_expression_type(&field.base)?;
+        let tuple_elements = self.tuple_elements(receiver_type)?;
+        if !call.arguments.is_empty() {
+            for argument in &call.arguments {
+                self.analyze_expression(argument);
+            }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6022",
+                    format!("`{}` accepts only compile-time type arguments", method.name),
+                    call.span,
+                )
+                .with_help(format!("write `tuple.{}<Type>()`", method.name)),
+            );
+            return Some(invalid_composite_expression(call.span));
+        }
+        let Some(requested) = self.resolve_tuple_type_requests(call, method, returns_tuple) else {
+            return Some(invalid_composite_expression(call.span));
+        };
+
+        let Some(selected) = self.select_tuple_type_fields(&tuple_elements, &requested, call.span)
+        else {
+            return Some(invalid_composite_expression(call.span));
+        };
+
+        self.require_expression_root_available(&field.base, call.span);
+        if mutable_first {
+            self.require_mutable_place(&field.base);
+        }
+        self.check_and_record_borrow(&field.base, mutable_first, call.span);
+
+        let Some(borrowed) =
+            self.borrow_tuple_type_fields(field, &selected, mutable_first, call.span)
+        else {
+            return Some(invalid_composite_expression(call.span));
+        };
+        if !returns_tuple {
+            let mut result = borrowed
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| invalid_composite_expression(call.span));
+            if let Some(expected) = expected_return {
+                self.require_type(expected, result.ty, call.span, "tuple type access");
+            }
+            result.span = call.span;
+            return Some(result);
+        }
+        let result_type = self
+            .types
+            .intern_tuple(
+                borrowed.iter().map(|value| value.ty).collect(),
+                call.span,
+                self.diagnostics,
+            )
+            .unwrap_or(Type::Unit);
+        if let Some(expected) = expected_return {
+            self.require_type(expected, result_type, call.span, "tuple type split");
+        }
+        Some(Expression {
+            kind: ExpressionKind::Tuple(borrowed),
+            ty: result_type,
+            span: call.span,
+        })
+    }
+
+    fn analyze_tuple_unique_types(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+    ) -> Option<Expression> {
+        let receiver_type = self.place_expression_type(&field.base)?;
+        let tuple_elements = self.tuple_elements(receiver_type)?;
+        if !call.arguments.is_empty() || !call.generic_arguments.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6022",
+                    "`assert_unique_types` does not accept arguments",
+                    call.span,
+                )
+                .with_help("write `tuple.assert_unique_types()`"),
+            );
+        }
+        let mut seen = HashSet::new();
+        for element in tuple_elements {
+            if !seen.insert(element) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6022",
+                        format!("tuple contains type `{element}` more than once"),
+                        call.span,
+                    )
+                    .with_help("heterogeneous type-addressable tuples require unique types"),
+                );
+            }
+        }
+        Some(Expression {
+            kind: ExpressionKind::Unit,
+            ty: Type::Unit,
+            span: call.span,
+        })
+    }
+
+    fn resolve_tuple_type_requests(
+        &mut self,
+        call: &ast::CallExpression,
+        method: &ast::Identifier,
+        returns_tuple: bool,
+    ) -> Option<Vec<Type>> {
+        let values = self.types.resolve_generic_argument_values(
+            &call.generic_arguments,
+            &self.generic_environment,
+            self.diagnostics,
+        )?;
+        let Some(requested) = values
+            .into_iter()
+            .map(|value| match value {
+                GenericValue::Type(ty) => Some(ty),
+                GenericValue::Const(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6022",
+                    "tuple type access accepts only type arguments",
+                    call.span,
+                )
+                .with_help("remove const arguments from the method call"),
+            );
+            return None;
+        };
+        let expected_count = if returns_tuple { None } else { Some(1) };
+        if requested.is_empty() || expected_count.is_some_and(|count| requested.len() != count) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6022",
+                    if returns_tuple {
+                        "`split_type_mut` requires at least one requested type".to_owned()
+                    } else {
+                        format!("`{}` requires exactly one requested type", method.name)
+                    },
+                    call.span,
+                )
+                .with_help("provide the requested tuple element types between `<` and `>`"),
+            );
+            return None;
+        }
+        Some(requested)
+    }
+
+    fn select_tuple_type_fields(
+        &mut self,
+        tuple_elements: &[Type],
+        requested: &[Type],
+        span: Span,
+    ) -> Option<Vec<usize>> {
+        let mut selected = Vec::with_capacity(requested.len());
+        let mut selected_set = HashSet::with_capacity(requested.len());
+        for requested_type in requested {
+            let mut matched = None;
+            let mut duplicate = false;
+            for (index, element) in tuple_elements.iter().enumerate() {
+                if element == requested_type {
+                    duplicate = matched.replace(index).is_some();
+                    if duplicate {
+                        break;
+                    }
+                }
+            }
+            let Some(index) = matched else {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6022",
+                        format!("tuple does not contain `{requested_type}`"),
+                        span,
+                    )
+                    .with_help("each type-addressable tuple element must be unique"),
+                );
+                return None;
+            };
+            if duplicate {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6022",
+                        format!("tuple contains `{requested_type}` more than once"),
+                        span,
+                    )
+                    .with_help("each type-addressable tuple element must be unique"),
+                );
+                return None;
+            }
+            if !selected_set.insert(index) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6022",
+                        format!("type `{requested_type}` is requested more than once"),
+                        span,
+                    )
+                    .with_help("request each tuple element at most once"),
+                );
+                return None;
+            }
+            selected.push(index);
+        }
+        Some(selected)
+    }
+
+    fn borrow_tuple_type_fields(
+        &mut self,
+        field: &ast::FieldExpression,
+        selected: &[usize],
+        mutable_first: bool,
+        span: Span,
+    ) -> Option<Vec<Expression>> {
+        let mut borrowed = Vec::with_capacity(selected.len());
+        for (request_index, field_index) in selected.iter().copied().enumerate() {
+            let field_number = u32::try_from(field_index).ok()?;
+            let element_expression = AstExpression::Field(Box::new(ast::FieldExpression {
+                base: field.base.clone(),
+                field: ast::FieldName::TupleIndex {
+                    index: field_number,
+                    span,
+                },
+                span,
+            }));
+            let place = self.analyze_place(&element_expression)?;
+            let mutable = mutable_first && request_index == 0;
+            let reference_type = self
+                .types
+                .intern_reference(place.ty, mutable, span, self.diagnostics)
+                .unwrap_or(Type::Unit);
+            borrowed.push(Expression {
+                kind: ExpressionKind::Borrow {
+                    place,
+                    mutable,
+                    slice_length: None,
+                },
+                ty: reference_type,
+                span,
+            });
+        }
+        Some(borrowed)
     }
 
     fn analyze_format_push_method(
@@ -9475,7 +10162,10 @@ impl<'context> FunctionAnalyzer<'context> {
         parameters: &[ast::GenericParameter],
         environment: &mut GenericEnvironment,
     ) {
-        if call.generic_arguments.len() > parameters.len() {
+        let has_pack = parameters
+            .iter()
+            .any(|parameter| matches!(parameter, ast::GenericParameter::TypePack { .. }));
+        if !has_pack && call.generic_arguments.len() > parameters.len() {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
@@ -9489,67 +10179,60 @@ impl<'context> FunctionAnalyzer<'context> {
                 .with_help("remove the extra generic arguments"),
             );
         }
-        for (parameter, argument) in parameters.iter().zip(&call.generic_arguments) {
-            match (parameter, argument) {
-                (ast::GenericParameter::Type { name, .. }, ast::GenericArgument::Type(ty)) => {
-                    if let Some(resolved) = self.types.resolve_type_name_in(
-                        ty,
-                        &self.generic_environment,
-                        self.diagnostics,
-                    ) {
-                        environment.types.insert(name.name.clone(), resolved);
+        let Some(values) = self.types.resolve_generic_argument_values(
+            &call.generic_arguments,
+            &self.generic_environment,
+            self.diagnostics,
+        ) else {
+            return;
+        };
+        let mut value_index = 0;
+        for parameter in parameters {
+            match parameter {
+                ast::GenericParameter::Type { name, .. } => match values.get(value_index) {
+                    Some(GenericValue::Type(ty)) => {
+                        environment.types.insert(name.name.clone(), *ty);
+                        value_index += 1;
                     }
-                }
-                (ast::GenericParameter::Const { name, .. }, ast::GenericArgument::Const(value)) => {
-                    if let Some(resolved) =
-                        evaluate_array_length_in(value, &self.generic_environment, self.diagnostics)
-                    {
-                        environment.constants.insert(name.name.clone(), resolved);
+                    Some(GenericValue::Const(_)) => self.diagnostics.push(
+                        Diagnostic::error("E6004", "expected a type generic argument", call.span)
+                            .with_help("provide a type name at this position"),
+                    ),
+                    None => break,
+                },
+                ast::GenericParameter::TypePack { name, .. } => {
+                    if value_index == values.len() && call.generic_arguments.is_empty() {
+                        continue;
                     }
-                }
-                (
-                    ast::GenericParameter::Const { name, .. },
-                    ast::GenericArgument::Type(ast::TypeName {
-                        kind: TypeNameKind::Path(path),
-                        ..
-                    }),
-                ) => {
-                    let value = single_path_name(path)
-                        .and_then(|name| self.generic_environment.constants.get(name))
-                        .copied();
-                    if let Some(value) = value {
-                        environment.constants.insert(name.name.clone(), value);
-                    } else {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "E6004",
-                                "const generic argument is not a known constant",
-                                argument.span(),
-                            )
-                            .with_help("use an integer expression or a bound const parameter"),
-                        );
+                    let mut types = Vec::new();
+                    for value in &values[value_index..] {
+                        let GenericValue::Type(ty) = value else {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "E6020",
+                                    format!("type pack `{}` received a const argument", name.name),
+                                    call.span,
+                                )
+                                .with_help("type packs accept only type arguments"),
+                            );
+                            return;
+                        };
+                        types.push(*ty);
                     }
+                    environment.type_packs.insert(name.name.clone(), types);
+                    value_index = values.len();
                 }
-                (ast::GenericParameter::Type { .. }, ast::GenericArgument::Const(_)) => {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            "E6004",
-                            "expected a type generic argument",
-                            argument.span(),
-                        )
-                        .with_help("provide a type name at this position"),
-                    );
-                }
-                (ast::GenericParameter::Const { .. }, ast::GenericArgument::Type(_)) => {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            "E6004",
-                            "expected a const generic argument",
-                            argument.span(),
-                        )
-                        .with_help("provide an integer expression at this position"),
-                    );
-                }
+                ast::GenericParameter::Const { name, .. } => match values.get(value_index) {
+                    Some(GenericValue::Const(value)) => {
+                        environment.constants.insert(name.name.clone(), *value);
+                        value_index += 1;
+                    }
+                    Some(GenericValue::Type(_)) => self.diagnostics.push(
+                        Diagnostic::error("E6004", "expected a const generic argument", call.span)
+                            .with_help("provide an integer expression at this position"),
+                    ),
+                    None => break,
+                },
             }
         }
     }
@@ -9619,6 +10302,16 @@ impl<'context> FunctionAnalyzer<'context> {
         let key = GenericFunctionKey {
             resolved_name: template.resolved_name.clone(),
             arguments: values,
+            pack_lengths: template
+                .parameters
+                .iter()
+                .filter_map(|parameter| {
+                    let ast::GenericParameter::TypePack { name, .. } = parameter else {
+                        return None;
+                    };
+                    Some(environment.type_packs.get(&name.name).map_or(0, Vec::len))
+                })
+                .collect(),
         };
         if let Some(signature) = self.generic_functions.instances.get(&key) {
             return Some(signature.clone());
@@ -9706,6 +10399,23 @@ impl<'context> FunctionAnalyzer<'context> {
                             )
                             .with_help(
                                 "use the parameter in an argument or provide an expected return type",
+                            ),
+                        );
+                    }
+                }
+                ast::GenericParameter::TypePack { name, .. } => {
+                    if let Some(types) = environment.type_packs.get(&name.name) {
+                        values.extend(types.iter().copied().map(GenericValue::Type));
+                    } else {
+                        complete = false;
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "E6020",
+                                format!("cannot infer generic type pack `{}`", name.name),
+                                span,
+                            )
+                            .with_help(
+                                "use the pack in a tuple parameter or provide explicit type arguments",
                             ),
                         );
                     }
@@ -10904,7 +11614,7 @@ fn validate_generic_parameter_names(
 ) {
     let mut names = HashMap::new();
     let mut saw_default = false;
-    for parameter in parameters {
+    for (index, parameter) in parameters.iter().enumerate() {
         let name = parameter.name();
         if names.insert(name.name.as_str(), name.span).is_some() {
             diagnostics.push(Diagnostic::error(
@@ -10919,7 +11629,20 @@ fn validate_generic_parameter_names(
         let has_default = match parameter {
             ast::GenericParameter::Type { default, .. } => default.is_some(),
             ast::GenericParameter::Const { default, .. } => default.is_some(),
+            ast::GenericParameter::TypePack { .. } => false,
         };
+        if matches!(parameter, ast::GenericParameter::TypePack { .. })
+            && index + 1 != parameters.len()
+        {
+            diagnostics.push(
+                Diagnostic::error(
+                    "E6020",
+                    "a type pack must be the final generic parameter",
+                    parameter.span(),
+                )
+                .with_help("move `<...Types>` to the end of the generic parameter list"),
+            );
+        }
         if saw_default && !has_default {
             diagnostics.push(
                 Diagnostic::error(
@@ -10939,6 +11662,9 @@ fn generic_type_parameter(parameters: &[ast::GenericParameter], name: &str) -> b
         matches!(
             parameter,
             ast::GenericParameter::Type {
+                name: parameter_name,
+                ..
+            } | ast::GenericParameter::TypePack {
                 name: parameter_name,
                 ..
             } if parameter_name.name == name
@@ -10963,6 +11689,19 @@ fn bind_type_argument(environment: &mut GenericEnvironment, name: &str, ty: Type
         *existing == ty
     } else {
         environment.types.insert(name.to_owned(), ty);
+        true
+    }
+}
+
+fn bind_type_pack_argument(
+    environment: &mut GenericEnvironment,
+    name: &str,
+    types: Vec<Type>,
+) -> bool {
+    if let Some(existing) = environment.type_packs.get(name) {
+        existing == &types
+    } else {
+        environment.type_packs.insert(name.to_owned(), types);
         true
     }
 }
@@ -11026,7 +11765,39 @@ fn type_pattern_is_bound(
                 ast::GenericArgument::Const(value) => {
                     const_pattern_is_bound(value, parameters, environment)
                 }
+                ast::GenericArgument::Pack { pack, template, .. } => {
+                    environment.type_packs.contains_key(&pack.name)
+                        && template.as_ref().is_none_or(|template| {
+                            let mut element_environment = environment.clone();
+                            environment
+                                .type_packs
+                                .get(&pack.name)
+                                .and_then(|types| types.first())
+                                .is_none_or(|ty| {
+                                    element_environment.types.insert(pack.name.clone(), *ty);
+                                    type_pattern_is_bound(
+                                        template,
+                                        parameters,
+                                        &element_environment,
+                                    )
+                                })
+                        })
+                }
             })
+        }
+        TypeNameKind::PackExpansion { pack, template } => {
+            environment.type_packs.contains_key(&pack.name)
+                && template.as_ref().is_none_or(|template| {
+                    let mut element_environment = environment.clone();
+                    environment
+                        .type_packs
+                        .get(&pack.name)
+                        .and_then(|types| types.first())
+                        .is_none_or(|ty| {
+                            element_environment.types.insert(pack.name.clone(), *ty);
+                            type_pattern_is_bound(template, parameters, &element_environment)
+                        })
+                })
         }
         TypeNameKind::Tuple(elements) => elements
             .iter()
@@ -11322,9 +12093,22 @@ fn validate_comptime_type(type_name: &ast::TypeName, diagnostics: &mut Vec<Diagn
         ),
         TypeNameKind::Generic { arguments, .. } => {
             for argument in arguments {
-                if let ast::GenericArgument::Type(type_name) = argument {
-                    validate_comptime_type(type_name, diagnostics);
+                match argument {
+                    ast::GenericArgument::Type(type_name) => {
+                        validate_comptime_type(type_name, diagnostics);
+                    }
+                    ast::GenericArgument::Pack { template, .. } => {
+                        if let Some(template) = template {
+                            validate_comptime_type(template, diagnostics);
+                        }
+                    }
+                    ast::GenericArgument::Const(_) => {}
                 }
+            }
+        }
+        TypeNameKind::PackExpansion { template, .. } => {
+            if let Some(template) = template {
+                validate_comptime_type(template, diagnostics);
             }
         }
         TypeNameKind::Tuple(elements) => {
@@ -11414,6 +12198,9 @@ fn validate_comptime_expression(
             for element in &tuple.elements {
                 validate_comptime_expression(element, comptime_functions, diagnostics);
             }
+        }
+        AstExpression::PackExpansion(expansion) => {
+            validate_comptime_expression(&expansion.template, comptime_functions, diagnostics);
         }
         AstExpression::Array(array) => {
             validate_comptime_array(array, comptime_functions, diagnostics);
@@ -11970,6 +12757,12 @@ fn type_pattern_key(type_name: &ast::TypeName) -> String {
                 .map(|argument| match argument {
                     ast::GenericArgument::Type(ty) => type_pattern_key(ty),
                     ast::GenericArgument::Const(value) => const_expression_key(value),
+                    ast::GenericArgument::Pack { pack, template, .. } => {
+                        template.as_ref().map_or_else(
+                            || format!("...{}", pack.name),
+                            |template| format!("...{}=>{}", pack.name, type_pattern_key(template)),
+                        )
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(",");
@@ -12001,6 +12794,10 @@ fn type_pattern_key(type_name: &ast::TypeName) -> String {
             "*{} {}",
             if *mutable { "mut" } else { "const" },
             type_pattern_key(target)
+        ),
+        TypeNameKind::PackExpansion { pack, template } => template.as_ref().map_or_else(
+            || format!("...{}", pack.name),
+            |template| format!("...{}=>{}", pack.name, type_pattern_key(template)),
         ),
     }
 }
@@ -12089,7 +12886,8 @@ fn type_constructor_name(type_name: &ast::TypeName) -> Option<&str> {
         | TypeNameKind::Array { .. }
         | TypeNameKind::Slice(_)
         | TypeNameKind::Reference { .. }
-        | TypeNameKind::RawPointer { .. } => None,
+        | TypeNameKind::RawPointer { .. }
+        | TypeNameKind::PackExpansion { .. } => None,
     }
 }
 
@@ -12163,6 +12961,7 @@ fn initializer_stores_borrow(expression: &AstExpression) -> bool {
             .iter()
             .any(|field| initializer_stores_borrow(&field.value)),
         AstExpression::Tuple(tuple) => tuple.elements.iter().any(initializer_stores_borrow),
+        AstExpression::PackExpansion(expansion) => initializer_stores_borrow(&expansion.template),
         AstExpression::Array(array) => match &array.kind {
             ast::ArrayExpressionKind::List(elements) => {
                 elements.iter().any(initializer_stores_borrow)
@@ -12693,6 +13492,77 @@ mod tests {
                 .count()
                 == 2
         );
+    }
+
+    #[test]
+    fn resolve_should_expand_variadic_type_packs_and_mapped_tuple_types() {
+        let source = "
+            struct Slot<T> { value: T }
+            struct Registry<...Types> { slots: (...Types => Slot<Types>) }
+            fn forward<...Types>(values: (...Types)) -> (...Types) { values }
+            fn main() -> i32 {
+                let registry: Registry<i32, bool> = Registry {
+                    slots: (Slot { value: 42 }, Slot { value: true }),
+                };
+                let values: (i32, bool) = forward((registry.slots.0.value, true));
+                values.0
+            }
+        ";
+
+        let program = resolve_fixture(source).expect("variadic fixture should resolve");
+
+        assert!(program.types.iter().any(|definition| {
+            definition
+                .name
+                .as_deref()
+                .is_some_and(|name| name == "Registry<i32, bool>")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_expand_variadic_value_templates() {
+        let source = "
+            struct Marker<T> { value: i32 }
+            fn make_marker<T>() -> Marker<T> { Marker { value: 21 } }
+            fn markers<...Types>() -> (...Types => Marker<Types>) {
+                (...Types => make_marker<Types>(),)
+            }
+            fn main() -> i32 {
+                let values: (Marker<i32>, Marker<bool>) = markers<i32, bool>();
+                values.0.value + values.1.value
+            }
+        ";
+
+        resolve_fixture(source).expect("value pack fixture should resolve");
+    }
+
+    #[test]
+    fn resolve_should_reject_non_final_type_packs() {
+        let diagnostics = resolve_fixture(
+            "struct Invalid<...Types, Tail> { value: Tail }
+             fn main() -> i32 { 0 }",
+        )
+        .expect_err("non-final pack should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6020" && diagnostic.message.contains("final")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_reject_ambiguous_type_addressable_tuples() {
+        let diagnostics = resolve_fixture(
+            "fn main() -> i32 {
+                 let values: (i32, i32) = (20, 22);
+                 values.assert_unique_types();
+                 0
+             }",
+        )
+        .expect_err("duplicate tuple types should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6022" && diagnostic.message.contains("more than once")
+        }));
     }
 
     #[test]

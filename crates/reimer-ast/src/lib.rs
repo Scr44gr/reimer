@@ -348,6 +348,15 @@ pub enum GenericParameter {
         /// Full parameter span.
         span: Span,
     },
+    /// A variadic sequence of type parameters.
+    TypePack {
+        /// Pack name.
+        name: Identifier,
+        /// Traits required for every type in the pack.
+        bounds: Vec<Path>,
+        /// Full parameter span.
+        span: Span,
+    },
     /// A compile-time integer or boolean parameter.
     Const {
         /// Parameter name.
@@ -366,7 +375,9 @@ impl GenericParameter {
     #[must_use]
     pub fn name(&self) -> &Identifier {
         match self {
-            Self::Type { name, .. } | Self::Const { name, .. } => name,
+            Self::Type { name, .. } | Self::TypePack { name, .. } | Self::Const { name, .. } => {
+                name
+            }
         }
     }
 
@@ -374,7 +385,9 @@ impl GenericParameter {
     #[must_use]
     pub fn span(&self) -> Span {
         match self {
-            Self::Type { span, .. } | Self::Const { span, .. } => *span,
+            Self::Type { span, .. } | Self::TypePack { span, .. } | Self::Const { span, .. } => {
+                *span
+            }
         }
     }
 }
@@ -460,6 +473,13 @@ pub enum TypeNameKind {
         /// Type and constant arguments in source order.
         arguments: Vec<GenericArgument>,
     },
+    /// A type-pack expansion, optionally mapped through a type template.
+    PackExpansion {
+        /// Bound type-pack name.
+        pack: Identifier,
+        /// Per-element mapping. Without a mapping, expands to the pack types.
+        template: Option<Box<TypeName>>,
+    },
     /// The unit type `()`.
     Unit,
     /// A tuple type `(A, B, ...)`.
@@ -496,6 +516,15 @@ pub enum GenericArgument {
     Type(TypeName),
     /// A compile-time value argument.
     Const(Expression),
+    /// A type pack expanded into zero or more generic arguments.
+    Pack {
+        /// Bound type-pack name.
+        pack: Identifier,
+        /// Per-element mapping. Without a mapping, forwards the pack types.
+        template: Option<TypeName>,
+        /// Full argument span.
+        span: Span,
+    },
 }
 
 impl GenericArgument {
@@ -505,6 +534,7 @@ impl GenericArgument {
         match self {
             Self::Type(ty) => ty.span,
             Self::Const(expression) => expression.span(),
+            Self::Pack { span, .. } => *span,
         }
     }
 }
@@ -637,6 +667,8 @@ pub enum Expression {
     Unit(Span),
     /// A tuple literal.
     Tuple(TupleExpression),
+    /// A compile-time value-pack expansion inside an aggregate.
+    PackExpansion(Box<PackExpansionExpression>),
     /// An array literal.
     Array(ArrayExpression),
     /// A named-field aggregate literal.
@@ -689,6 +721,7 @@ impl Expression {
             Self::Boolean(literal) => literal.span,
             Self::Unit(span) | Self::Try { span, .. } => *span,
             Self::Tuple(expression) => expression.span,
+            Self::PackExpansion(expression) => expression.span,
             Self::Array(expression) => expression.span,
             Self::Struct(expression) => expression.span,
             Self::Path(path) => path.span,
@@ -913,6 +946,17 @@ pub struct BooleanLiteral {
 pub struct TupleExpression {
     /// Elements in positional order.
     pub elements: Vec<Expression>,
+    /// Full source location.
+    pub span: Span,
+}
+
+/// A value template repeated once for every type in a generic type pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackExpansionExpression {
+    /// Bound type-pack name.
+    pub pack: Identifier,
+    /// Expression analyzed once per concrete pack type.
+    pub template: Expression,
     /// Full source location.
     pub span: Span,
 }

@@ -375,6 +375,12 @@ impl<'ast, 'metadata, M: Metadata> Evaluator<'ast, 'metadata, M> {
             Expression::Tuple(tuple) => self
                 .evaluate_values(&tuple.elements, frame)
                 .map(Value::Tuple),
+            Expression::PackExpansion(expansion) => self.fail(
+                "E7012",
+                "type-pack expansion is resolved before runtime analysis",
+                expansion.span,
+                "use the expansion inside a generic runtime tuple",
+            ),
             Expression::Array(array) => match &array.kind {
                 ast::ArrayExpressionKind::List(elements) => {
                     self.evaluate_values(elements, frame).map(Value::Array)
@@ -1565,7 +1571,8 @@ fn value_matches_type(
         ast::TypeNameKind::Function { .. }
         | ast::TypeNameKind::Slice(_)
         | ast::TypeNameKind::Reference { .. }
-        | ast::TypeNameKind::RawPointer { .. } => false,
+        | ast::TypeNameKind::RawPointer { .. }
+        | ast::TypeNameKind::PackExpansion { .. } => false,
     }
 }
 

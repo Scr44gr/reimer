@@ -121,6 +121,7 @@ fn generic_parameters(visitor: &mut impl Visitor, parameters: &[GenericParameter
                     expression(visitor, default);
                 }
             }
+            GenericParameter::TypePack { .. } => {}
         }
     }
 }
@@ -191,6 +192,9 @@ pub(crate) fn expression(visitor: &mut impl Visitor, expression: &Expression) {
                 self::expression(visitor, element);
             }
         }
+        Expression::PackExpansion(expansion) => {
+            self::expression(visitor, &expansion.template);
+        }
         Expression::Array(array) => match &array.kind {
             reimer_ast::ArrayExpressionKind::List(elements) => {
                 for element in elements {
@@ -215,10 +219,7 @@ pub(crate) fn expression(visitor: &mut impl Visitor, expression: &Expression) {
         Expression::Call(call) => {
             self::expression(visitor, &call.callee);
             for argument in &call.generic_arguments {
-                match argument {
-                    GenericArgument::Type(ty) => type_name(visitor, ty),
-                    GenericArgument::Const(value) => self::expression(visitor, value),
-                }
+                generic_argument(visitor, argument);
             }
             for argument in &call.arguments {
                 self::expression(visitor, argument);
@@ -259,6 +260,18 @@ pub(crate) fn expression(visitor: &mut impl Visitor, expression: &Expression) {
             }
         }
         Expression::Try { value, .. } => self::expression(visitor, value),
+    }
+}
+
+fn generic_argument(visitor: &mut impl Visitor, argument: &GenericArgument) {
+    match argument {
+        GenericArgument::Type(ty) => type_name(visitor, ty),
+        GenericArgument::Const(value) => self::expression(visitor, value),
+        GenericArgument::Pack { template, .. } => {
+            if let Some(template) = template {
+                type_name(visitor, template);
+            }
+        }
     }
 }
 
@@ -308,7 +321,17 @@ pub(crate) fn type_name(visitor: &mut impl Visitor, type_name: &ast::TypeName) {
                 match argument {
                     GenericArgument::Type(ty) => self::type_name(visitor, ty),
                     GenericArgument::Const(value) => expression(visitor, value),
+                    GenericArgument::Pack { template, .. } => {
+                        if let Some(template) = template {
+                            self::type_name(visitor, template);
+                        }
+                    }
                 }
+            }
+        }
+        TypeNameKind::PackExpansion { template, .. } => {
+            if let Some(template) = template {
+                self::type_name(visitor, template);
             }
         }
         TypeNameKind::Tuple(elements) => {
