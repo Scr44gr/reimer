@@ -5,7 +5,7 @@ id = "2cd76739b1e7b319c68f889b"
 name = "sdl3"
 version = "3.4.12"
 source = "path+../../vendor/sdl3"
-checksum = "dcc58503e2ea9d0533b021a3e329363b856037c80a7277daea59f7dfc0a475b7"
+checksum = "9843ed6dc2a9d879df8533338966a0fdc2926a25f532fe2996bd13154125a75f"
 dependencies = []
 
 [[package]]
@@ -52,6 +52,6 @@ id = "ba665127e4683f3f1dee0e46"
 name = "wgpu"
 version = "29.0.1"
 source = "path+../../vendor/wgpu"
-checksum = "0f9d8daf9c1f30d6ecdf8ebe290261f17370c009f70e78d4b3841d83b90ccb65"
+checksum = "b50158a5ce76857dc80a2054162eb139fafcbae212e922df93bf5cfe446751a6"
 dependencies = []
 

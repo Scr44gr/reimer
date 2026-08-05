@@ -2,12 +2,7 @@ from std::alloc import allocate_bytes, bytes_len, deinit_bytes, page_allocator;
 
 fn main() -> i32 {
     let allocator = page_allocator();
-    let bytes = match allocate_bytes(&allocator, 64) {
-        Ok(value) => value,
-        Err(_) => {
-            return 1;
-        },
-    };
+    let bytes = allocate_bytes(&allocator, 64).expect("page allocation must succeed");
     defer deinit_bytes(bytes);
     let len = bytes_len(&bytes);
 

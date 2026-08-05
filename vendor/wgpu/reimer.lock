@@ -5,5 +5,5 @@ id = "5c3c8c164df6516f5ba18521"
 name = "wgpu"
 version = "29.0.1"
 source = "path+."
-checksum = "bd6b1d09d98ff2e2e031ac6bc31bf3d77becc511d2ca839521db42329dd184b1"
+checksum = "b50158a5ce76857dc80a2054162eb139fafcbae212e922df93bf5cfe446751a6"
 dependencies = []

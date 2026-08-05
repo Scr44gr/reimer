@@ -26,7 +26,7 @@ reimer init [path]
 reimer check [path] [--locked|--refresh]
 ```
 
-Runs lexing, parsing, package loading, name resolution, type checking, borrow and move analysis, and semantic validation without machine-code generation.
+Runs lexing, parsing, package loading, manifest-native path validation, name resolution, type checking, borrow and move analysis, and semantic validation without machine-code generation.
 
 For CI, use:
 
@@ -46,7 +46,9 @@ Execution uses the Cranelift JIT. Arguments after `--` belong to the Reimer prog
 reimer run . --release --locked -- --level arena-01
 ```
 
-The program reads them through `std::env::args()`.
+The program reads them through `std::env::args()`. Native libraries declared by
+the package graph are resolved without requiring global `PATH`,
+`LD_LIBRARY_PATH`, or `DYLD_LIBRARY_PATH` changes.
 
 ## Build a native executable
 
@@ -54,7 +56,7 @@ The program reads them through `std::env::args()`.
 reimer build [path] [--release] [--locked|--refresh] [-o <executable>]
 ```
 
-For executable packages and source files, `build` emits a native object and links it with the matching startup and runtime. The resulting program does not need the Reimer compiler or a separate Reimer runtime when launched.
+For executable packages and source files, `build` emits a native object and links it with the matching startup and runtime. Manifest-declared `.dll`, `.so`, or `.dylib` files are copied beside the executable. The resulting program does not need the Reimer compiler or a separate Reimer runtime when launched, although it still needs those explicitly declared third-party shared libraries.
 
 ```text
 reimer build . --release --locked -o game.exe

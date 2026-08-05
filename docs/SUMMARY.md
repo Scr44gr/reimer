@@ -23,7 +23,8 @@
 # Standard library
 
 - [Standard library overview](standard-library/overview.md)
-- [Allocation and collections](standard-library/allocation-and-collections.md)
+- [Allocators](standard-library/allocators.md)
+- [Collections](standard-library/allocation-and-collections.md)
 - [Terminal I/O and files](standard-library/io-and-files.md)
 - [Environment and processes](standard-library/environment-and-processes.md)
 - [Time](standard-library/time.md)

@@ -31,15 +31,11 @@ fn main() -> i32 {
     let elapsed = started.elapsed();
 
     if elapsed.as_milliseconds() >= 20 {
-        match println("timer completed") {
-            Ok(_) => 0,
-            Err(_) => 2,
-        }
+        println("timer completed").expect("standard output must be writable");
+        0
     } else {
-        match eprintln("the timer returned too early") {
-            Ok(_) => 1,
-            Err(_) => 3,
-        }
+        eprintln("the timer returned too early").expect("standard error must be writable");
+        1
     }
 }
 ```

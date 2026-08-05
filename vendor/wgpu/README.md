@@ -30,8 +30,12 @@ wgpu = { path = "../reimer/vendor/wgpu", version = "^29.0" }
 Run the native initialization and mapped-buffer example:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File vendor\wgpu\tools\invoke.ps1 -Project examples\wgpu_info
+reimer run examples\wgpu_info --release
 ```
+
+The package manifest resolves `wgpu_native` before `wgpu_bridge` without
+changing `PATH`. Native runtime files are staged automatically by
+`reimer build`.
 
 For window surfaces, use the separate `vendor/wgpu-sdl3` adapter. Keeping the
 adapter separate prevents SDL-specific handles and lifetimes from leaking into

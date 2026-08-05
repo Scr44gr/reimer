@@ -178,6 +178,11 @@ pub(crate) fn expression(visitor: &mut impl Visitor, expression: &Expression) {
         | Expression::Boolean(_)
         | Expression::Unit(_)
         | Expression::Path(_) => {}
+        Expression::GenericFunction(function) => {
+            for argument in &function.generic_arguments {
+                generic_argument(visitor, argument);
+            }
+        }
         Expression::FormattedString(formatted) => {
             for fragment in &formatted.fragments {
                 if let ast::FormattedStringFragment::Display(expression)

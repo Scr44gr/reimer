@@ -35,6 +35,14 @@ edition = "2026"
 physics = { path = "../physics", version = "^0.1" }
 assets = { git = "https://example.com/assets.git", tag = "0.4.0" }
 
+[native.windows-x86_64]
+library-paths = ["native/windows-x86_64"]
+link-libraries = ["physics_native", "physics_bridge"]
+runtime-files = [
+    "native/windows-x86_64/physics_native.dll",
+    "native/windows-x86_64/physics_bridge.dll",
+]
+
 [profile.debug]
 optimization = 0
 
@@ -52,6 +60,32 @@ with `package = "real-name"`. Supported sources are:
 Only one Git selector may appear. Registry dependencies are recognized so the
 compiler can produce a precise error, but registry support and publishing are
 reserved for a later milestone.
+
+## Native runtime dependencies
+
+Packages that expose `@link` functions can describe their native artifacts in
+the manifest. The supported target names are `windows-x86_64`,
+`windows-aarch64`, `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, and
+`macos-aarch64`.
+
+- `library-paths` contains directories searched before system library paths;
+- `link-libraries` contains the names used by the native linker and is ordered
+  dependency-first when one shared library depends on another;
+- `runtime-files` contains `.dll`, `.so`, or `.dylib` files copied beside a
+  built executable.
+
+Every path is relative to the manifest that declares it. Absolute paths,
+parent traversal, symbolic links, missing files, and target/extension
+mismatches are rejected during project resolution. Native declarations from
+direct and transitive dependencies are combined for the current host. Two
+packages cannot stage different runtime files under the same file name.
+
+`reimer run` and `reimer test` load declared libraries by their resolved paths
+without modifying the process-wide `PATH`, `LD_LIBRARY_PATH`, or
+`DYLD_LIBRARY_PATH`. `reimer build` passes the same search paths to the linker
+and stages the declared runtime files beside the executable. Native inputs are
+included in the package checksum, so `--locked` detects binary drift as well as
+source drift.
 
 ## Resolution and lockfile
 
@@ -85,7 +119,8 @@ reimer remove <alias>
 ```
 
 `build` emits an object under `target/reimer/debug` or
-`target/reimer/release`. Manifest levels map to Cranelift strategies: `0`
+`target/reimer/release`. Required native runtime files are placed beside the
+generated executable. Manifest levels map to Cranelift strategies: `0`
 disables optimization, `1-2` optimize for speed, and `3` balances speed and
 size. `run` executes the same graph through JIT.
 

@@ -5,6 +5,7 @@ mod c_abi;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
@@ -76,11 +77,23 @@ struct NativeLibraries {
 }
 
 impl NativeLibraries {
-    fn load(program: &Program) -> Result<Self, String> {
+    fn load(
+        program: &Program,
+        search_paths: &[PathBuf],
+        preload: &[String],
+    ) -> Result<Self, String> {
         let names = linked_native_libraries(program);
-        let mut libraries = Vec::with_capacity(names.len());
+        let mut libraries = Vec::with_capacity(names.len().saturating_add(preload.len()));
+        let mut loaded = BTreeSet::new();
+        for name in preload {
+            if loaded.insert(name.as_str()) {
+                libraries.push(load_native_library(name, search_paths)?);
+            }
+        }
         for name in names {
-            libraries.push(load_native_library(name)?);
+            if loaded.insert(name) {
+                libraries.push(load_native_library(name, search_paths)?);
+            }
         }
         Ok(Self { libraries })
     }
@@ -244,22 +257,90 @@ fn finish_extern_call(
     unsafe_code,
     reason = "loading a user-declared native library may execute its platform initializer"
 )]
-fn load_native_library(name: &str) -> Result<libloading::Library, String> {
+fn load_native_library(
+    name: &str,
+    search_paths: &[PathBuf],
+) -> Result<libloading::Library, String> {
     let conventional = libloading::library_filename(name);
+    let requested = Path::new(name);
+    let mut failures = Vec::new();
+    if requested.components().count() == 1 {
+        for directory in search_paths {
+            for candidate in [directory.join(requested), directory.join(&conventional)] {
+                if failures
+                    .iter()
+                    .any(|(attempted, _): &(PathBuf, libloading::Error)| attempted == &candidate)
+                {
+                    continue;
+                }
+                // SAFETY: `@link` and the project manifest explicitly opt the
+                // program into loading this native library.
+                match unsafe { open_native_library(&candidate) } {
+                    Ok(library) => return Ok(library),
+                    Err(error) => failures.push((candidate, error)),
+                }
+            }
+        }
+    }
     // SAFETY: `@link` explicitly opts the program into loading this native library.
-    match unsafe { libloading::Library::new(name) } {
+    match unsafe { open_native_library(requested) } {
         Ok(library) => Ok(library),
         Err(first_error) if conventional != name => {
             // SAFETY: This is the platform-conventional spelling of the same requested library.
-            unsafe { libloading::Library::new(&conventional) }.map_err(|second_error| {
-                format!(
-                    "failed to load native library `{name}` ({first_error}); `{}` also failed ({second_error})",
-                    conventional.to_string_lossy()
-                )
+            unsafe { open_native_library(Path::new(&conventional)) }.map_err(|second_error| {
+                failures.push((requested.to_path_buf(), first_error));
+                failures.push((PathBuf::from(&conventional), second_error));
+                native_library_load_error(name, &failures)
             })
         }
-        Err(error) => Err(format!("failed to load native library `{name}`: {error}")),
+        Err(error) => {
+            failures.push((requested.to_path_buf(), error));
+            Err(native_library_load_error(name, &failures))
+        }
     }
+}
+
+fn native_library_load_error(name: &str, failures: &[(PathBuf, libloading::Error)]) -> String {
+    let attempts = failures
+        .iter()
+        .map(|(path, error)| format!("`{}` ({error})", path.display()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("failed to load native library `{name}`; attempted {attempts}")
+}
+
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "loading a user-declared native library may execute its platform initializer"
+)]
+unsafe fn open_native_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    use libloading::os::windows::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+
+    if path.is_absolute() {
+        // SAFETY: The caller accepted execution of this manifest-declared library.
+        return unsafe {
+            libloading::os::windows::Library::load_with_flags(
+                path,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        }
+        .map(Into::into);
+    }
+    // SAFETY: The caller accepted execution of this source-declared library.
+    unsafe { libloading::Library::new(path) }
+}
+
+#[cfg(not(windows))]
+#[expect(
+    unsafe_code,
+    reason = "loading a user-declared native library may execute its platform initializer"
+)]
+unsafe fn open_native_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    // SAFETY: The caller accepted execution of this source- or manifest-declared library.
+    unsafe { libloading::Library::new(path) }
 }
 
 /// Emits a native object for the current host.
@@ -375,6 +456,33 @@ pub fn execute_with_arguments(
     execute_internal(program, optimization, Some(arguments))
 }
 
+/// Compiles and executes the entry point using manifest-resolved native libraries.
+///
+/// `library_paths` are searched before platform defaults. `preload` preserves
+/// manifest order so a bridge library can depend on an earlier native library
+/// without modifying the process-wide library search path.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when a native library cannot be loaded,
+/// Cranelift rejects the program, or JIT memory cannot be finalized.
+pub fn execute_with_native_libraries(
+    program: &Program,
+    optimization: OptimizationLevel,
+    arguments: Option<Vec<OsString>>,
+    library_paths: &[PathBuf],
+    preload: &[String],
+) -> Result<i32, Vec<Diagnostic>> {
+    execute_internal_with_native_libraries(
+        program,
+        optimization,
+        arguments,
+        library_paths,
+        preload,
+        &[],
+    )
+}
+
 fn execute_internal(
     program: &Program,
     optimization: OptimizationLevel,
@@ -389,6 +497,24 @@ fn execute_internal_with_symbols(
     arguments: Option<Vec<OsString>>,
     additional_symbols: &[(&str, *const u8)],
 ) -> Result<i32, Vec<Diagnostic>> {
+    execute_internal_with_native_libraries(
+        program,
+        optimization,
+        arguments,
+        &[],
+        &[],
+        additional_symbols,
+    )
+}
+
+fn execute_internal_with_native_libraries(
+    program: &Program,
+    optimization: OptimizationLevel,
+    arguments: Option<Vec<OsString>>,
+    library_paths: &[PathBuf],
+    preload: &[String],
+    additional_symbols: &[(&str, *const u8)],
+) -> Result<i32, Vec<Diagnostic>> {
     let flags = cranelift_flags(optimization);
     let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
         .map_err(|error| backend_error(error.to_string()))?;
@@ -396,7 +522,8 @@ fn execute_internal_with_symbols(
     for (name, pointer) in additional_symbols {
         builder.symbol((*name).to_owned(), *pointer);
     }
-    let libraries = NativeLibraries::load(program).map_err(backend_error)?;
+    let libraries =
+        NativeLibraries::load(program, library_paths, preload).map_err(backend_error)?;
     if !libraries.is_empty() {
         builder.symbol_lookup_fn(Box::new(move |name| libraries.lookup(name)));
     }
@@ -448,12 +575,35 @@ pub fn execute_test_with_options(
     test_index: usize,
     optimization: OptimizationLevel,
 ) -> Result<(), Vec<Diagnostic>> {
+    execute_test_with_native_libraries(program, test_index, optimization, &[], &[])
+}
+
+/// Compiles and executes one `@test` using manifest-resolved native libraries.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when the test index is invalid, a native
+/// library cannot be loaded, or native code generation fails.
+pub fn execute_test_with_native_libraries(
+    program: &Program,
+    test_index: usize,
+    optimization: OptimizationLevel,
+    library_paths: &[PathBuf],
+    preload: &[String],
+) -> Result<(), Vec<Diagnostic>> {
     let test = program
         .tests
         .get(test_index)
         .copied()
         .ok_or_else(|| backend_error(format!("unit test index {test_index} does not exist")))?;
-    execute_selected_tests(program, &[test], optimization, |_, _| {})
+    execute_selected_tests(
+        program,
+        &[test],
+        optimization,
+        library_paths,
+        preload,
+        |_, _| {},
+    )
 }
 
 /// Compiles the program once and executes every discovered `@test` function.
@@ -489,13 +639,38 @@ pub fn execute_tests_with_options_and_progress(
     optimization: OptimizationLevel,
     progress: impl FnMut(usize, &str),
 ) -> Result<(), Vec<Diagnostic>> {
-    execute_selected_tests(program, &program.tests, optimization, progress)
+    execute_tests_with_native_libraries_and_progress(program, optimization, &[], &[], progress)
+}
+
+/// Compiles and executes every discovered `@test` using manifest-resolved native libraries.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when typed test metadata is invalid, a native
+/// library cannot be loaded, or native code generation fails.
+pub fn execute_tests_with_native_libraries_and_progress(
+    program: &Program,
+    optimization: OptimizationLevel,
+    library_paths: &[PathBuf],
+    preload: &[String],
+    progress: impl FnMut(usize, &str),
+) -> Result<(), Vec<Diagnostic>> {
+    execute_selected_tests(
+        program,
+        &program.tests,
+        optimization,
+        library_paths,
+        preload,
+        progress,
+    )
 }
 
 fn execute_selected_tests(
     program: &Program,
     tests: &[FunctionId],
     optimization: OptimizationLevel,
+    library_paths: &[PathBuf],
+    preload: &[String],
     mut progress: impl FnMut(usize, &str),
 ) -> Result<(), Vec<Diagnostic>> {
     for test in tests {
@@ -515,7 +690,8 @@ fn execute_selected_tests(
     let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
         .map_err(|error| backend_error(error.to_string()))?;
     register_runtime_symbols(&mut builder);
-    let libraries = NativeLibraries::load(program).map_err(backend_error)?;
+    let libraries =
+        NativeLibraries::load(program, library_paths, preload).map_err(backend_error)?;
     if !libraries.is_empty() {
         builder.symbol_lookup_fn(Box::new(move |name| libraries.lookup(name)));
     }
@@ -548,6 +724,7 @@ fn execute_selected_tests(
 
 fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_core_symbols(builder);
+    register_identity_symbols(builder);
     register_collection_symbols(builder);
     register_target_symbols(builder);
     register_time_symbols(builder);
@@ -560,6 +737,16 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
     register_process_symbols(builder);
     register_storage_symbols(builder);
     register_coordination_symbols(builder);
+}
+
+fn register_identity_symbols(builder: &mut JITBuilder) {
+    register_symbol_group(
+        builder,
+        [(
+            reimer_runtime::PROCESS_UNIQUE_ID_SYMBOL,
+            reimer_runtime::runtime_process_unique_id as *const u8,
+        )],
+    );
 }
 
 fn register_binary_symbols(builder: &mut JITBuilder) {
@@ -741,8 +928,16 @@ fn register_memory_symbols(builder: &mut JITBuilder) {
                 reimer_runtime::allocate_bytes as *const u8,
             ),
             (
+                reimer_runtime::ALLOCATE_ALIGNED_BYTES_SYMBOL,
+                reimer_runtime::allocate_aligned_bytes as *const u8,
+            ),
+            (
                 reimer_runtime::DEALLOCATE_BYTES_SYMBOL,
                 reimer_runtime::deallocate_bytes as *const u8,
+            ),
+            (
+                reimer_runtime::DEALLOCATE_ALIGNED_BYTES_SYMBOL,
+                reimer_runtime::deallocate_aligned_bytes as *const u8,
             ),
             (
                 reimer_runtime::ABS_I32_SYMBOL,
@@ -1873,26 +2068,7 @@ fn runtime_panic_reference<M: Module>(
     Ok(module.declare_func_in_func(function, builder.func))
 }
 
-fn runtime_allocate_bytes_reference<M: Module>(
-    builder: &mut FunctionBuilder<'_>,
-    module: &mut M,
-) -> Result<ir::FuncRef, String> {
-    let mut signature = module.make_signature();
-    signature
-        .params
-        .extend([AbiParam::new(pointer_type()), AbiParam::new(pointer_type())]);
-    signature.returns.push(AbiParam::new(pointer_type()));
-    let function = module
-        .declare_function(
-            reimer_runtime::ALLOCATE_BYTES_SYMBOL,
-            Linkage::Import,
-            &signature,
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(module.declare_func_in_func(function, builder.func))
-}
-
-fn runtime_deallocate_bytes_reference<M: Module>(
+fn runtime_allocate_aligned_bytes_reference<M: Module>(
     builder: &mut FunctionBuilder<'_>,
     module: &mut M,
 ) -> Result<ir::FuncRef, String> {
@@ -1902,9 +2078,31 @@ fn runtime_deallocate_bytes_reference<M: Module>(
         AbiParam::new(pointer_type()),
         AbiParam::new(pointer_type()),
     ]);
+    signature.returns.push(AbiParam::new(pointer_type()));
     let function = module
         .declare_function(
-            reimer_runtime::DEALLOCATE_BYTES_SYMBOL,
+            reimer_runtime::ALLOCATE_ALIGNED_BYTES_SYMBOL,
+            Linkage::Import,
+            &signature,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(module.declare_func_in_func(function, builder.func))
+}
+
+fn runtime_deallocate_aligned_bytes_reference<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+) -> Result<ir::FuncRef, String> {
+    let mut signature = module.make_signature();
+    signature.params.extend([
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+        AbiParam::new(pointer_type()),
+    ]);
+    let function = module
+        .declare_function(
+            reimer_runtime::DEALLOCATE_ALIGNED_BYTES_SYMBOL,
             Linkage::Import,
             &signature,
         )
@@ -2385,10 +2583,18 @@ struct ForParts<'hir> {
 struct AllocateBytesParts<'hir> {
     allocator: &'hir Expression,
     length: &'hir Expression,
+    alignment: Option<&'hir Expression>,
     result_type: Type,
     allocation_type: Type,
     error_type: Type,
     error_variant: u32,
+}
+
+struct DeallocateBytesParts<'hir> {
+    allocator: &'hir Expression,
+    data: &'hir Expression,
+    length: &'hir Expression,
+    alignment: Option<&'hir Expression>,
 }
 
 struct ThreadCallbackParts<'hir> {
@@ -3088,7 +3294,6 @@ fn emit_expression<M: Module>(
     state: &mut CodegenState<'_>,
     expression: &Expression,
 ) -> Result<Emitted, String> {
-    let result_type = expression.ty;
     match &expression.kind {
         ExpressionKind::Integer(_)
         | ExpressionKind::Float32(_)
@@ -3134,7 +3339,7 @@ fn emit_expression<M: Module>(
         | ExpressionKind::Match(_)
         | ExpressionKind::Loop(_)
         | ExpressionKind::Block(_) => {
-            emit_control_expression(builder, module, functions, state, expression, result_type)
+            emit_control_expression(builder, module, functions, state, expression, expression.ty)
         }
         ExpressionKind::Assign {
             target,
@@ -3158,6 +3363,7 @@ fn emit_expression<M: Module>(
         | ExpressionKind::StringFromParts { .. }
         | ExpressionKind::SliceFromParts { .. }
         | ExpressionKind::TypeStride { .. }
+        | ExpressionKind::TypeAlignment { .. }
         | ExpressionKind::HashValue { .. }
         | ExpressionKind::AllocateBytes { .. }
         | ExpressionKind::DeallocateBytes { .. }
@@ -3175,6 +3381,9 @@ fn emit_expression<M: Module>(
         | ExpressionKind::JobWait { .. }
         | ExpressionKind::ParallelFor { .. } => {
             emit_runtime_intrinsic_expression(builder, module, functions, state, expression)
+        }
+        ExpressionKind::Expect { .. } => {
+            emit_expect_expression(builder, module, functions, state, expression)
         }
         ExpressionKind::Try { .. } => {
             emit_try_expression(builder, module, functions, state, expression)
@@ -3411,35 +3620,15 @@ fn emit_runtime_intrinsic_expression<M: Module>(
             data,
             length,
         ),
-        ExpressionKind::TypeStride { target } => emit_type_stride(builder, state.layouts, *target),
         ExpressionKind::HashValue { value, seed } => {
             emit_hash_value_expression(builder, module, functions, state, value, seed)
         }
-        ExpressionKind::AllocateBytes {
-            allocator,
-            length,
-            allocation_type,
-            error_type,
-            error_variant,
-        } => emit_allocate_bytes(
-            builder,
-            module,
-            functions,
-            state,
-            &AllocateBytesParts {
-                allocator,
-                length,
-                result_type: expression.ty,
-                allocation_type: *allocation_type,
-                error_type: *error_type,
-                error_variant: *error_variant,
-            },
-        ),
-        ExpressionKind::DeallocateBytes {
-            allocator,
-            data,
-            length,
-        } => emit_deallocate_bytes(builder, module, functions, state, allocator, data, length),
+        ExpressionKind::TypeStride { .. }
+        | ExpressionKind::TypeAlignment { .. }
+        | ExpressionKind::AllocateBytes { .. }
+        | ExpressionKind::DeallocateBytes { .. } => {
+            emit_allocator_intrinsic_expression(builder, module, functions, state, expression)
+        }
         ExpressionKind::ThreadSpawn { .. }
         | ExpressionKind::ThreadJoin { .. }
         | ExpressionKind::ThreadScope { .. } => {
@@ -3462,6 +3651,61 @@ fn emit_runtime_intrinsic_expression<M: Module>(
             emit_job_intrinsic_expression(builder, module, functions, state, expression)
         }
         _ => Err("non-runtime intrinsic reached intrinsic code generation".to_owned()),
+    }
+}
+
+fn emit_allocator_intrinsic_expression<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    expression: &Expression,
+) -> Result<Emitted, String> {
+    match &expression.kind {
+        ExpressionKind::TypeStride { target } => emit_type_stride(builder, state.layouts, *target),
+        ExpressionKind::TypeAlignment { target } => {
+            emit_type_alignment(builder, state.layouts, *target)
+        }
+        ExpressionKind::AllocateBytes {
+            allocator,
+            length,
+            alignment,
+            allocation_type,
+            error_type,
+            error_variant,
+        } => emit_allocate_bytes(
+            builder,
+            module,
+            functions,
+            state,
+            &AllocateBytesParts {
+                allocator,
+                length,
+                alignment: alignment.as_deref(),
+                result_type: expression.ty,
+                allocation_type: *allocation_type,
+                error_type: *error_type,
+                error_variant: *error_variant,
+            },
+        ),
+        ExpressionKind::DeallocateBytes {
+            allocator,
+            data,
+            length,
+            alignment,
+        } => emit_deallocate_bytes(
+            builder,
+            module,
+            functions,
+            state,
+            &DeallocateBytesParts {
+                allocator,
+                data,
+                length,
+                alignment: alignment.as_deref(),
+            },
+        ),
+        _ => Err("non-allocator intrinsic reached allocator code generation".to_owned()),
     }
 }
 
@@ -4074,6 +4318,17 @@ fn emit_type_stride(
     ))
 }
 
+fn emit_type_alignment(
+    builder: &mut FunctionBuilder<'_>,
+    layouts: &Layouts,
+    target: Type,
+) -> Result<Emitted, String> {
+    let alignment = layouts.value_layout(target)?.align;
+    Ok(Emitted::value(
+        builder.ins().iconst(pointer_type(), i64::from(alignment)),
+    ))
+}
+
 fn type_index(id: TypeId) -> Result<usize, String> {
     usize::try_from(id.0).map_err(|_| format!("type id {} does not fit this host", id.0))
 }
@@ -4317,11 +4572,20 @@ fn emit_panic<M: Module>(
         return Ok(emitted);
     }
     let descriptor = require_value(emitted, "panic message")?;
+    emit_panic_descriptor(builder, module, state, descriptor, message.span.start)
+}
+
+fn emit_panic_descriptor<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    state: &CodegenState<'_>,
+    descriptor: Value,
+    source_offset: usize,
+) -> Result<Emitted, String> {
     let (data, length) = load_string_view(builder, state.layouts, descriptor)?;
     let byte_offset = builder.ins().iconst(
         pointer_type(),
-        i64::try_from(message.span.start)
-            .map_err(|_| "panic source offset exceeds i64".to_owned())?,
+        i64::try_from(source_offset).map_err(|_| "panic source offset exceeds i64".to_owned())?,
     );
     let function = runtime_panic_reference(builder, module)?;
     builder.ins().call(function, &[data, length, byte_offset]);
@@ -4423,8 +4687,19 @@ fn emit_allocate_bytes<M: Module>(
         return Ok(length);
     }
     let length = require_value(length, "allocation length")?;
-    let function = runtime_allocate_bytes_reference(builder, module)?;
-    let call = builder.ins().call(function, &[allocator, length]);
+    let alignment = if let Some(alignment) = parts.alignment {
+        let alignment = emit_expression(builder, module, functions, state, alignment)?;
+        if alignment.terminated {
+            return Ok(alignment);
+        }
+        require_value(alignment, "allocation alignment")?
+    } else {
+        builder.ins().iconst(pointer_type(), 1)
+    };
+    let function = runtime_allocate_aligned_bytes_reference(builder, module)?;
+    let call = builder
+        .ins()
+        .call(function, &[allocator, length, alignment]);
     let data = builder
         .inst_results(call)
         .first()
@@ -4459,6 +4734,7 @@ fn emit_allocate_bytes<M: Module>(
         &[
             (Type::Usize, data),
             (Type::Usize, length),
+            (Type::Usize, alignment),
             (Type::Usize, allocator),
         ],
     )?;
@@ -4485,28 +4761,36 @@ fn emit_deallocate_bytes<M: Module>(
     module: &mut M,
     functions: &HashMap<FunctionId, FuncId>,
     state: &mut CodegenState<'_>,
-    allocator: &Expression,
-    data: &Expression,
-    length: &Expression,
+    parts: &DeallocateBytesParts<'_>,
 ) -> Result<Emitted, String> {
-    let allocator = emit_expression(builder, module, functions, state, allocator)?;
+    let allocator = emit_expression(builder, module, functions, state, parts.allocator)?;
     if allocator.terminated {
         return Ok(allocator);
     }
-    let data = emit_expression(builder, module, functions, state, data)?;
+    let data = emit_expression(builder, module, functions, state, parts.data)?;
     if data.terminated {
         return Ok(data);
     }
-    let length = emit_expression(builder, module, functions, state, length)?;
+    let length = emit_expression(builder, module, functions, state, parts.length)?;
     if length.terminated {
         return Ok(length);
     }
+    let alignment = if let Some(alignment) = parts.alignment {
+        let alignment = emit_expression(builder, module, functions, state, alignment)?;
+        if alignment.terminated {
+            return Ok(alignment);
+        }
+        require_value(alignment, "allocation alignment")?
+    } else {
+        builder.ins().iconst(pointer_type(), 1)
+    };
     let arguments = [
         require_value(allocator, "allocator handle")?,
         require_value(data, "allocation pointer")?,
         require_value(length, "allocation length")?,
+        alignment,
     ];
-    let function = runtime_deallocate_bytes_reference(builder, module)?;
+    let function = runtime_deallocate_aligned_bytes_reference(builder, module)?;
     builder.ins().call(function, &arguments);
     Ok(Emitted::unit())
 }
@@ -5284,6 +5568,60 @@ fn value_size(layouts: &Layouts, ty: Type) -> Result<u32, String> {
     }
 }
 
+fn emit_expect_expression<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    functions: &HashMap<FunctionId, FuncId>,
+    state: &mut CodegenState<'_>,
+    expression: &Expression,
+) -> Result<Emitted, String> {
+    let ExpressionKind::Expect {
+        value,
+        message,
+        success_variant,
+        output_type,
+    } = &expression.kind
+    else {
+        return Err("non-expect expression reached expect code generation".to_owned());
+    };
+    let emitted = emit_expression(builder, module, functions, state, value)?;
+    if emitted.terminated {
+        return Ok(emitted);
+    }
+    let enum_value = require_value(emitted, "expect operand")?;
+    let emitted_message = emit_expression(builder, module, functions, state, message)?;
+    if emitted_message.terminated {
+        return Ok(emitted_message);
+    }
+    let message_descriptor = require_value(emitted_message, "expect message")?;
+    let discriminant = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), enum_value, 0);
+    let expected = builder
+        .ins()
+        .iconst(types::I32, i64::from(*success_variant));
+    let succeeded = builder.ins().icmp(IntCC::Equal, discriminant, expected);
+    let success = builder.create_block();
+    let failure = builder.create_block();
+    builder.ins().brif(succeeded, success, &[], failure, &[]);
+
+    builder.switch_to_block(failure);
+    let panicked = emit_panic_descriptor(
+        builder,
+        module,
+        state,
+        message_descriptor,
+        message.span.start,
+    )?;
+    if !panicked.terminated {
+        return Err("failed result expectation did not terminate execution".to_owned());
+    }
+
+    builder.switch_to_block(success);
+    let payload = enum_payload_address(builder, state, value.ty, enum_value, *success_variant, 0)?;
+    load_at_address(builder, *output_type, payload)
+}
+
 fn emit_try_expression<M: Module>(
     builder: &mut FunctionBuilder<'_>,
     module: &mut M,
@@ -5412,13 +5750,13 @@ fn enum_payload_address(
 ) -> Result<Value, String> {
     let layout = state.layouts.aggregate(enum_type)?;
     let AggregateLayoutKind::Enum { variants } = &layout.kind else {
-        return Err("`?` requires an enum layout".to_owned());
+        return Err("enum payload access requires an enum layout".to_owned());
     };
     let offset = variants
         .get(type_index(TypeId(variant))?)
         .and_then(|offsets| offsets.get(field))
         .copied()
-        .ok_or_else(|| "`?` success variant has no payload".to_owned())?;
+        .ok_or_else(|| "enum variant payload field is missing".to_owned())?;
     Ok(address_at_offset(builder, base, offset))
 }
 
@@ -8502,6 +8840,54 @@ mod tests {
         assert!(result > 0);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn execute_should_resolve_a_linked_library_from_manifest_search_paths() {
+        let program = compile_fixture(
+            "@link(\"SDL3\") extern \"C\" {
+                 fn SDL_GetVersion() -> i32;
+             }
+             fn main() -> i32 { 42 }",
+        );
+        let library_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/sdl3/native/windows-x86_64");
+
+        let result = super::execute_with_native_libraries(
+            &program,
+            OptimizationLevel::None,
+            None,
+            &[library_path],
+            &["SDL3".to_owned()],
+        )
+        .expect("manifest search path should resolve SDL3 without PATH changes");
+
+        assert_eq!(result, 42);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn execute_should_preload_native_dependencies_before_their_bridge() {
+        let program = compile_fixture(
+            "@link(\"wgpu_bridge\") extern \"C\" {
+                 fn reimer_wgpu_bridge_version() -> u32;
+             }
+             fn main() -> i32 { 42 }",
+        );
+        let library_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/wgpu/native/windows-x86_64");
+
+        let result = super::execute_with_native_libraries(
+            &program,
+            OptimizationLevel::None,
+            None,
+            &[library_path],
+            &["wgpu_native".to_owned(), "wgpu_bridge".to_owned()],
+        )
+        .expect("wgpu native should load before its bridge without PATH changes");
+
+        assert_eq!(result, 42);
+    }
+
     #[test]
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     fn execute_should_pass_nul_terminated_c_string_literals() {
@@ -8839,6 +9225,21 @@ mod tests {
     }
 
     #[test]
+    fn execute_should_call_monomorphized_generic_function_values() {
+        let program = compile_fixture(
+            "fn identity<T>(value: T) -> T { value }
+             fn main() -> i32 {
+                 let callback: fn(i32) -> i32 = identity::<i32>;
+                 callback(42)
+             }",
+        );
+
+        let result = execute(&program).expect("generic function value should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
     fn execute_should_collect_marker_derives_into_omitted_type_packs() {
         let program = compile_fixture(
             "trait Component: Copy {}
@@ -9098,6 +9499,34 @@ mod tests {
                      Err(code) => code,
                  };
                  if success == 42 && optional_failure == 1 && result_failure == 7 {
+                     42
+                 } else {
+                     0
+                 }
+             }",
+        );
+
+        let result = execute(&program).expect("fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_extract_result_expect_payload_and_evaluate_message() {
+        let program = compile_fixture(
+            "struct PlainError { code: i32 }
+             struct Resource { left: i32, right: i32 }
+             static mut MESSAGE_CALLS: i32 = 0;
+             fn acquire() -> Result<Resource, PlainError> {
+                 Ok(Resource { left: 20, right: 22 })
+             }
+             fn main() -> i32 {
+                 let resource = acquire().expect({
+                     unsafe { MESSAGE_CALLS += 1; }
+                     \"resource acquisition must succeed\"
+                 });
+                 let message_calls = unsafe { MESSAGE_CALLS };
+                 if resource.left + resource.right == 42 && message_calls == 1 {
                      42
                  } else {
                      0

@@ -1,6 +1,8 @@
 //! Declarative project manifests, reproducible lockfiles, and dependency graphs.
 
-use std::collections::{BTreeMap, HashMap};
+mod native;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
@@ -13,6 +15,8 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+pub use native::NativeDependencies;
 
 const MANIFEST_FILE: &str = "reimer.toml";
 const LOCK_FILE: &str = "reimer.lock";
@@ -46,6 +50,7 @@ pub struct Project {
     lock_path: PathBuf,
     root: String,
     packages: Vec<ResolvedPackage>,
+    native_dependencies: NativeDependencies,
     debug_optimization: u8,
     release_optimization: u8,
 }
@@ -164,6 +169,12 @@ impl Project {
         &self.lock_path
     }
 
+    /// Returns the validated host-native inputs from the complete dependency graph.
+    #[must_use]
+    pub const fn native_dependencies(&self) -> &NativeDependencies {
+        &self.native_dependencies
+    }
+
     fn root_package(&self) -> Option<&ResolvedPackage> {
         self.packages.iter().find(|package| package.id == self.root)
     }
@@ -270,6 +281,7 @@ struct ResolvedPackage {
     source: String,
     checksum: String,
     dependencies: Vec<ResolvedDependency>,
+    native: Vec<native::ResolvedNativeTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +299,8 @@ struct ManifestDocument {
     dependencies: BTreeMap<String, DependencyValue>,
     #[serde(default)]
     profile: ProfileTables,
+    #[serde(default)]
+    native: BTreeMap<String, native::NativeTargetTable>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +352,7 @@ struct ParsedManifest {
     name: String,
     version: Version,
     dependencies: Vec<DependencyRequest>,
+    native: Vec<native::ParsedNativeTarget>,
     debug_optimization: u8,
     release_optimization: u8,
 }
@@ -477,11 +492,13 @@ impl Resolver {
         } else if self.previous.as_ref() != Some(&current) {
             write_lock(&self.lock_path, &current)?;
         }
+        let native_dependencies = native::collect_dependencies(&self.packages)?;
         Ok(Project {
             manifest_path: self.manifest_path,
             lock_path: self.lock_path,
             root,
             packages: self.packages,
+            native_dependencies,
             debug_optimization: self.debug_optimization,
             release_optimization: self.release_optimization,
         })
@@ -580,7 +597,9 @@ impl Resolver {
             return Ok(id);
         }
         self.visiting.push((id.clone(), manifest.name.clone()));
-        let checksum = source_checksum(&directory)?;
+        let native_targets = native::resolve_targets(&manifest.path, &directory, &manifest.native)?;
+        let native_files = native::collect_checksum_files(&manifest.path, &native_targets)?;
+        let checksum = source_checksum(&directory, &native_files)?;
         let mut dependencies = Vec::with_capacity(manifest.dependencies.len());
         for request in &manifest.dependencies {
             let target = match &request.source {
@@ -613,6 +632,7 @@ impl Resolver {
             source,
             checksum,
             dependencies,
+            native: native_targets,
         });
         Ok(id)
     }
@@ -737,6 +757,7 @@ fn parse_manifest(path: &Path) -> Result<ParsedManifest, ProjectError> {
         .into_iter()
         .map(|(alias, value)| parse_dependency(&path, alias, value))
         .collect::<Result<Vec<_>, _>>()?;
+    let native = native::parse_targets(&path, document.native)?;
     let debug_optimization =
         validate_optimization(&path, "debug", document.profile.debug.optimization, 0)?;
     let release_optimization =
@@ -746,6 +767,7 @@ fn parse_manifest(path: &Path) -> Result<ParsedManifest, ProjectError> {
         name: document.package.name,
         version,
         dependencies,
+        native,
         debug_optimization,
         release_optimization,
     })
@@ -1038,7 +1060,9 @@ fn write_lock(path: &Path, lock: &LockDocument) -> Result<(), ProjectError> {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    text.push('\n');
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
     let temporary = write_temporary_lock(path, text.as_bytes())?;
     if path.exists()
         && let Err(source) = fs::remove_file(path)
@@ -1105,9 +1129,9 @@ fn write_temporary_lock(path: &Path, contents: &[u8]) -> Result<PathBuf, Project
     })
 }
 
-fn source_checksum(directory: &Path) -> Result<String, ProjectError> {
+fn source_checksum(directory: &Path, native_files: &[PathBuf]) -> Result<String, ProjectError> {
     let manifest = directory.join(MANIFEST_FILE);
-    let mut files = vec![manifest];
+    let mut files = BTreeSet::from([manifest]);
     let vendored_checksums = directory.join("checksums.sha256");
     if fs::symlink_metadata(&vendored_checksums)
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -1118,7 +1142,7 @@ fn source_checksum(directory: &Path) -> Result<String, ProjectError> {
         });
     }
     if vendored_checksums.is_file() {
-        files.push(vendored_checksums);
+        files.insert(vendored_checksums);
     }
     let source = directory.join("src");
     if fs::symlink_metadata(&source).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
@@ -1130,7 +1154,7 @@ fn source_checksum(directory: &Path) -> Result<String, ProjectError> {
     if source.is_dir() {
         files.extend(collect_source_files(&source)?);
     }
-    files.sort();
+    files.extend(native_files.iter().cloned());
     let mut digest = Sha256::new();
     for path in files {
         let relative = path.strip_prefix(directory).unwrap_or(&path);
@@ -1537,6 +1561,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use super::native::{NativeOperatingSystem, NativePlatform, host_native_platform};
     use super::{BuildProfile, LockMode, Project, ProjectError, git_output, normalized_path};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -1627,6 +1652,292 @@ edition = "2026"
         fixture.write("math/src/package.reim", "pub fn answer() -> i32 { 42 }");
     }
 
+    fn test_host_platform() -> NativePlatform {
+        host_native_platform().expect("tests require a supported native host")
+    }
+
+    fn shared_library_name(platform: NativePlatform, stem: &str) -> String {
+        match platform.operating_system {
+            NativeOperatingSystem::Windows => format!("{stem}.dll"),
+            NativeOperatingSystem::Linux => format!("lib{stem}.so"),
+            NativeOperatingSystem::MacOs => format!("lib{stem}.dylib"),
+        }
+    }
+
+    fn foreign_native_platform(platform: NativePlatform) -> &'static str {
+        match platform.operating_system {
+            NativeOperatingSystem::Windows => "linux-x86_64",
+            NativeOperatingSystem::Linux | NativeOperatingSystem::MacOs => "windows-x86_64",
+        }
+    }
+
+    #[test]
+    fn open_should_collect_host_native_dependencies_in_manifest_order() {
+        let fixture = Fixture::new();
+        let platform = test_host_platform();
+        let foreign = foreign_native_platform(platform);
+        let runtime = shared_library_name(platform, "fixture");
+        fixture.write(
+            "app/reimer.toml",
+            &format!(
+                r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[native.{platform}]
+library-paths = ["native/{platform}"]
+link-libraries = ["native_core", "native_bridge"]
+runtime-files = ["native/{platform}/{runtime}"]
+
+[native.{foreign}]
+link-libraries = ["foreign_library"]
+"#
+            ),
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+        fixture.write(&format!("app/native/{platform}/{runtime}"), "fixture");
+
+        let project =
+            Project::open(&fixture.path("app"), LockMode::Use).expect("project should resolve");
+        let native = project.native_dependencies();
+
+        assert_eq!(native.link_libraries(), ["native_core", "native_bridge"]);
+        assert_eq!(native.library_paths().len(), 1);
+        assert_eq!(
+            native.runtime_files()[0]
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(runtime.as_str())
+        );
+    }
+
+    #[test]
+    fn open_should_reject_native_parent_traversal() {
+        let fixture = Fixture::new();
+        let platform = test_host_platform();
+        fixture.write(
+            "app/reimer.toml",
+            &format!(
+                r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[native.{platform}]
+library-paths = ["../outside"]
+"#
+            ),
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("native paths must remain inside their package");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("cannot traverse parent directories")
+        ));
+    }
+
+    #[test]
+    fn open_should_reject_missing_native_paths_during_check_resolution() {
+        let fixture = Fixture::new();
+        let platform = test_host_platform();
+        fixture.write(
+            "app/reimer.toml",
+            &format!(
+                r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[native.{platform}]
+library-paths = ["native/missing"]
+"#
+            ),
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("missing native paths must fail project resolution");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("native/missing") && message.contains("cannot be inspected")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_should_reject_symlink_traversal_inside_native_directories() {
+        let fixture = Fixture::new();
+        let platform = test_host_platform();
+        fixture.write(
+            "app/reimer.toml",
+            &format!(
+                r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[native.{platform}]
+library-paths = ["native/{platform}"]
+"#
+            ),
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+        fixture.write("outside/library.bin", "outside");
+        let native = fixture.path(&format!("app/native/{platform}"));
+        fs::create_dir_all(&native).expect("native directory should be created");
+        symlink(fixture.path("outside/library.bin"), native.join("escape"))
+            .expect("native traversal fixture should be linked");
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("native directories cannot traverse through symbolic links");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("cannot contain symbolic links")
+        ));
+    }
+
+    #[test]
+    fn open_should_reject_unknown_native_platforms() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[native.window-x86_64]
+"#,
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("platform typos must be rejected");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("native target `window-x86_64` is unsupported")
+        ));
+    }
+
+    #[test]
+    fn open_should_reject_runtime_files_with_the_wrong_platform_extension() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[native.linux-x86_64]
+runtime-files = ["native/bridge.dll"]
+"#,
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("runtime library extensions must match their platform");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("does not use the platform shared-library extension")
+        ));
+    }
+
+    #[test]
+    fn open_should_reject_conflicting_runtime_destinations() {
+        let fixture = Fixture::new();
+        let platform = test_host_platform();
+        let runtime = shared_library_name(platform, "shared");
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+first = { path = "../first" }
+second = { path = "../second" }
+"#,
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+        for package in ["first", "second"] {
+            fixture.write(
+                &format!("{package}/reimer.toml"),
+                &format!(
+                    r#"[package]
+name = "{package}"
+version = "0.1.0"
+edition = "2026"
+
+[native.{platform}]
+library-paths = ["native/{platform}"]
+runtime-files = ["native/{platform}/{runtime}"]
+"#
+                ),
+            );
+            fixture.write(
+                &format!("{package}/src/package.reim"),
+                "pub fn marker() -> i32 { 0 }",
+            );
+            fixture.write(&format!("{package}/native/{platform}/{runtime}"), package);
+        }
+
+        let error = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect_err("two runtime files cannot stage to the same destination");
+
+        assert!(matches!(
+            error,
+            ProjectError::InvalidManifest { message, .. }
+                if message.contains("conflicts between packages `first` and `second`")
+        ));
+    }
+
+    #[test]
+    fn locked_mode_should_hash_declared_native_files() {
+        let fixture = Fixture::new();
+        let platform = test_host_platform();
+        let runtime = shared_library_name(platform, "fixture");
+        fixture.write(
+            "app/reimer.toml",
+            &format!(
+                r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[native.{platform}]
+library-paths = ["native/{platform}"]
+runtime-files = ["native/{platform}/{runtime}"]
+"#
+            ),
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+        let runtime_path = format!("app/native/{platform}/{runtime}");
+        fixture.write(&runtime_path, "first");
+        Project::open(&fixture.path("app"), LockMode::Use)
+            .expect("initial native lock should be written");
+        fixture.write(&runtime_path, "changed");
+
+        let error = Project::open(&fixture.path("app"), LockMode::Locked)
+            .expect_err("native artifact drift must invalidate the lockfile");
+
+        assert!(matches!(error, ProjectError::LockOutOfDate { .. }));
+    }
+
     #[test]
     fn open_should_resolve_path_graph_and_write_a_deterministic_lockfile() {
         let fixture = Fixture::new();
@@ -1685,6 +1996,8 @@ edition = "2026"
         assert_eq!(execute(&project), 42);
         assert_eq!(project.optimization(BuildProfile::Debug), 1);
         assert_eq!(first_lock, second_lock);
+        assert!(first_lock.ends_with('\n'));
+        assert!(!first_lock.ends_with("\n\n"));
     }
 
     #[test]

@@ -38,11 +38,17 @@ from reaching gameplay systems.
 Run the complete example from the repository root:
 
 ```powershell
-vendor\imgui\tools\invoke.ps1 -Project examples\imgui_demo -Command run -Release
+reimer run examples\imgui_demo --release
 ```
 
-For a distributable executable, use `-Command build`; the helper copies
-`imgui.dll`, `SDL3.dll`, and `wgpu_native.dll` beside the generated program.
+For a distributable executable, run:
+
+```powershell
+reimer build examples\imgui_demo --release
+```
+
+The manifest copies `imgui.dll`, `SDL3.dll`, `wgpu_native.dll`, and
+`wgpu_bridge.dll` beside the generated program.
 
 ## Reproduce the bindings and native bridge
 

@@ -1,10 +1,13 @@
 //! Host-native executable linking for generated Reimer objects.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use reimer_project::NativeDependencies;
 
 use crate::generated_output;
 
@@ -18,12 +21,14 @@ const HOST_TARGET: &str = env!("REIMER_HOST_TARGET");
 /// # Errors
 ///
 /// Returns an error when an intermediate artifact cannot be written, the Rust
-/// linker driver cannot start, or native linking fails.
+/// linker driver cannot start, native linking fails, or a runtime library
+/// cannot be staged safely.
 pub fn link_executable(
     object: &[u8],
     executable: &Path,
     artifact_directory: &Path,
     generated_root: &Path,
+    native: &NativeDependencies,
     generated_executable: bool,
 ) -> Result<PathBuf, String> {
     let artifact_directory =
@@ -66,6 +71,14 @@ pub fn link_executable(
             .arg("-C")
             .arg(format!("linker={}", linker.display()));
     }
+    for path in native.library_paths() {
+        let mut argument = OsString::from("native=");
+        argument.push(path);
+        command.arg("-L").arg(argument);
+    }
+    for library in native.link_libraries() {
+        command.arg("-l").arg(format!("dylib={library}"));
+    }
     let output = command
         .arg("-o")
         .arg(&executable)
@@ -82,7 +95,122 @@ pub fn link_executable(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
+    stage_runtime_files(
+        native.runtime_files(),
+        &executable,
+        generated_root,
+        generated_executable,
+    )?;
     Ok(object_path)
+}
+
+fn stage_runtime_files(
+    sources: &[PathBuf],
+    executable: &Path,
+    generated_root: &Path,
+    generated_executable: bool,
+) -> Result<(), String> {
+    let directory = executable.parent().unwrap_or_else(|| Path::new("."));
+    let mut destinations = BTreeMap::new();
+    let mut staged = Vec::with_capacity(sources.len());
+    for source in sources {
+        let name = source.file_name().ok_or_else(|| {
+            format!(
+                "native runtime file `{}` has no destination file name",
+                source.display()
+            )
+        })?;
+        let destination = directory.join(name);
+        if same_output_path(&destination, executable) {
+            return Err(format!(
+                "native runtime file `{}` conflicts with executable `{}`",
+                source.display(),
+                executable.display()
+            ));
+        }
+        let key = runtime_output_key(name);
+        if let Some(existing) = destinations.insert(key, source)
+            && existing != source
+        {
+            return Err(format!(
+                "native runtime files `{}` and `{}` conflict at `{}`",
+                existing.display(),
+                source.display(),
+                destination.display()
+            ));
+        }
+        staged.push((source, destination));
+    }
+    for (source, destination) in staged {
+        let contents = fs::read(source).map_err(|error| {
+            format!(
+                "failed to read native runtime file `{}`: {error}",
+                source.display()
+            )
+        })?;
+        if generated_executable {
+            generated_output::write_if_changed(generated_root, &destination, &contents)?;
+        } else {
+            write_runtime_file(&destination, &contents)?;
+        }
+    }
+    Ok(())
+}
+
+fn runtime_output_key(name: &std::ffi::OsStr) -> String {
+    let name = name.to_string_lossy();
+    if cfg!(windows) {
+        name.to_ascii_lowercase()
+    } else {
+        name.into_owned()
+    }
+}
+
+fn write_runtime_file(destination: &Path, contents: &[u8]) -> Result<(), String> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "refusing to replace linked or non-file native runtime output `{}`",
+                destination.display()
+            ));
+        }
+        Ok(_) => {
+            let existing = fs::read(destination).map_err(|error| {
+                format!(
+                    "failed to read native runtime output `{}`: {error}",
+                    destination.display()
+                )
+            })?;
+            if existing == contents {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect native runtime output `{}`: {error}",
+                destination.display()
+            ));
+        }
+    }
+    fs::write(destination, contents).map_err(|error| {
+        format!(
+            "failed to stage native runtime output `{}`: {error}",
+            destination.display()
+        )
+    })
+}
+
+fn same_output_path(left: &Path, right: &Path) -> bool {
+    if cfg!(windows) {
+        left.components()
+            .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .eq(right
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase()))
+    } else {
+        left == right
+    }
 }
 
 #[cfg(windows)]
@@ -122,4 +250,107 @@ fn bundled_windows_linker(compiler: &OsString) -> Result<PathBuf, String> {
 
 const fn object_extension() -> &'static str {
     if cfg!(windows) { "obj" } else { "o" }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::stage_runtime_files;
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let unique = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "reimer-native-linker-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("fixture root should be created");
+            Self { root }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn stage_runtime_files_should_copy_libraries_beside_the_executable() {
+        let fixture = Fixture::new();
+        let source = fixture.root.join("vendor/native.dll");
+        let output = fixture.root.join("target/game.exe");
+        fs::create_dir_all(source.parent().expect("source should have a parent"))
+            .expect("source directory should be created");
+        fs::create_dir_all(output.parent().expect("output should have a parent"))
+            .expect("output directory should be created");
+        fs::write(&source, b"native").expect("native fixture should be written");
+
+        stage_runtime_files(&[source], &output, &fixture.root, true)
+            .expect("runtime file should be staged");
+
+        assert_eq!(
+            fs::read(fixture.root.join("target/native.dll"))
+                .expect("staged runtime should be readable"),
+            b"native"
+        );
+    }
+
+    #[test]
+    fn stage_runtime_files_should_reject_an_executable_name_collision() {
+        let fixture = Fixture::new();
+        let source = fixture.root.join("vendor/game.exe");
+        let output = fixture.root.join("target/game.exe");
+        fs::create_dir_all(source.parent().expect("source should have a parent"))
+            .expect("source directory should be created");
+        fs::create_dir_all(output.parent().expect("output should have a parent"))
+            .expect("output directory should be created");
+        fs::write(&source, b"native").expect("native fixture should be written");
+        let expected = output
+            .parent()
+            .expect("output should have a parent")
+            .join(source.file_name().expect("source should have a file name"));
+        assert!(
+            super::same_output_path(&expected, &output),
+            "expected {expected:?} to equal {output:?}"
+        );
+
+        let error = stage_runtime_files(&[source], &output, &fixture.root, true)
+            .expect_err("runtime file cannot replace the executable");
+
+        assert!(error.contains("conflicts with executable"));
+    }
+
+    #[test]
+    fn stage_runtime_files_should_reject_conflicting_custom_output_names() {
+        let fixture = Fixture::new();
+        let first = fixture.root.join("first/native.dll");
+        let second = fixture.root.join("second/native.dll");
+        let output = fixture.root.join("custom/game.exe");
+        for (source, contents) in [
+            (&first, b"first".as_slice()),
+            (&second, b"second".as_slice()),
+        ] {
+            fs::create_dir_all(source.parent().expect("source should have a parent"))
+                .expect("source directory should be created");
+            fs::write(source, contents).expect("native fixture should be written");
+        }
+        fs::create_dir_all(output.parent().expect("output should have a parent"))
+            .expect("output directory should be created");
+
+        let error = stage_runtime_files(&[first, second], &output, &fixture.root, false)
+            .expect_err("custom output cannot collapse distinct runtime files");
+
+        assert!(error.contains("conflict at"));
+        assert!(!fixture.root.join("custom/native.dll").exists());
+    }
 }

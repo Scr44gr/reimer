@@ -10,12 +10,12 @@ Executable source files define `fn main() -> i32`. The returned integer becomes 
 from std::io import println;
 
 fn main() -> i32 {
-    match println("Hello from Reimer") {
-        Ok(_) => 0,
-        Err(_) => 1,
-    }
+    println("Hello from Reimer").expect("standard output must be writable");
+    0
 }
 ```
+
+`expect` is concise when failure violates an application invariant. Use `?` when the caller should receive and handle the error.
 
 Run a single source file directly:
 

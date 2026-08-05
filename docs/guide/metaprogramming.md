@@ -105,7 +105,8 @@ fn header_default_should_be_zeroed() {
 `Copy`, `Eq`, `Hash`, `Debug`, and `Default` are accepted only when every field
 supports the operation. An enum's `Default` uses its first variant. `Clone` is
 only derived for `Copy` fields: `value.clone()` never allocates, fails, or
-requires an allocator. Owned containers retain `clone_in`.
+requires an allocator. Allocator-backed duplication is type-specific and
+explicit; `String` currently provides `clone_in`.
 
 `Pod` is a compiler-provided derive for byte-safe native and GPU transfers. It
 requires `@repr(C)`, rejects implicit padding, and accepts only numeric scalar

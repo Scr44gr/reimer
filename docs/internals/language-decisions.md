@@ -107,7 +107,8 @@ hide allocations, failures, or resource-specific semantics.
 
 - `Copy` means implicit, bitwise, infallible duplication without an allocator.
 - Derived `Clone` means explicit duplication with the same restrictions.
-- Owned containers provide `clone_in(allocator)`.
+- Allocator-backed types provide type-specific explicit duplication when it is
+  implemented. `String` currently exposes `clone_in(allocator)`.
 - Resources provide semantic operations such as `duplicate_handle()` or
   `retain()`.
 
@@ -119,7 +120,7 @@ struct Point {
 }
 
 let second = point.clone();
-let copy = bytes.clone_in(allocator)?;
+let copy = text.clone_in(allocator)?;
 let handle = texture.duplicate_handle()?;
 ```
 

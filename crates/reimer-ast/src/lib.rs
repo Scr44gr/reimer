@@ -675,6 +675,8 @@ pub enum Expression {
     Struct(StructExpression),
     /// A local, function, module, or associated path.
     Path(Path),
+    /// A generic function specialized as a first-class function value.
+    GenericFunction(Box<GenericFunctionExpression>),
     /// A prefix operation.
     Unary(Box<UnaryExpression>),
     /// An infix operation.
@@ -725,6 +727,7 @@ impl Expression {
             Self::Array(expression) => expression.span,
             Self::Struct(expression) => expression.span,
             Self::Path(path) => path.span,
+            Self::GenericFunction(expression) => expression.span,
             Self::Unary(expression) => expression.span,
             Self::Binary(expression) => expression.span,
             Self::Call(expression) => expression.span,
@@ -738,6 +741,17 @@ impl Expression {
             Self::Index(expression) => expression.span,
         }
     }
+}
+
+/// A generic function item with every generic argument fixed explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericFunctionExpression {
+    /// Generic function path.
+    pub path: Path,
+    /// Type or constant arguments used for monomorphization.
+    pub generic_arguments: Vec<GenericArgument>,
+    /// Full expression span, including the turbofish arguments.
+    pub span: Span,
 }
 
 /// A sequence of literal text and typed interpolation expressions.
@@ -1093,6 +1107,8 @@ pub struct CallExpression {
     pub callee: Expression,
     /// Explicit type or constant arguments written before the call parentheses.
     pub generic_arguments: Vec<GenericArgument>,
+    /// Whether the source included a generic argument list, even when it was empty.
+    pub has_explicit_generic_arguments: bool,
     /// Arguments in source order.
     pub arguments: Vec<Expression>,
     /// Full expression span.

@@ -37,7 +37,7 @@ fn exercise_text() -> Result<i32, AllocError> {
         &repeated,
         &uppercase,
     );
-    println(formatted.as_str());
+    println(formatted.as_str()).expect("formatted output must be writable");
     uppercase.deinit();
     repeated.deinit();
     combined.deinit();
@@ -49,8 +49,5 @@ fn exercise_text() -> Result<i32, AllocError> {
 }
 
 fn main() -> i32 {
-    match exercise_text() {
-        Ok(value) => value,
-        Err(_) => 1,
-    }
+    exercise_text().expect("the text example must complete")
 }

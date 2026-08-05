@@ -51,6 +51,32 @@ fn run_command_should_report_the_assertion_message() {
 }
 
 #[test]
+fn run_command_should_report_the_result_expect_message() {
+    let fixture = Fixture::source(
+        "struct PlainError { code: i32 }
+        fn fail() -> Result<i32, PlainError> {
+            Err(PlainError { code: 7 })
+        }
+        fn main() -> i32 {
+            fail().expect(\"asset load must succeed\")
+        }",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reimer"))
+        .arg("run")
+        .arg(&fixture.path)
+        .output()
+        .expect("compiler process should start");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("asset load must succeed"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn release_run_should_omit_a_failing_debug_assertion() {
     let fixture = Fixture::source(
         "fn main() -> i32 {

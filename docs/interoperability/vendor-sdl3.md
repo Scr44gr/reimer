@@ -79,16 +79,13 @@ program maps them to its own actions.
 
 ## Run or build an application
 
-Use the package launcher so the native loader and linker both see the pinned
-artifacts:
+Run the project directly. SDL3's package manifest supplies its pinned native
+artifacts transitively:
 
 ```powershell
-.\vendor\sdl3\tools\invoke.ps1 `
-    -Project ..\my-graphics-app `
-    -Command run `
-    -Release `
-    -Locked
+reimer run ..\my-graphics-app --release --locked
 ```
 
-`-Command build` also copies `SDL3.dll` beside the generated executable. The
-package README documents its target matrix and update procedure.
+`reimer build` also copies `SDL3.dll` beside the generated executable. The
+package README documents its target matrix and update procedure. No global or
+process-local `PATH` modification is required.

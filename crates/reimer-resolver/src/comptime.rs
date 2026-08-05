@@ -381,38 +381,7 @@ impl<'ast, 'metadata, M: Metadata> Evaluator<'ast, 'metadata, M> {
                 expansion.span,
                 "use the expansion inside a generic runtime tuple",
             ),
-            Expression::Array(array) => match &array.kind {
-                ast::ArrayExpressionKind::List(elements) => {
-                    self.evaluate_values(elements, frame).map(Value::Array)
-                }
-                ast::ArrayExpressionKind::Repeat { value, length } => {
-                    let length_value = self.evaluate_expression(length, frame)?;
-                    let Some(length) = length_value
-                        .as_non_negative_u128()
-                        .and_then(|value| usize::try_from(value).ok())
-                    else {
-                        return self.fail(
-                            "E7011",
-                            "repeated array length must be a non-negative integer constant",
-                            length.span(),
-                            "use a compile-time length that fits in `usize`",
-                        );
-                    };
-                    let value = self.evaluate_expression(value, frame)?;
-                    let element_storage = std::mem::size_of::<Value>()
-                        .saturating_add(value.memory_size())
-                        .max(1);
-                    if length > DEFAULT_MEMORY_LIMIT / element_storage {
-                        return self.fail(
-                            "E7014",
-                            "repeated array exceeds the compile-time memory limit",
-                            array.span,
-                            "reduce the repeated length or construct the array at runtime",
-                        );
-                    }
-                    Ok(Value::Array(vec![value; length]))
-                }
-            },
+            Expression::Array(array) => self.evaluate_array(array, frame),
             Expression::Struct(structure) => {
                 let mut fields = BTreeMap::new();
                 for field in &structure.fields {
@@ -424,6 +393,9 @@ impl<'ast, 'metadata, M: Metadata> Evaluator<'ast, 'metadata, M> {
                 Ok(Value::Record(fields))
             }
             Expression::Path(path) => self.evaluate_path(path, frame),
+            Expression::GenericFunction(function) => {
+                self.reject_compiletime_function_value(function)
+            }
             Expression::Unary(unary) => {
                 let value = self.evaluate_expression(&unary.operand, frame)?;
                 self.evaluate_unary(unary.operator, value, unary.span)
@@ -454,6 +426,67 @@ impl<'ast, 'metadata, M: Metadata> Evaluator<'ast, 'metadata, M> {
                 "handle the value explicitly before entering `comptime`",
             ),
         }
+    }
+
+    fn reject_compiletime_function_value(
+        &mut self,
+        function: &ast::GenericFunctionExpression,
+    ) -> EvalResult<Value> {
+        self.fail(
+            "E7012",
+            "function values are not available during compile-time evaluation",
+            function.span,
+            "materialize the specialized function in runtime code",
+        )
+    }
+
+    fn evaluate_array(
+        &mut self,
+        array: &ast::ArrayExpression,
+        frame: &mut Frame,
+    ) -> EvalResult<Value> {
+        match &array.kind {
+            ast::ArrayExpressionKind::List(elements) => {
+                self.evaluate_values(elements, frame).map(Value::Array)
+            }
+            ast::ArrayExpressionKind::Repeat { value, length } => {
+                self.evaluate_repeated_array(value, length, array.span, frame)
+            }
+        }
+    }
+
+    fn evaluate_repeated_array(
+        &mut self,
+        value: &Expression,
+        length: &Expression,
+        span: Span,
+        frame: &mut Frame,
+    ) -> EvalResult<Value> {
+        let length_value = self.evaluate_expression(length, frame)?;
+        let Some(length) = length_value
+            .as_non_negative_u128()
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return self.fail(
+                "E7011",
+                "repeated array length must be a non-negative integer constant",
+                length.span(),
+                "use a compile-time length that fits in `usize`",
+            );
+        };
+        let value = self.evaluate_expression(value, frame)?;
+        let element_storage = std::mem::size_of::<Value>()
+            .saturating_add(value.memory_size())
+            .max(1);
+        if length > DEFAULT_MEMORY_LIMIT / element_storage {
+            return self.fail(
+                "E7014",
+                "repeated array exceeds the compile-time memory limit",
+                span,
+                "reduce the repeated length or construct the array at runtime",
+            );
+        }
+        Ok(Value::Array(vec![value; length]))
     }
 
     fn evaluate_conditional(

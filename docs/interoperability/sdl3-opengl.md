@@ -19,33 +19,30 @@ The example's public API is safe. `unsafe` blocks are limited to FFI calls and
 use opaque handles returned by SDL. Tensor allocation, indexing, borrowing,
 and cleanup remain safe source-language operations.
 
-## Run on Windows x64
+## Run a manifest-backed SDL3 and OpenGL application
 
-From the repository root:
+`m5_sdl_opengl.reim` remains a focused single-file compiler fixture. For an
+interactive project that declares every native dependency in `reimer.toml`,
+run the SDL3 + OpenGL + Dear ImGui example from the repository root:
 
 ```powershell
-.\scripts\demos\run-sdl-opengl.ps1
+reimer run examples\imgui_demo --release --locked
 ```
 
-The script uses the pinned SDL 3.4.12 runtime in
-`vendor/sdl3/native/windows-x86_64` and temporarily adds that directory to
-`PATH`. The upstream archive and checked-in artifact digests are recorded in
-`vendor/sdl3/checksums.sha256`. OpenGL 1.1 comes from `opengl32.dll`, which is
-included with Windows. The example only calls `glClearColor` and `glClear`, so
-it does not require an extension loader.
+The project receives SDL3, OpenGL, and Dear ImGui through package dependencies.
+Reimer resolves the vendored linker and runtime files transitively without a
+launcher or `PATH`/`LIB` changes. The upstream SDL archive and checked-in
+artifact digests remain recorded in `vendor/sdl3/checksums.sha256`.
 
-A successful run displays a blue window and ends with
-`program returned 42`.
-
-## Check without native libraries
+## Check the standalone compiler fixture
 
 Object generation validates the lexer, parser, types, FFI, and backend without
 loading SDL or opening a window:
 
 ```powershell
-cargo run -p reimer-cli --locked -- emit-object examples/m5_sdl_opengl.reim
+reimer emit-object examples\m5_sdl_opengl.reim
 ```
 
-Execution requires Windows x64 with a working OpenGL driver. On other systems,
-replace the `opengl32` link with the platform OpenGL library and add a matching
-native target to the vendored SDL3 package.
+The standalone fixture names Windows OpenGL directly. Portable applications
+should use a project manifest and target-specific vendor declarations instead
+of relying on process environment variables.

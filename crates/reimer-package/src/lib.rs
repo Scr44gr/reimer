@@ -1433,17 +1433,7 @@ fn visit_type_paths<'ast>(ty: &'ast TypeName, paths: &mut Vec<&'ast ast::Path>) 
         TypeNameKind::Path(path) => paths.push(path),
         TypeNameKind::Generic { path, arguments } => {
             paths.push(path);
-            for argument in arguments {
-                match argument {
-                    ast::GenericArgument::Type(ty) => visit_type_paths(ty, paths),
-                    ast::GenericArgument::Const(value) => visit_expression_paths(value, paths),
-                    ast::GenericArgument::Pack { template, .. } => {
-                        if let Some(template) = template {
-                            visit_type_paths(template, paths);
-                        }
-                    }
-                }
-            }
+            visit_generic_argument_paths(arguments, paths);
         }
         TypeNameKind::PackExpansion { template, .. } => {
             if let Some(template) = template {
@@ -1464,6 +1454,23 @@ fn visit_type_paths<'ast>(ty: &'ast TypeName, paths: &mut Vec<&'ast ast::Path>) 
             visit_type_paths(target, paths);
         }
         TypeNameKind::Unit => {}
+    }
+}
+
+fn visit_generic_argument_paths<'ast>(
+    arguments: &'ast [ast::GenericArgument],
+    paths: &mut Vec<&'ast ast::Path>,
+) {
+    for argument in arguments {
+        match argument {
+            ast::GenericArgument::Type(ty) => visit_type_paths(ty, paths),
+            ast::GenericArgument::Const(value) => visit_expression_paths(value, paths),
+            ast::GenericArgument::Pack { template, .. } => {
+                if let Some(template) = template {
+                    visit_type_paths(template, paths);
+                }
+            }
+        }
     }
 }
 
@@ -1576,6 +1583,10 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
             }
         }
         Expression::Path(path) => paths.push(path),
+        Expression::GenericFunction(function) => {
+            paths.push(&function.path);
+            visit_generic_argument_paths(&function.generic_arguments, paths);
+        }
         Expression::Unary(unary) => visit_expression_paths(&unary.operand, paths),
         Expression::Binary(binary) => {
             visit_expression_paths(&binary.left, paths);
@@ -1583,17 +1594,7 @@ fn visit_expression_paths<'ast>(expression: &'ast Expression, paths: &mut Vec<&'
         }
         Expression::Call(call) => {
             visit_expression_paths(&call.callee, paths);
-            for argument in &call.generic_arguments {
-                match argument {
-                    ast::GenericArgument::Type(ty) => visit_type_paths(ty, paths),
-                    ast::GenericArgument::Const(value) => visit_expression_paths(value, paths),
-                    ast::GenericArgument::Pack { template, .. } => {
-                        if let Some(template) = template {
-                            visit_type_paths(template, paths);
-                        }
-                    }
-                }
-            }
+            visit_generic_argument_paths(&call.generic_arguments, paths);
             for argument in &call.arguments {
                 visit_expression_paths(argument, paths);
             }
@@ -2176,13 +2177,13 @@ fn rewrite_scoped_expression(
             rewrite_array_expression(array, scope, apis, diagnostics, local_scopes);
         }
         Expression::Struct(structure) => {
-            rewrite_path(&mut structure.path, scope, apis, diagnostics);
-            for field in &mut structure.fields {
-                rewrite_scoped_expression(&mut field.value, scope, apis, diagnostics, local_scopes);
-            }
+            rewrite_scoped_struct(structure, scope, apis, diagnostics, local_scopes);
         }
         Expression::Path(path) => {
             rewrite_scoped_path(path, scope, apis, diagnostics, local_scopes);
+        }
+        Expression::GenericFunction(function) => {
+            rewrite_scoped_generic_function(function, scope, apis, diagnostics, local_scopes);
         }
         Expression::Unary(unary) => {
             rewrite_scoped_expression(&mut unary.operand, scope, apis, diagnostics, local_scopes);
@@ -2248,15 +2249,44 @@ fn rewrite_scoped_expression(
     }
 }
 
-fn rewrite_scoped_call(
-    call: &mut ast::CallExpression,
+fn rewrite_scoped_struct(
+    structure: &mut ast::StructExpression,
     scope: &Scope,
     apis: &ModuleApis,
     diagnostics: &mut Vec<FileDiagnostic>,
     local_scopes: &mut Vec<HashSet<String>>,
 ) {
-    rewrite_scoped_expression(&mut call.callee, scope, apis, diagnostics, local_scopes);
-    for argument in &mut call.generic_arguments {
+    rewrite_path(&mut structure.path, scope, apis, diagnostics);
+    for field in &mut structure.fields {
+        rewrite_scoped_expression(&mut field.value, scope, apis, diagnostics, local_scopes);
+    }
+}
+
+fn rewrite_scoped_generic_function(
+    function: &mut ast::GenericFunctionExpression,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
+) {
+    rewrite_path(&mut function.path, scope, apis, diagnostics);
+    rewrite_scoped_generic_arguments(
+        &mut function.generic_arguments,
+        scope,
+        apis,
+        diagnostics,
+        local_scopes,
+    );
+}
+
+fn rewrite_scoped_generic_arguments(
+    arguments: &mut [ast::GenericArgument],
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
+) {
+    for argument in arguments {
         match argument {
             ast::GenericArgument::Type(ty) => rewrite_type(ty, scope, apis, diagnostics),
             ast::GenericArgument::Const(value) => {
@@ -2269,6 +2299,23 @@ fn rewrite_scoped_call(
             }
         }
     }
+}
+
+fn rewrite_scoped_call(
+    call: &mut ast::CallExpression,
+    scope: &Scope,
+    apis: &ModuleApis,
+    diagnostics: &mut Vec<FileDiagnostic>,
+    local_scopes: &mut Vec<HashSet<String>>,
+) {
+    rewrite_scoped_expression(&mut call.callee, scope, apis, diagnostics, local_scopes);
+    rewrite_scoped_generic_arguments(
+        &mut call.generic_arguments,
+        scope,
+        apis,
+        diagnostics,
+        local_scopes,
+    );
     for argument in &mut call.arguments {
         rewrite_scoped_expression(argument, scope, apis, diagnostics, local_scopes);
     }

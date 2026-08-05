@@ -1,23 +1,39 @@
+/// Failure reported by explicit allocation operations.
 pub enum AllocError {
+    /// The allocator could not satisfy a request, its size overflowed, or an
+    /// allocator could not be initialized from the supplied storage policy.
     OutOfMemory,
+    /// A requested alignment was zero or not a power of two.
+    InvalidAlignment,
 }
 
+/// Copyable handle to one allocation strategy.
+///
+/// General and page handles are process-stable. Handles copied from an arena
+/// or fixed buffer remain valid only while their allocator owner is alive.
 pub struct Allocator {
     raw: usize,
 }
 
 impl Copy for Allocator {}
 
+/// Owned contiguous bytes that retain their allocator and alignment.
+///
+/// The safe slice methods are preferred for ordinary access. Raw pointers are
+/// intended for narrow native boundaries and cannot outlive this owner.
 pub struct OwnedBytes {
     data: *mut u8,
     len: usize,
+    alignment: usize,
     allocator: usize,
 }
 
+/// Allocator that releases all child backing regions as one lifetime group.
 pub struct ArenaAllocator {
     allocator: Allocator,
 }
 
+/// Bump allocator over a caller-owned, fixed-capacity byte region.
 pub struct FixedBufferAllocator {
     allocator: Allocator,
 }
@@ -35,35 +51,67 @@ extern "C" {
     ) -> i32;
 }
 
+/// Returns the process-stable allocator for owners with independent lifetimes.
 pub fn general_allocator() -> Allocator {
     Allocator { raw: 1 }
 }
 
+/// Returns the process-stable allocator whose physical reservations are
+/// page-rounded and aligned to at least 4 KiB.
 pub fn page_allocator() -> Allocator {
     Allocator { raw: 2 }
 }
 
 impl Allocator {
+    /// Returns the runtime handle for an ABI that explicitly accepts a Reimer
+    /// allocator.
+    ///
+    /// Do not fabricate, persist, or use this value as an address.
     pub fn opaque_handle(&self) -> usize {
         (*self).raw
     }
 }
 
+/// Allocates `len` owned bytes with byte alignment.
 pub fn allocate_bytes(
     allocator: &Allocator,
     len: usize,
 ) -> Result<OwnedBytes, AllocError> {
-    __allocate_bytes((*allocator).raw, len)
+    allocate_aligned_bytes(allocator, len, 1)
 }
 
-pub fn deinit_bytes(bytes: OwnedBytes) {
-    unsafe {
-        __deallocate_bytes(bytes.allocator, bytes.data, bytes.len);
+/// Allocates `len` owned bytes with a power-of-two byte alignment.
+pub fn allocate_aligned_bytes(
+    allocator: &Allocator,
+    len: usize,
+    alignment: usize,
+) -> Result<OwnedBytes, AllocError> {
+    if !is_valid_alignment(alignment) {
+        Err(AllocError::InvalidAlignment)
+    } else {
+        __allocate_aligned_bytes((*allocator).raw, len, alignment)
     }
 }
 
+/// Consumes and releases one `OwnedBytes` value through its original allocator.
+pub fn deinit_bytes(bytes: OwnedBytes) {
+    unsafe {
+        __deallocate_aligned_bytes(
+            bytes.allocator,
+            bytes.data,
+            bytes.len,
+            bytes.alignment,
+        );
+    }
+}
+
+/// Returns the logical byte length retained by `bytes`.
 pub fn bytes_len(bytes: &OwnedBytes) -> usize {
     (*bytes).len
+}
+
+fn is_valid_alignment(alignment: usize) -> bool {
+    alignment != 0 && (alignment & (alignment - 1)) == 0
 }
 
 impl OwnedBytes {
@@ -72,14 +120,17 @@ impl OwnedBytes {
         OwnedBytes {
             data: 0 as usize as *mut u8,
             len: 0,
+            alignment: 1,
             allocator: (*allocator).raw,
         }
     }
 
+    /// Returns this owner's logical byte length.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Borrows the first byte address for read-only native interoperability.
     pub fn as_ptr(&self) -> *const u8 {
         self.data as *const u8
     }
@@ -94,16 +145,45 @@ impl OwnedBytes {
         __slice_from_parts(self.data, self.len)
     }
 
+    /// Borrows the first byte address for exclusive native interoperability.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data
     }
 
+    /// Returns the power-of-two alignment retained for this allocation.
+    pub fn alignment(&self) -> usize {
+        self.alignment
+    }
+
+    /// Grows this owner while preserving its current alignment.
     pub fn grow(&mut self, new_len: usize) -> Result<(), AllocError> {
-        if new_len <= self.len {
+        let alignment = self.alignment;
+        self.grow_aligned(new_len, alignment)
+    }
+
+    /// Ensures at least `new_len` bytes with the requested power-of-two alignment.
+    pub fn grow_aligned(
+        &mut self,
+        new_len: usize,
+        alignment: usize,
+    ) -> Result<(), AllocError> {
+        if !is_valid_alignment(alignment) {
+            return Err(AllocError::InvalidAlignment);
+        }
+        if new_len <= self.len && alignment == self.alignment {
             Ok(())
         } else {
+            let target_len = if new_len > self.len {
+                new_len
+            } else {
+                self.len
+            };
             let allocation: Result<OwnedBytes, AllocError> =
-                __allocate_bytes(self.allocator, new_len);
+                __allocate_aligned_bytes(
+                    self.allocator,
+                    target_len,
+                    alignment,
+                );
             let replacement = allocation?;
             let status = unsafe {
                 copy_bytes(
@@ -114,18 +194,25 @@ impl OwnedBytes {
             };
             if status == 0 {
                 unsafe {
-                    __deallocate_bytes(self.allocator, self.data, self.len);
+                    __deallocate_aligned_bytes(
+                        self.allocator,
+                        self.data,
+                        self.len,
+                        self.alignment,
+                    );
                 }
                 self.data = replacement.data;
                 self.len = replacement.len;
+                self.alignment = replacement.alignment;
                 self.allocator = replacement.allocator;
                 Ok(())
             } else {
                 unsafe {
-                    __deallocate_bytes(
+                    __deallocate_aligned_bytes(
                         replacement.allocator,
                         replacement.data,
                         replacement.len,
+                        replacement.alignment,
                     );
                 }
                 panic("std::alloc received invalid bounded byte regions")
@@ -136,22 +223,34 @@ impl OwnedBytes {
     /// Releases the current region and takes ownership of `replacement`.
     pub fn replace(&mut self, replacement: OwnedBytes) {
         unsafe {
-            __deallocate_bytes(self.allocator, self.data, self.len);
+            __deallocate_aligned_bytes(
+                self.allocator,
+                self.data,
+                self.len,
+                self.alignment,
+            );
         }
         self.data = replacement.data;
         self.len = replacement.len;
+        self.alignment = replacement.alignment;
         self.allocator = replacement.allocator;
     }
 
+    /// Consumes and releases this byte region through its original allocator.
     pub fn deinit(self) {
         deinit_bytes(self);
     }
 
     /// Releases this region in place and makes repeated cleanup a no-op.
     pub fn release(&mut self) {
-        if self.len != 0 {
+        if self.data as usize != 0 {
             unsafe {
-                __deallocate_bytes(self.allocator, self.data, self.len);
+                __deallocate_aligned_bytes(
+                    self.allocator,
+                    self.data,
+                    self.len,
+                    self.alignment,
+                );
             }
             self.data = 0 as usize as *mut u8;
             self.len = 0;
@@ -160,6 +259,10 @@ impl OwnedBytes {
 }
 
 impl ArenaAllocator {
+    /// Creates an arena backed by a process-stable parent allocator.
+    ///
+    /// The current runtime accepts the general or page allocator as the
+    /// parent. Unsupported or unavailable parents return `OutOfMemory`.
     pub fn init(parent: &Allocator) -> Result<ArenaAllocator, AllocError> {
         let raw = unsafe { arena_allocator_init(parent.raw) };
         if raw == 0 {
@@ -171,6 +274,7 @@ impl ArenaAllocator {
         }
     }
 
+    /// Borrows the arena handle for immediate child construction.
     pub fn allocator(&self) -> &Allocator {
         &self.allocator
     }
@@ -197,6 +301,10 @@ impl ArenaAllocator {
         }
     }
 
+    /// Consumes the arena and releases every child backing allocation.
+    ///
+    /// Child owners must be cleaned before this method runs. Use `release`
+    /// instead when an aggregate requires idempotent in-place cleanup.
     pub fn deinit(self) {
         unsafe {
             arena_allocator_deinit(self.allocator.raw);
@@ -205,6 +313,11 @@ impl ArenaAllocator {
 }
 
 impl FixedBufferAllocator {
+    /// Creates a bump allocator over `len` caller-owned bytes at `data`.
+    ///
+    /// Null or zero-length storage returns `OutOfMemory`. The backing region
+    /// must remain alive and unmoved until every child and this allocator have
+    /// been cleaned up.
     pub fn init(data: *mut u8, len: usize) -> Result<FixedBufferAllocator, AllocError> {
         let raw = unsafe { fixed_buffer_allocator_init(data, len) };
         if raw == 0 {
@@ -216,6 +329,7 @@ impl FixedBufferAllocator {
         }
     }
 
+    /// Borrows the fixed-buffer handle for immediate child construction.
     pub fn allocator(&self) -> &Allocator {
         &self.allocator
     }
@@ -238,9 +352,56 @@ impl FixedBufferAllocator {
         }
     }
 
+    /// Consumes and retires this allocator without freeing caller-owned bytes.
+    ///
+    /// Child owners must be cleaned before this method runs. Retiring the
+    /// allocator does not deinitialize its backing storage.
     pub fn deinit(self) {
         unsafe {
             fixed_buffer_allocator_deinit(self.allocator.raw);
         }
+    }
+}
+
+fn assert_invalid_alignment(result: Result<OwnedBytes, AllocError>) {
+    match result {
+        Err(AllocError::InvalidAlignment) => (),
+        _ => panic("aligned allocation accepted an invalid alignment"),
+    }
+}
+
+@test
+fn aligned_allocation_should_reject_invalid_alignments() {
+    let allocator = general_allocator();
+
+    assert_invalid_alignment(allocate_aligned_bytes(&allocator, 16, 0));
+    assert_invalid_alignment(allocate_aligned_bytes(&allocator, 16, 24));
+}
+
+@test
+fn realigning_owned_bytes_should_preserve_the_existing_region() {
+    let mut backing: [u8; 257] = [0; 257];
+    let base = &mut backing as *mut u8;
+    let misaligned = (base as usize + 1) as *mut u8;
+    let fixed = FixedBufferAllocator::init(misaligned, 256)
+        .expect("fixed allocator creation must succeed");
+    defer fixed.deinit();
+    let mut bytes = allocate_bytes(fixed.allocator(), 32)
+        .expect("initial byte allocation must succeed");
+    defer bytes.deinit();
+    unsafe {
+        *bytes.data = 7;
+        *((bytes.data as usize + 31) as *mut u8) = 42;
+    }
+
+    bytes.grow_aligned(8, 64)
+        .expect("byte realignment must succeed");
+
+    assert(bytes.len() == 32);
+    assert(bytes.alignment() == 64);
+    assert((bytes.as_ptr() as usize & 63) == 0);
+    unsafe {
+        assert(*bytes.data == 7);
+        assert(*((bytes.data as usize + 31) as *const u8) == 42);
     }
 }

@@ -258,6 +258,13 @@ impl<'function> Estimator<'function> {
                 }
             }
             Expression::Try { value, .. } => self.scan_expression(value, loop_depth),
+            Expression::GenericFunction(function) => {
+                for argument in &function.generic_arguments {
+                    if let ast::GenericArgument::Const(value) = argument {
+                        self.scan_expression(value, loop_depth);
+                    }
+                }
+            }
             Expression::Integer(_)
             | Expression::Float(_)
             | Expression::Character(_)
@@ -374,6 +381,11 @@ fn allocation_specification(
     };
     match operation {
         "allocate_bytes" => Some(exact(0, argument_bytes(call, 1), "byte reservation")),
+        "allocate_aligned_bytes" => Some(exact(
+            0,
+            argument_bytes(call, 1),
+            "aligned byte reservation; allocator padding is excluded",
+        )),
         "read" | "read_exact" | "read_line" | "read_to_end" => Some(exact(
             0,
             argument_bytes(call, call.arguments.len().saturating_sub(1)),
@@ -551,6 +563,18 @@ mod tests {
         let (allocations, _) = estimate(&syntax);
 
         assert_eq!(allocations[0].quantity, AllocationQuantity::Exact(128));
+    }
+
+    #[test]
+    fn estimate_should_report_aligned_logical_bytes_without_padding() {
+        let source = "fn main() { let bytes = allocate_aligned_bytes(&allocator, 96, 64); }";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let (allocations, _) = estimate(&syntax);
+
+        assert_eq!(allocations[0].quantity, AllocationQuantity::Exact(96));
+        assert!(allocations[0].explanation.contains("padding is excluded"));
     }
 
     #[test]

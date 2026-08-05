@@ -41,6 +41,11 @@ mod environment;
 mod filesystem;
 #[expect(
     unsafe_code,
+    reason = "process-local identity generation exposes one stable runtime symbol"
+)]
+mod identity;
+#[expect(
+    unsafe_code,
     reason = "the job ABI exposes stable symbols and invokes compiler-generated callback thunks"
 )]
 mod job;
@@ -118,6 +123,7 @@ pub use filesystem::{
     path_exists, path_file_size, path_is_within, path_remove_file, path_rename, path_replace_file,
     path_snapshot_close, path_snapshot_copy, path_snapshot_len,
 };
+pub use identity::{PROCESS_UNIQUE_ID_SYMBOL, runtime_process_unique_id};
 pub use job::{
     JOB_JOIN_INVALID_HANDLE, JOB_JOIN_OK, JOB_JOIN_RESULT_MISMATCH, JOB_JOIN_WORKER_PANICKED,
     JOB_PARALLEL_FOR_SYMBOL, JOB_POOL_CLONE_SYMBOL, JOB_POOL_CREATE_SYMBOL,
@@ -195,8 +201,12 @@ pub const PANIC_SYMBOL: &str = "runtime_panic";
 pub const TARGET_OS_SYMBOL: &str = "target_os_code";
 /// ABI symbol used for explicit byte allocations.
 pub const ALLOCATE_BYTES_SYMBOL: &str = "allocate_bytes";
+/// ABI symbol used for explicit byte allocations with a caller-selected alignment.
+pub const ALLOCATE_ALIGNED_BYTES_SYMBOL: &str = "allocate_aligned_bytes";
 /// ABI symbol used to release explicit byte allocations.
 pub const DEALLOCATE_BYTES_SYMBOL: &str = "deallocate_bytes";
+/// ABI symbol used to release explicitly aligned byte allocations.
+pub const DEALLOCATE_ALIGNED_BYTES_SYMBOL: &str = "deallocate_aligned_bytes";
 /// Demonstration C-ABI symbol used by the FFI vertical slice.
 pub const ABS_I32_SYMBOL: &str = "absolute_i32";
 /// ABI symbol used to create an arena allocator.
@@ -267,6 +277,7 @@ const UNEXPECTED_END_OF_INPUT_CODE: isize = -2;
 struct Allocation {
     address: usize,
     length: usize,
+    alignment: usize,
 }
 
 #[derive(Debug)]
@@ -612,9 +623,32 @@ pub unsafe extern "C" fn runtime_panic(data: *const u8, length: usize, byte_offs
     reason = "the allocator ABI must expose a stable native symbol"
 )]
 pub extern "C" fn allocate_bytes(allocator: usize, length: usize) -> *mut u8 {
+    allocate_aligned_bytes(allocator, length, 1)
+}
+
+/// Allocates an owned byte region with a power-of-two alignment.
+///
+/// Null is returned when `alignment` is zero or not a power of two, when the
+/// requested layout overflows, or when the allocator cannot satisfy the
+/// request. Unknown allocator handles remain compiler or runtime bugs and
+/// terminate through the checked failure path.
+#[must_use]
+#[unsafe(no_mangle)]
+#[expect(
+    unsafe_code,
+    reason = "the allocator ABI must expose a stable native symbol"
+)]
+pub extern "C" fn allocate_aligned_bytes(
+    allocator: usize,
+    length: usize,
+    alignment: usize,
+) -> *mut u8 {
+    if !alignment.is_power_of_two() {
+        return std::ptr::null_mut();
+    }
     match allocator {
-        GENERAL_ALLOCATOR | PAGE_ALLOCATOR => allocate_static(allocator, length),
-        _ => allocate_dynamic(allocator, length),
+        GENERAL_ALLOCATOR | PAGE_ALLOCATOR => allocate_static(allocator, length, alignment),
+        _ => allocate_dynamic(allocator, length, alignment),
     }
 }
 
@@ -630,15 +664,41 @@ pub extern "C" fn allocate_bytes(allocator: usize, length: usize) -> *mut u8 {
     reason = "the allocator ABI receives an owned raw allocation from generated code"
 )]
 pub unsafe extern "C" fn deallocate_bytes(allocator: usize, data: *mut u8, length: usize) {
+    // SAFETY: This compatibility wrapper preserves the original byte-aligned ABI contract.
+    unsafe { deallocate_aligned_bytes(allocator, data, length, 1) };
+}
+
+/// Releases a byte region returned by [`allocate_aligned_bytes`].
+///
+/// # Safety
+///
+/// `data`, `length`, and `alignment` must identify one live allocation returned
+/// by this ABI with the same `allocator`. `alignment` must be the exact
+/// power-of-two alignment used for allocation. The region must not be used
+/// after this call.
+#[unsafe(no_mangle)]
+#[expect(
+    unsafe_code,
+    reason = "the allocator ABI receives an owned raw allocation from generated code"
+)]
+pub unsafe extern "C" fn deallocate_aligned_bytes(
+    allocator: usize,
+    data: *mut u8,
+    length: usize,
+    alignment: usize,
+) {
     if data.is_null() {
         return;
+    }
+    if !alignment.is_power_of_two() {
+        runtime_fail(Failure::InvalidAllocator as u32);
     }
     match allocator {
         GENERAL_ALLOCATOR | PAGE_ALLOCATOR => {
             // SAFETY: This public ABI's contract guarantees matching allocation metadata.
-            unsafe { deallocate_static(allocator, data, length) };
+            unsafe { deallocate_static(allocator, data, length, alignment) };
         }
-        _ => validate_dynamic_deallocation(allocator, data, length),
+        _ => validate_dynamic_deallocation(allocator, data, length, alignment),
     }
 }
 
@@ -680,7 +740,12 @@ pub extern "C" fn arena_allocator_deinit(handle: usize) {
     for allocation in allocations {
         // SAFETY: Arena entries are recorded from live allocations made with this parent.
         unsafe {
-            deallocate_static(parent, allocation.address as *mut u8, allocation.length);
+            deallocate_static(
+                parent,
+                allocation.address as *mut u8,
+                allocation.length,
+                allocation.alignment,
+            );
         }
     }
 }
@@ -1155,17 +1220,16 @@ unsafe fn bytes_from_raw_parts_mut<'data>(data: *mut u8, length: usize) -> Optio
     Some(unsafe { std::slice::from_raw_parts_mut(data, length) })
 }
 
-fn allocation_layout(allocator: usize, length: usize) -> Layout {
+fn allocation_layout(allocator: usize, length: usize, alignment: usize) -> Option<Layout> {
+    if !alignment.is_power_of_two() {
+        return None;
+    }
     match allocator {
-        GENERAL_ALLOCATOR => Layout::array::<u8>(length.max(1))
-            .unwrap_or_else(|_| runtime_fail(Failure::Overflow as u32)),
+        GENERAL_ALLOCATOR => Layout::from_size_align(length.max(1), alignment).ok(),
         PAGE_ALLOCATOR => {
-            let rounded = length.max(1).checked_add(PAGE_GRANULARITY - 1).map_or_else(
-                || runtime_fail(Failure::Overflow as u32),
-                |value| value / PAGE_GRANULARITY * PAGE_GRANULARITY,
-            );
-            Layout::from_size_align(rounded, PAGE_GRANULARITY)
-                .unwrap_or_else(|_| runtime_fail(Failure::Overflow as u32))
+            let rounded = length.max(1).checked_add(PAGE_GRANULARITY - 1)? / PAGE_GRANULARITY
+                * PAGE_GRANULARITY;
+            Layout::from_size_align(rounded, alignment.max(PAGE_GRANULARITY)).ok()
         }
         _ => runtime_fail(Failure::InvalidAllocator as u32),
     }
@@ -1175,8 +1239,10 @@ fn allocation_layout(allocator: usize, length: usize) -> Layout {
     unsafe_code,
     reason = "Rust's allocation primitive is wrapped behind validated runtime layouts"
 )]
-fn allocate_static(allocator: usize, length: usize) -> *mut u8 {
-    let layout = allocation_layout(allocator, length);
+fn allocate_static(allocator: usize, length: usize, alignment: usize) -> *mut u8 {
+    let Some(layout) = allocation_layout(allocator, length, alignment) else {
+        return std::ptr::null_mut();
+    };
     // SAFETY: `layout` is non-zero and was validated by `Layout`.
     unsafe { alloc::alloc(layout) }
 }
@@ -1185,13 +1251,15 @@ fn allocate_static(allocator: usize, length: usize) -> *mut u8 {
     unsafe_code,
     reason = "the private helper centralizes the allocator provenance contract"
 )]
-unsafe fn deallocate_static(allocator: usize, data: *mut u8, length: usize) {
-    let layout = allocation_layout(allocator, length);
+unsafe fn deallocate_static(allocator: usize, data: *mut u8, length: usize, alignment: usize) {
+    let Some(layout) = allocation_layout(allocator, length, alignment) else {
+        runtime_fail(Failure::InvalidAllocator as u32);
+    };
     // SAFETY: The caller guarantees matching provenance, size, allocator, and liveness.
     unsafe { alloc::dealloc(data, layout) };
 }
 
-fn allocate_dynamic(allocator: usize, length: usize) -> *mut u8 {
+fn allocate_dynamic(allocator: usize, length: usize, alignment: usize) -> *mut u8 {
     let mut allocators = lock_dynamic_allocators();
     let Some(dynamic) = allocators.get_mut(&allocator) else {
         runtime_fail(Failure::InvalidAllocator as u32);
@@ -1201,11 +1269,12 @@ fn allocate_dynamic(allocator: usize, length: usize) -> *mut u8 {
             parent,
             allocations,
         } => {
-            let data = allocate_static(*parent, length);
+            let data = allocate_static(*parent, length, alignment);
             if !data.is_null() {
                 allocations.push(Allocation {
                     address: data as usize,
                     length,
+                    alignment,
                 });
             }
             data
@@ -1216,37 +1285,56 @@ fn allocate_dynamic(allocator: usize, length: usize) -> *mut u8 {
             offset,
         } => {
             let requested = length.max(1);
-            let Some(end) = offset.checked_add(requested) else {
+            let Some(current_address) = base.checked_add(*offset) else {
+                return std::ptr::null_mut();
+            };
+            let Some(aligned_address) = current_address
+                .checked_add(alignment - 1)
+                .map(|address| address & !(alignment - 1))
+            else {
+                return std::ptr::null_mut();
+            };
+            let Some(aligned_offset) = aligned_address.checked_sub(*base) else {
+                return std::ptr::null_mut();
+            };
+            let Some(end) = aligned_offset.checked_add(requested) else {
                 return std::ptr::null_mut();
             };
             if end > *capacity {
                 return std::ptr::null_mut();
             }
-            let Some(address) = base.checked_add(*offset) else {
-                return std::ptr::null_mut();
-            };
             *offset = end;
-            address as *mut u8
+            aligned_address as *mut u8
         }
     }
 }
 
-fn validate_dynamic_deallocation(allocator: usize, data: *mut u8, length: usize) {
+fn validate_dynamic_deallocation(allocator: usize, data: *mut u8, length: usize, alignment: usize) {
     let allocators = lock_dynamic_allocators();
     let Some(dynamic) = allocators.get(&allocator) else {
         runtime_fail(Failure::InvalidAllocator as u32);
     };
     let valid = match dynamic {
-        DynamicAllocator::Arena { allocations, .. } => allocations
-            .iter()
-            .any(|allocation| allocation.address == data as usize && allocation.length == length),
+        DynamicAllocator::Arena { allocations, .. } => allocations.iter().any(|allocation| {
+            allocation.address == data as usize
+                && allocation.length == length
+                && allocation.alignment == alignment
+        }),
         DynamicAllocator::Fixed {
             base,
             length: capacity,
             ..
-        } => base
-            .checked_add(*capacity)
-            .is_some_and(|end| (data as usize) >= *base && (data as usize) < end),
+        } => {
+            let requested = length.max(1);
+            let address = data as usize;
+            base.checked_add(*capacity).is_some_and(|buffer_end| {
+                address >= *base
+                    && address.is_multiple_of(alignment)
+                    && address
+                        .checked_add(requested)
+                        .is_some_and(|allocation_end| allocation_end <= buffer_end)
+            })
+        }
     };
     if !valid {
         runtime_fail(Failure::InvalidAllocator as u32);
@@ -1300,11 +1388,11 @@ mod tests {
 
     use super::{
         Failure, GENERAL_ALLOCATOR, PAGE_ALLOCATOR, PAGE_GRANULARITY, THREAD_JOIN_OK,
-        allocate_bytes, arena_allocator_deinit, arena_allocator_init, buffer_equals, copy_bytes,
-        deallocate_bytes, failure_message, fixed_buffer_allocator_deinit,
-        fixed_buffer_allocator_init, read_line_into, read_to_end_into, target_os_code,
-        thread_available_parallelism, thread_join, thread_spawn, utf8_decode_next, utf8_is_valid,
-        write_all_with_optional_newline,
+        allocate_aligned_bytes, allocate_bytes, arena_allocator_deinit, arena_allocator_init,
+        buffer_equals, copy_bytes, deallocate_aligned_bytes, deallocate_bytes, failure_message,
+        fixed_buffer_allocator_deinit, fixed_buffer_allocator_init, read_line_into,
+        read_to_end_into, target_os_code, thread_available_parallelism, thread_join, thread_spawn,
+        utf8_decode_next, utf8_is_valid, write_all_with_optional_newline,
     };
 
     #[expect(
@@ -1405,6 +1493,34 @@ mod tests {
     #[test]
     #[expect(
         unsafe_code,
+        reason = "the test releases the exact aligned layout returned by the runtime ABI"
+    )]
+    fn general_allocator_should_preserve_requested_alignment_during_deallocation() {
+        let data = allocate_aligned_bytes(GENERAL_ALLOCATOR, 24, 64);
+
+        assert!(!data.is_null());
+        assert!((data as usize).is_multiple_of(64));
+        // SAFETY: All allocation metadata, including the 64-byte alignment, is unchanged.
+        unsafe { deallocate_aligned_bytes(GENERAL_ALLOCATOR, data, 24, 64) };
+    }
+
+    #[test]
+    fn aligned_allocator_should_reject_zero_alignment() {
+        let data = allocate_aligned_bytes(GENERAL_ALLOCATOR, 16, 0);
+
+        assert!(data.is_null());
+    }
+
+    #[test]
+    fn aligned_allocator_should_reject_non_power_of_two_alignment() {
+        let data = allocate_aligned_bytes(GENERAL_ALLOCATOR, 16, 24);
+
+        assert!(data.is_null());
+    }
+
+    #[test]
+    #[expect(
+        unsafe_code,
         reason = "the test releases the exact allocation returned by the runtime ABI"
     )]
     fn page_allocator_should_return_page_aligned_memory() {
@@ -1422,13 +1538,34 @@ mod tests {
     )]
     fn arena_allocator_should_own_child_allocations_until_deinit() {
         let arena = arena_allocator_init(GENERAL_ALLOCATOR);
-        let data = allocate_bytes(arena, 32);
+        let data = allocate_aligned_bytes(arena, 32, 128);
 
         assert!(arena >= 3);
         assert!(!data.is_null());
-        // SAFETY: The allocation belongs to this live arena and is logically released once.
-        unsafe { deallocate_bytes(arena, data, 32) };
+        assert!((data as usize).is_multiple_of(128));
+        // SAFETY: The exact aligned allocation belongs to this live arena.
+        unsafe { deallocate_aligned_bytes(arena, data, 32, 128) };
         arena_allocator_deinit(arena);
+    }
+
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test validates and logically releases an allocation in a stack buffer"
+    )]
+    fn fixed_allocator_should_align_the_absolute_address_from_a_misaligned_base() {
+        let mut storage = [0_u8; 160];
+        let base = storage.as_mut_ptr().wrapping_add(1);
+        let fixed = fixed_buffer_allocator_init(base, storage.len() - 1);
+        let data = allocate_aligned_bytes(fixed, 32, 64);
+
+        assert!(!data.is_null());
+        assert!((data as usize).is_multiple_of(64));
+        assert!((data as usize) >= base as usize);
+        assert!((data as usize + 32) < base as usize + storage.len());
+        // SAFETY: The exact logical allocation is still live within the fixed buffer.
+        unsafe { deallocate_aligned_bytes(fixed, data, 32, 64) };
+        fixed_buffer_allocator_deinit(fixed);
     }
 
     #[test]

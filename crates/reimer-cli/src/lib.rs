@@ -6,6 +6,7 @@ use std::path::Path;
 use reimer_codegen_native::OptimizationLevel;
 use reimer_diagnostics::Diagnostic;
 use reimer_package::{FileDiagnostic, SourceGraph};
+use reimer_project::NativeDependencies;
 
 /// Runs the complete frontend without native code generation.
 ///
@@ -143,6 +144,27 @@ pub fn execute_graph(
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
+/// JIT-compiles and executes a resolved package graph with its native manifest inputs.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, native-library, or backend diagnostics.
+pub fn execute_graph_with_native_dependencies(
+    graph: &SourceGraph,
+    optimization: OptimizationLevel,
+    native: &NativeDependencies,
+) -> Result<i32, Vec<FileDiagnostic>> {
+    let (package, program) = analyze_graph(graph)?;
+    reimer_codegen_native::execute_with_native_libraries(
+        &program,
+        optimization,
+        None,
+        native.library_paths(),
+        native.link_libraries(),
+    )
+    .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
 /// JIT-compiles and executes a resolved source graph with explicit arguments.
 ///
 /// # Errors
@@ -156,6 +178,28 @@ pub fn execute_graph_with_arguments(
     let (package, program) = analyze_graph(graph)?;
     reimer_codegen_native::execute_with_arguments(&program, optimization, arguments)
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
+/// JIT-compiles and executes a resolved graph with arguments and native manifest inputs.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, native-library, or backend diagnostics.
+pub fn execute_graph_with_arguments_and_native_dependencies(
+    graph: &SourceGraph,
+    optimization: OptimizationLevel,
+    arguments: Vec<OsString>,
+    native: &NativeDependencies,
+) -> Result<i32, Vec<FileDiagnostic>> {
+    let (package, program) = analyze_graph(graph)?;
+    reimer_codegen_native::execute_with_native_libraries(
+        &program,
+        optimization,
+        Some(arguments),
+        native.library_paths(),
+        native.link_libraries(),
+    )
+    .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
 /// Discovers compiler-recognized `@test` functions in one source package.
@@ -252,6 +296,28 @@ pub fn execute_graph_test(
         .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
+/// Executes one graph-discovered `@test` with native manifest inputs.
+///
+/// # Errors
+///
+/// Returns file-aware frontend, native-library, or backend diagnostics.
+pub fn execute_graph_test_with_native_dependencies(
+    graph: &SourceGraph,
+    test_index: usize,
+    optimization: OptimizationLevel,
+    native: &NativeDependencies,
+) -> Result<(), Vec<FileDiagnostic>> {
+    let (package, program) = analyze_test_graph(graph)?;
+    reimer_codegen_native::execute_test_with_native_libraries(
+        &program,
+        test_index,
+        optimization,
+        native.library_paths(),
+        native.link_libraries(),
+    )
+    .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
 /// Executes every graph-discovered `@test` function after compiling the graph
 /// once.
 ///
@@ -283,6 +349,28 @@ pub fn execute_graph_tests_with_progress(
     reimer_codegen_native::execute_tests_with_options_and_progress(
         &program,
         optimization,
+        |test_index, name| progress(test_index, source_test_name(name)),
+    )
+    .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+}
+
+/// Executes every graph-discovered `@test` with native manifest inputs.
+///
+/// # Errors
+///
+/// Returns file-aware frontend, native-library, or backend diagnostics.
+pub fn execute_graph_tests_with_native_dependencies_and_progress(
+    graph: &SourceGraph,
+    optimization: OptimizationLevel,
+    native: &NativeDependencies,
+    mut progress: impl FnMut(usize, &str),
+) -> Result<(), Vec<FileDiagnostic>> {
+    let (package, program) = analyze_test_graph(graph)?;
+    reimer_codegen_native::execute_tests_with_native_libraries_and_progress(
+        &program,
+        optimization,
+        native.library_paths(),
+        native.link_libraries(),
         |test_index, name| progress(test_index, source_test_name(name)),
     )
     .map_err(|diagnostics| package.map_diagnostics(diagnostics))

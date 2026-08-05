@@ -298,6 +298,7 @@ struct SyntaxIndex<'ast> {
     let_names: HashMap<(usize, usize), Span>,
     pattern_names: HashMap<(usize, usize), Span>,
     call_callees: HashMap<(usize, usize), Span>,
+    generic_function_names: HashMap<(usize, usize), Span>,
     type_uses: Vec<(String, Span)>,
     type_targets: HashMap<String, Span>,
 }
@@ -311,6 +312,7 @@ impl<'ast> SyntaxIndex<'ast> {
             let_names: HashMap::new(),
             pattern_names: HashMap::new(),
             call_callees: HashMap::new(),
+            generic_function_names: HashMap::new(),
             type_uses: Vec::new(),
             type_targets: HashMap::new(),
         };
@@ -377,6 +379,10 @@ impl<'ast> SyntaxIndex<'ast> {
         self.static_names.get(&span_key(span)).copied()
     }
 
+    fn generic_function_name(&self, span: Span) -> Option<Span> {
+        self.generic_function_names.get(&span_key(span)).copied()
+    }
+
     fn type_definition_links(&self) -> Vec<DefinitionLink> {
         self.type_targets
             .values()
@@ -404,9 +410,18 @@ impl Visitor for SyntaxIndex<'_> {
     }
 
     fn expression(&mut self, expression: &AstExpression) {
-        if let AstExpression::Call(call) = expression {
-            self.call_callees
-                .insert(span_key(call.span), call.callee.span());
+        match expression {
+            AstExpression::Call(call) => {
+                self.call_callees
+                    .insert(span_key(call.span), call.callee.span());
+            }
+            AstExpression::GenericFunction(function) => {
+                if let Some(name) = function.path.segments.last() {
+                    self.generic_function_names
+                        .insert(span_key(function.span), name.span);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -722,9 +737,7 @@ impl HirIndexer<'_> {
                 function,
                 arguments,
             } => self.direct_call(*function, arguments, expression.span),
-            ExpressionKind::Function(function) => {
-                self.function_value(*function, expression.span);
-            }
+            ExpressionKind::Function(function) => self.function_value(*function, expression.span),
             ExpressionKind::IndirectCall { callee, arguments } => {
                 self.expression(callee);
                 for argument in arguments {
@@ -778,6 +791,7 @@ impl HirIndexer<'_> {
                 mutable,
             } => self.slice_get(slice, index, *reference_type, *mutable, expression.span),
             ExpressionKind::Assert { .. } => self.assertion(expression),
+            ExpressionKind::Expect { .. } => self.result_expect(expression),
             ExpressionKind::If(_)
             | ExpressionKind::Match(_)
             | ExpressionKind::Loop(_)
@@ -812,7 +826,8 @@ impl HirIndexer<'_> {
             | ExpressionKind::CString(_)
             | ExpressionKind::Boolean(_)
             | ExpressionKind::Unit
-            | ExpressionKind::TypeStride { .. } => {}
+            | ExpressionKind::TypeStride { .. }
+            | ExpressionKind::TypeAlignment { .. } => {}
         }
     }
 
@@ -911,19 +926,29 @@ impl HirIndexer<'_> {
             ExpressionKind::Borrow { place, .. } => self.place(place),
             ExpressionKind::Panic { message } => self.expression(message),
             ExpressionKind::AllocateBytes {
-                allocator, length, ..
+                allocator,
+                length,
+                alignment,
+                ..
             } => {
                 self.expression(allocator);
                 self.expression(length);
+                if let Some(alignment) = alignment {
+                    self.expression(alignment);
+                }
             }
             ExpressionKind::DeallocateBytes {
                 allocator,
                 data,
                 length,
+                alignment,
             } => {
                 self.expression(allocator);
                 self.expression(data);
                 self.expression(length);
+                if let Some(alignment) = alignment {
+                    self.expression(alignment);
+                }
             }
             ExpressionKind::ThreadSpawn {
                 callback, argument, ..
@@ -1017,6 +1042,37 @@ impl HirIndexer<'_> {
             });
         }
         self.expression(condition);
+        self.expression(message);
+    }
+
+    fn result_expect(&mut self, expression: &hir::Expression) {
+        let ExpressionKind::Expect {
+            value,
+            message,
+            output_type,
+            ..
+        } = &expression.kind
+        else {
+            return;
+        };
+        if let Some(callee) = self
+            .syntax_index
+            .call_callees
+            .get(&span_key(expression.span))
+            .copied()
+        {
+            self.type_hints.push(TypeHint {
+                span: callee,
+                label: format!(
+                    "fn expect(self: {}, message: str) -> {}",
+                    type_label(value.ty, self.typed),
+                    type_label(*output_type, self.typed)
+                ),
+                documentation: "Consumes the result and returns its `Ok` value. An `Err` panics with `message`; use `?` when the caller should recover. The error type does not need `Display` or `Debug`.".to_owned(),
+                kind: TypeHintKind::Callable,
+            });
+        }
+        self.expression(value);
         self.expression(message);
     }
 
@@ -1176,10 +1232,14 @@ impl HirIndexer<'_> {
     }
 
     fn function_value(&mut self, function: FunctionId, span: Span) {
-        self.add_callable_hint(function, span);
+        let use_span = self
+            .syntax_index
+            .generic_function_name(span)
+            .unwrap_or(span);
+        self.add_callable_hint(function, use_span);
         if let Some(target_span) = self.function_targets.get(&function).copied() {
             self.definitions.push(DefinitionLink {
-                use_span: span,
+                use_span,
                 target_span,
             });
         }
@@ -1195,9 +1255,21 @@ fn function_signature(function: &hir::Function, program: &hir::Program) -> Strin
         .join(", ");
     format!(
         "fn {}({parameters}) -> {}",
-        reimer_package::display_symbol_name(&function.name),
+        source_function_name(&function.name),
         type_label(function.return_type, program)
     )
+}
+
+fn source_function_name(name: &str) -> String {
+    let display_name = reimer_package::display_symbol_name(name);
+    let Some((source_name, instance)) = display_name.rsplit_once("$instance$") else {
+        return display_name;
+    };
+    if instance.bytes().all(|byte| byte.is_ascii_digit()) {
+        source_name.to_owned()
+    } else {
+        display_name
+    }
 }
 
 fn extern_signature(function: &hir::ExternFunction, program: &hir::Program) -> String {

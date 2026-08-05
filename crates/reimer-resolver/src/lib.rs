@@ -194,6 +194,12 @@ enum StringViewIntrinsic {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum PointeeLayoutIntrinsic {
+    Stride,
+    Alignment,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum ThreadSafety {
     Send,
     Sync,
@@ -5608,6 +5614,9 @@ impl<'context> FunctionAnalyzer<'context> {
                 span: *span,
             },
             AstExpression::Path(path) => self.analyze_path(path, expected),
+            AstExpression::GenericFunction(function) => {
+                self.analyze_generic_function_item(function, expected)
+            }
             AstExpression::Unary(expression) => self.analyze_unary(expression, expected),
             AstExpression::Binary(expression) => self.analyze_binary(expression, expected),
             AstExpression::Call(expression) => self.analyze_call(expression, expected),
@@ -6383,6 +6392,7 @@ impl<'context> FunctionAnalyzer<'context> {
         let call = ast::CallExpression {
             callee: AstExpression::Field(Box::new(field.clone())),
             generic_arguments: Vec::new(),
+            has_explicit_generic_arguments: false,
             arguments,
             span: index.span,
         };
@@ -6483,6 +6493,131 @@ impl<'context> FunctionAnalyzer<'context> {
             kind: ExpressionKind::Unit,
             ty: Type::Unit,
             span: path.span,
+        }
+    }
+
+    fn analyze_generic_function_item(
+        &mut self,
+        item: &ast::GenericFunctionExpression,
+        expected: Option<Type>,
+    ) -> Expression {
+        let Some((resolved_name, template)) = self.resolve_generic_function_item(item) else {
+            return invalid_composite_expression(item.span);
+        };
+        let mut environment = self.types.base_environment();
+        let explicit_parameters = template
+            .parameters
+            .get(template.explicit_parameter_start..)
+            .unwrap_or_default();
+        self.bind_explicit_generic_arguments(
+            &item.generic_arguments,
+            true,
+            item.span,
+            explicit_parameters,
+            &mut environment,
+        );
+        self.infer_generic_function_item_from_expected(&template, expected, &mut environment);
+        let Some(values) = self.complete_generic_environment(
+            &template.parameters,
+            &template.where_predicates,
+            &mut environment,
+            item.span,
+        ) else {
+            return invalid_composite_expression(item.span);
+        };
+        let Some(signature) =
+            self.instantiate_generic_function(&template, values, &environment, item.span)
+        else {
+            return invalid_composite_expression(item.span);
+        };
+        self.validate_function_access(&item.path, item.span, &resolved_name, &signature);
+        let ty = self
+            .types
+            .intern_function(
+                signature.parameter_types.clone(),
+                signature.return_type,
+                item.span,
+                self.diagnostics,
+            )
+            .unwrap_or(Type::Unit);
+        if let Some(expected) = expected {
+            self.require_type(expected, ty, item.span, "generic function value");
+        }
+        Expression {
+            kind: ExpressionKind::Function(signature.id),
+            ty,
+            span: item.span,
+        }
+    }
+
+    fn resolve_generic_function_item(
+        &mut self,
+        item: &ast::GenericFunctionExpression,
+    ) -> Option<(String, GenericFunctionTemplate)> {
+        if let Some(name) = single_path_name(&item.path)
+            && self.lookup(name).is_some()
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    format!("local binding `{name}` is not generic"),
+                    item.span,
+                )
+                .with_help("remove the `::<...>` arguments"),
+            );
+            return None;
+        }
+
+        let resolved_name = self.resolve_function_path(&item.path)?;
+        if let Some(template) = self
+            .generic_functions
+            .templates
+            .get(&resolved_name)
+            .cloned()
+        {
+            return Some((resolved_name, template));
+        }
+
+        let diagnostic = if self.signatures.contains_key(&resolved_name) {
+            Diagnostic::error(
+                "E6004",
+                format!("function `{resolved_name}` is not generic"),
+                item.span,
+            )
+            .with_help("remove the `::<...>` arguments")
+        } else {
+            Diagnostic::error(
+                "E3106",
+                format!("cannot resolve function `{}`", item.path.display()),
+                item.path.span,
+            )
+            .with_help("declare the generic function before using it")
+        };
+        self.diagnostics.push(diagnostic);
+        None
+    }
+
+    fn infer_generic_function_item_from_expected(
+        &mut self,
+        template: &GenericFunctionTemplate,
+        expected: Option<Type>,
+        environment: &mut GenericEnvironment,
+    ) {
+        let Some((parameter_types, return_type)) = expected.and_then(|ty| {
+            self.types
+                .function_shape(ty)
+                .map(|(parameters, return_type)| (parameters.to_vec(), return_type))
+        }) else {
+            return;
+        };
+
+        for (parameter, actual) in template.function.parameters.iter().zip(parameter_types) {
+            self.types
+                .infer_type_pattern(&parameter.ty, actual, &template.parameters, environment);
+        }
+        if let Some(pattern) = &template.function.return_type {
+            self.types
+                .infer_type_pattern(pattern, return_type, &template.parameters, environment);
         }
     }
 
@@ -7139,7 +7274,7 @@ impl<'context> FunctionAnalyzer<'context> {
         call: &ast::CallExpression,
         _expected_return: Option<Type>,
     ) -> Expression {
-        if !call.generic_arguments.is_empty() {
+        if call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
@@ -7294,7 +7429,7 @@ impl<'context> FunctionAnalyzer<'context> {
     }
 
     fn validate_derived_clone_call(&mut self, call: &ast::CallExpression) {
-        if !call.arguments.is_empty() || !call.generic_arguments.is_empty() {
+        if !call.arguments.is_empty() || call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E7007",
@@ -7316,6 +7451,11 @@ impl<'context> FunctionAnalyzer<'context> {
         method: &ast::Identifier,
         expected_return: Option<Type>,
     ) -> Option<Expression> {
+        if let Some(expression) =
+            self.analyze_result_expect_method(call, field, method, expected_return)
+        {
+            return Some(expression);
+        }
         if let Some(expression) =
             self.analyze_tuple_type_access_method(call, field, method, expected_return)
         {
@@ -7342,6 +7482,71 @@ impl<'context> FunctionAnalyzer<'context> {
             return Some(expression);
         }
         self.analyze_slice_access_method(call, field, method, expected_return)
+    }
+
+    fn analyze_result_expect_method(
+        &mut self,
+        call: &ast::CallExpression,
+        field: &ast::FieldExpression,
+        method: &ast::Identifier,
+        expected_return: Option<Type>,
+    ) -> Option<Expression> {
+        if method.name != "expect" {
+            return None;
+        }
+        let receiver_type = self.temporary_result_expression_type(&field.base, expected_return)?;
+        let IntrinsicType::Result { success, .. } = self.types.intrinsic(receiver_type)? else {
+            return None;
+        };
+        if call.has_explicit_generic_arguments {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E6004",
+                    "`Result.expect` does not accept generic arguments",
+                    call.span,
+                )
+                .with_help("remove the arguments between `<` and `>`"),
+            );
+        }
+        if call.arguments.len() != 1 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E3105",
+                    format!(
+                        "`Result.expect` expects 1 argument, but {} were provided",
+                        call.arguments.len()
+                    ),
+                    call.span,
+                )
+                .with_help("write `result.expect(\"failure context\")`"),
+            );
+        }
+
+        let value = self.analyze_expression_expected(&field.base, Some(receiver_type));
+        let message = call.arguments.first().map_or_else(
+            || invalid_composite_expression(call.span),
+            |argument| self.analyze_expression_expected(argument, Some(Type::Str)),
+        );
+        self.require_type(Type::Str, message.ty, message.span, "expect message");
+        for extra in call.arguments.iter().skip(1) {
+            self.analyze_expression(extra);
+        }
+        if let Some(expected) = expected_return {
+            self.require_type(expected, success, call.span, "`Result.expect` result");
+        }
+        let success_variant = self
+            .enum_variant(receiver_type, "Ok")
+            .map_or(0, |(variant, _)| variant);
+        Some(Expression {
+            kind: ExpressionKind::Expect {
+                value: Box::new(value),
+                message: Box::new(message),
+                success_variant,
+                output_type: success,
+            },
+            ty: success,
+            span: call.span,
+        })
     }
 
     fn analyze_tuple_type_access_method(
@@ -7484,7 +7689,7 @@ impl<'context> FunctionAnalyzer<'context> {
     ) -> Option<Expression> {
         let receiver_type = self.place_expression_type(&field.base)?;
         let tuple_elements = self.tuple_elements(receiver_type)?;
-        if !call.arguments.is_empty() || !call.generic_arguments.is_empty() {
+        if !call.arguments.is_empty() || call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6022",
@@ -7673,7 +7878,7 @@ impl<'context> FunctionAnalyzer<'context> {
         }
         let resolved_name = format!("{STANDARD_STRING_TYPE}::push_format");
         let signature = self.signatures.get(&resolved_name).cloned()?;
-        if !call.generic_arguments.is_empty() {
+        if call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
@@ -7910,6 +8115,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 span,
             }),
             generic_arguments: Vec::new(),
+            has_explicit_generic_arguments: false,
             arguments: vec![
                 AstExpression::Unary(Box::new(ast::UnaryExpression {
                     operator: AstUnaryOperator::BorrowMut,
@@ -7940,7 +8146,7 @@ impl<'context> FunctionAnalyzer<'context> {
             "saturating_add" => IntegerAdditionMode::Saturating,
             _ => return None,
         };
-        if !call.generic_arguments.is_empty() {
+        if call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
@@ -8098,7 +8304,7 @@ impl<'context> FunctionAnalyzer<'context> {
         receiver: &str,
         expected: usize,
     ) {
-        if !call.generic_arguments.is_empty() {
+        if call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
@@ -8138,7 +8344,7 @@ impl<'context> FunctionAnalyzer<'context> {
         };
         let receiver_type = self.place_expression_type(&field.base)?;
         let (element, receiver_mutable) = self.types.slice_shape(receiver_type)?;
-        if !call.generic_arguments.is_empty() {
+        if call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
@@ -8215,7 +8421,7 @@ impl<'context> FunctionAnalyzer<'context> {
         let ast::FieldName::Named(method) = &field.field else {
             return invalid_composite_expression(call.span);
         };
-        if !call.generic_arguments.is_empty() {
+        if call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
@@ -8285,7 +8491,7 @@ impl<'context> FunctionAnalyzer<'context> {
         if !self.types.satisfies_trait(ty, "Default") {
             return None;
         }
-        if !call.arguments.is_empty() || !call.generic_arguments.is_empty() {
+        if !call.arguments.is_empty() || call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E7007",
@@ -8399,6 +8605,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 span: method.span,
             }),
             generic_arguments: call.generic_arguments.clone(),
+            has_explicit_generic_arguments: call.has_explicit_generic_arguments,
             arguments,
             span: call.span,
         };
@@ -8575,10 +8782,19 @@ impl<'context> FunctionAnalyzer<'context> {
             "__slice_length" => Some(self.analyze_slice_length(call, path)),
             "__str_from_parts" => Some(self.analyze_string_from_parts(call, path)),
             "__slice_from_parts" => Some(self.analyze_slice_from_parts(call, path, expected)),
-            "__pointee_stride" => Some(self.analyze_pointee_stride(call, path)),
+            "__pointee_stride" => {
+                Some(self.analyze_pointee_layout(call, path, PointeeLayoutIntrinsic::Stride))
+            }
+            "__pointee_alignment" => {
+                Some(self.analyze_pointee_layout(call, path, PointeeLayoutIntrinsic::Alignment))
+            }
             "__hash_value" => Some(self.analyze_hash_value(call, path)),
-            "__allocate_bytes" => Some(self.analyze_allocate_bytes(call, path, expected)),
-            "__deallocate_bytes" => Some(self.analyze_deallocate_bytes(call, path)),
+            "__allocate_bytes" => Some(self.analyze_allocate_bytes(call, path, expected, false)),
+            "__allocate_aligned_bytes" => {
+                Some(self.analyze_allocate_bytes(call, path, expected, true))
+            }
+            "__deallocate_bytes" => Some(self.analyze_deallocate_bytes(call, path, false)),
+            "__deallocate_aligned_bytes" => Some(self.analyze_deallocate_bytes(call, path, true)),
             "__thread_spawn" => Some(self.analyze_thread_spawn(call, path, expected, false)),
             "__thread_join" => Some(self.analyze_thread_join(call, path, expected)),
             "__thread_scope" => Some(self.analyze_thread_spawn(call, path, expected, true)),
@@ -8814,10 +9030,11 @@ impl<'context> FunctionAnalyzer<'context> {
         }
     }
 
-    fn analyze_pointee_stride(
+    fn analyze_pointee_layout(
         &mut self,
         call: &ast::CallExpression,
         path: &ast::Path,
+        intrinsic: PointeeLayoutIntrinsic,
     ) -> Expression {
         self.require_standard_collections_intrinsic(call.span);
         if call.arguments.len() != 1 {
@@ -8831,10 +9048,14 @@ impl<'context> FunctionAnalyzer<'context> {
             self.analyze_expression(extra);
         }
         let Some((target, _, raw)) = self.types.pointer_shape(pointer.ty) else {
+            let description = match intrinsic {
+                PointeeLayoutIntrinsic::Stride => "pointee stride",
+                PointeeLayoutIntrinsic::Alignment => "pointee alignment",
+            };
             self.diagnostics.push(Diagnostic::error(
                 "E3150",
                 format!(
-                    "pointee stride requires a raw pointer, found `{}`",
+                    "{description} requires a raw pointer, found `{}`",
                     pointer.ty
                 ),
                 pointer.span,
@@ -8842,14 +9063,22 @@ impl<'context> FunctionAnalyzer<'context> {
             return invalid_composite_expression(call.span);
         };
         if !raw {
+            let description = match intrinsic {
+                PointeeLayoutIntrinsic::Stride => "pointee stride",
+                PointeeLayoutIntrinsic::Alignment => "pointee alignment",
+            };
             self.diagnostics.push(Diagnostic::error(
                 "E3150",
-                "pointee stride requires a raw pointer",
+                format!("{description} requires a raw pointer"),
                 pointer.span,
             ));
         }
+        let kind = match intrinsic {
+            PointeeLayoutIntrinsic::Stride => ExpressionKind::TypeStride { target },
+            PointeeLayoutIntrinsic::Alignment => ExpressionKind::TypeAlignment { target },
+        };
         Expression {
-            kind: ExpressionKind::TypeStride { target },
+            kind,
             ty: Type::Usize,
             span: call.span,
         }
@@ -8897,10 +9126,12 @@ impl<'context> FunctionAnalyzer<'context> {
         call: &ast::CallExpression,
         path: &ast::Path,
         expected: Option<Type>,
+        aligned: bool,
     ) -> Expression {
         self.require_standard_allocator_intrinsic(call.span);
-        if call.arguments.len() != 2 {
-            self.intrinsic_arity_diagnostic(path, call, 2);
+        let expected_arguments = if aligned { 3 } else { 2 };
+        if call.arguments.len() != expected_arguments {
+            self.intrinsic_arity_diagnostic(path, call, expected_arguments);
         }
         let allocator = call.arguments.first().map_or_else(
             || invalid_composite_expression(call.span),
@@ -8910,7 +9141,13 @@ impl<'context> FunctionAnalyzer<'context> {
             || invalid_composite_expression(call.span),
             |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
         );
-        for extra in call.arguments.iter().skip(2) {
+        let alignment = aligned.then(|| {
+            call.arguments.get(2).map_or_else(
+                || invalid_composite_expression(call.span),
+                |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+            )
+        });
+        for extra in call.arguments.iter().skip(expected_arguments) {
             self.analyze_expression(extra);
         }
         self.require_type(
@@ -8920,12 +9157,27 @@ impl<'context> FunctionAnalyzer<'context> {
             "allocator handle",
         );
         self.require_type(Type::Usize, length.ty, length.span, "allocation length");
+        if let Some(alignment) = &alignment {
+            self.require_type(
+                Type::Usize,
+                alignment.ty,
+                alignment.span,
+                "allocation alignment",
+            );
+        }
 
         let Some(result_type) = expected else {
+            let intrinsic_name = if aligned {
+                "__allocate_aligned_bytes"
+            } else {
+                "__allocate_bytes"
+            };
             self.diagnostics.push(
                 Diagnostic::error(
                     "E3145",
-                    "`__allocate_bytes` requires an expected `Result<OwnedBytes, AllocError>` type",
+                    format!(
+                        "`{intrinsic_name}` requires an expected `Result<OwnedBytes, AllocError>` type"
+                    ),
                     call.span,
                 )
                 .with_help("call the intrinsic only from the typed standard allocator wrapper"),
@@ -8937,9 +9189,14 @@ impl<'context> FunctionAnalyzer<'context> {
             error: error_type,
         }) = self.types.intrinsic(result_type)
         else {
+            let intrinsic_name = if aligned {
+                "__allocate_aligned_bytes"
+            } else {
+                "__allocate_bytes"
+            };
             self.diagnostics.push(Diagnostic::error(
                 "E3145",
-                "`__allocate_bytes` must return a Result",
+                format!("`{intrinsic_name}` must return a Result"),
                 call.span,
             ));
             return invalid_composite_expression(call.span);
@@ -8954,6 +9211,7 @@ impl<'context> FunctionAnalyzer<'context> {
             kind: ExpressionKind::AllocateBytes {
                 allocator: Box::new(allocator),
                 length: Box::new(length),
+                alignment: alignment.map(Box::new),
                 allocation_type,
                 error_type,
                 error_variant,
@@ -8967,6 +9225,7 @@ impl<'context> FunctionAnalyzer<'context> {
         &mut self,
         call: &ast::CallExpression,
         path: &ast::Path,
+        aligned: bool,
     ) -> Expression {
         self.require_standard_allocator_intrinsic(call.span);
         if self.unsafe_depth == 0 {
@@ -8979,8 +9238,9 @@ impl<'context> FunctionAnalyzer<'context> {
                 .with_help("keep the intrinsic inside the owned standard-library wrapper"),
             );
         }
-        if call.arguments.len() != 3 {
-            self.intrinsic_arity_diagnostic(path, call, 3);
+        let expected_arguments = if aligned { 4 } else { 3 };
+        if call.arguments.len() != expected_arguments {
+            self.intrinsic_arity_diagnostic(path, call, expected_arguments);
         }
         let allocator = call.arguments.first().map_or_else(
             || invalid_composite_expression(call.span),
@@ -8994,7 +9254,13 @@ impl<'context> FunctionAnalyzer<'context> {
             || invalid_composite_expression(call.span),
             |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
         );
-        for extra in call.arguments.iter().skip(3) {
+        let alignment = aligned.then(|| {
+            call.arguments.get(3).map_or_else(
+                || invalid_composite_expression(call.span),
+                |argument| self.analyze_expression_expected(argument, Some(Type::Usize)),
+            )
+        });
+        for extra in call.arguments.iter().skip(expected_arguments) {
             self.analyze_expression(extra);
         }
         self.require_type(
@@ -9004,6 +9270,14 @@ impl<'context> FunctionAnalyzer<'context> {
             "allocator handle",
         );
         self.require_type(Type::Usize, length.ty, length.span, "allocation length");
+        if let Some(alignment) = &alignment {
+            self.require_type(
+                Type::Usize,
+                alignment.ty,
+                alignment.span,
+                "allocation alignment",
+            );
+        }
         let valid_data = self
             .types
             .pointer_shape(data.ty)
@@ -9020,6 +9294,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 allocator: Box::new(allocator),
                 data: Box::new(data),
                 length: Box::new(length),
+                alignment: alignment.map(Box::new),
             },
             ty: Type::Unit,
             span: call.span,
@@ -10079,7 +10354,7 @@ impl<'context> FunctionAnalyzer<'context> {
                     let hir::TypeDefinitionKind::Struct { fields } = &definition.kind else {
                         return false;
                     };
-                    let [data, length, allocator] = fields.as_slice() else {
+                    let [data, length, alignment, allocator] = fields.as_slice() else {
                         return false;
                     };
                     data.name == "data"
@@ -10090,6 +10365,9 @@ impl<'context> FunctionAnalyzer<'context> {
                         && length.name == "len"
                         && !length.is_public
                         && length.ty == Type::Usize
+                        && alignment.name == "alignment"
+                        && !alignment.is_public
+                        && alignment.ty == Type::Usize
                         && allocator.name == "allocator"
                         && !allocator.is_public
                         && allocator.ty == Type::Usize
@@ -10115,7 +10393,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 span,
             )
             .with_help(
-                "`OwnedBytes` must contain private `data`, `len`, and `allocator` fields and `AllocError` must define `OutOfMemory`",
+                "`OwnedBytes` must contain private `data`, `len`, `alignment`, and `allocator` fields and `AllocError` must define `OutOfMemory`",
             ),
         );
         None
@@ -10415,7 +10693,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 span: call.span,
             };
         };
-        if !call.generic_arguments.is_empty() {
+        if call.has_explicit_generic_arguments {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
@@ -10525,9 +10803,15 @@ impl<'context> FunctionAnalyzer<'context> {
         let explicit_parameters = parameters
             .get(template.explicit_parameter_start..)
             .unwrap_or_default();
-        self.bind_explicit_generic_arguments(call, explicit_parameters, &mut environment);
+        self.bind_explicit_generic_arguments(
+            &call.generic_arguments,
+            call.has_explicit_generic_arguments,
+            call.span,
+            explicit_parameters,
+            &mut environment,
+        );
         if template.explicit_parameter_start == 0
-            && call.generic_arguments.is_empty()
+            && !call.has_explicit_generic_arguments
             && let Some((pack, marker)) = implicit_derived_pack_spec(parameters)
             && let Some(marker_name) = single_path_name(marker)
             && template
@@ -10596,29 +10880,31 @@ impl<'context> FunctionAnalyzer<'context> {
 
     fn bind_explicit_generic_arguments(
         &mut self,
-        call: &ast::CallExpression,
+        generic_arguments: &[ast::GenericArgument],
+        has_explicit_generic_arguments: bool,
+        span: Span,
         parameters: &[ast::GenericParameter],
         environment: &mut GenericEnvironment,
     ) {
         let has_pack = parameters
             .iter()
             .any(|parameter| matches!(parameter, ast::GenericParameter::TypePack { .. }));
-        if !has_pack && call.generic_arguments.len() > parameters.len() {
+        if !has_pack && generic_arguments.len() > parameters.len() {
             self.diagnostics.push(
                 Diagnostic::error(
                     "E6004",
                     format!(
                         "generic call provides {} argument(s), but at most {} are accepted",
-                        call.generic_arguments.len(),
+                        generic_arguments.len(),
                         parameters.len()
                     ),
-                    call.span,
+                    span,
                 )
                 .with_help("remove the extra generic arguments"),
             );
         }
         let Some(values) = self.types.resolve_generic_argument_values(
-            &call.generic_arguments,
+            generic_arguments,
             &self.generic_environment,
             self.diagnostics,
         ) else {
@@ -10633,13 +10919,13 @@ impl<'context> FunctionAnalyzer<'context> {
                         value_index += 1;
                     }
                     Some(GenericValue::Const(_)) => self.diagnostics.push(
-                        Diagnostic::error("E6004", "expected a type generic argument", call.span)
+                        Diagnostic::error("E6004", "expected a type generic argument", span)
                             .with_help("provide a type name at this position"),
                     ),
                     None => break,
                 },
                 ast::GenericParameter::TypePack { name, .. } => {
-                    if value_index == values.len() && call.generic_arguments.is_empty() {
+                    if value_index == values.len() && !has_explicit_generic_arguments {
                         continue;
                     }
                     let mut types = Vec::new();
@@ -10649,7 +10935,7 @@ impl<'context> FunctionAnalyzer<'context> {
                                 Diagnostic::error(
                                     "E6020",
                                     format!("type pack `{}` received a const argument", name.name),
-                                    call.span,
+                                    span,
                                 )
                                 .with_help("type packs accept only type arguments"),
                             );
@@ -10666,7 +10952,7 @@ impl<'context> FunctionAnalyzer<'context> {
                         value_index += 1;
                     }
                     Some(GenericValue::Type(_)) => self.diagnostics.push(
-                        Diagnostic::error("E6004", "expected a const generic argument", call.span)
+                        Diagnostic::error("E6004", "expected a const generic argument", span)
                             .with_help("provide an integer expression at this position"),
                     ),
                     None => break,
@@ -11705,9 +11991,7 @@ impl<'context> FunctionAnalyzer<'context> {
             return None;
         };
         match &call.callee {
-            AstExpression::Path(path) => function_path_name(path)
-                .and_then(|name| self.signatures.get(&name))
-                .map(|signature| signature.return_type),
+            AstExpression::Path(path) => self.temporary_function_call_return_type(call, path, None),
             AstExpression::Field(field) => {
                 let receiver = self
                     .place_expression_type(&field.base)
@@ -11715,6 +11999,12 @@ impl<'context> FunctionAnalyzer<'context> {
                 let ast::FieldName::Named(method) = &field.field else {
                     return None;
                 };
+                if method.name == "expect"
+                    && let Some(IntrinsicType::Result { success, .. }) =
+                        self.types.intrinsic(receiver)
+                {
+                    return Some(success);
+                }
                 let owner = self
                     .types
                     .nominal_name(receiver)
@@ -11773,6 +12063,9 @@ impl<'context> FunctionAnalyzer<'context> {
         template: &GenericFunctionTemplate,
     ) -> Option<Signature> {
         let receiver_parameter = template.function.parameters.first()?;
+        if call.arguments.len() + 1 != template.function.parameters.len() {
+            return None;
+        }
         let receiver_argument_type = match &receiver_parameter.ty.kind {
             TypeNameKind::Reference { mutable, .. } => match self
                 .types
@@ -11794,22 +12087,41 @@ impl<'context> FunctionAnalyzer<'context> {
             },
             _ => receiver_type,
         };
-        let mut argument_types = Vec::with_capacity(call.arguments.len() + 1);
-        argument_types.push(receiver_argument_type);
-        for argument in &call.arguments {
-            argument_types.push(self.temporary_expression_type(argument)?);
-        }
-        if argument_types.len() != template.function.parameters.len() {
-            return None;
-        }
-
         let mut environment = self.types.base_environment();
         let explicit_parameters = template
             .parameters
             .get(template.explicit_parameter_start..)
             .unwrap_or_default();
-        self.bind_explicit_generic_arguments(call, explicit_parameters, &mut environment);
-        for (parameter, actual) in template.function.parameters.iter().zip(argument_types) {
+        self.bind_explicit_generic_arguments(
+            &call.generic_arguments,
+            call.has_explicit_generic_arguments,
+            call.span,
+            explicit_parameters,
+            &mut environment,
+        );
+        if !self.types.infer_type_pattern(
+            &receiver_parameter.ty,
+            receiver_argument_type,
+            &template.parameters,
+            &mut environment,
+        ) {
+            return None;
+        }
+        for (argument, parameter) in call
+            .arguments
+            .iter()
+            .zip(template.function.parameters.iter().skip(1))
+        {
+            let expected = type_pattern_is_bound(&parameter.ty, &template.parameters, &environment)
+                .then(|| {
+                    self.types
+                        .resolve_type_name_in(&parameter.ty, &environment, self.diagnostics)
+                })
+                .flatten();
+            let actual = match expected {
+                Some(expected) => expected,
+                None => self.temporary_expression_type_expected(argument, None)?,
+            };
             if !self.types.infer_type_pattern(
                 &parameter.ty,
                 actual,
@@ -11828,11 +12140,144 @@ impl<'context> FunctionAnalyzer<'context> {
         self.instantiate_generic_function(template, values, &environment, call.span)
     }
 
+    fn temporary_result_expression_type(
+        &mut self,
+        expression: &AstExpression,
+        expected_success: Option<Type>,
+    ) -> Option<Type> {
+        let AstExpression::Call(call) = expression else {
+            return self.temporary_expression_type(expression);
+        };
+        let AstExpression::Path(path) = &call.callee else {
+            return self.temporary_expression_type(expression);
+        };
+        self.temporary_function_call_return_type(call, path, expected_success)
+    }
+
+    fn temporary_function_call_return_type(
+        &mut self,
+        call: &ast::CallExpression,
+        path: &ast::Path,
+        expected_result_success: Option<Type>,
+    ) -> Option<Type> {
+        let resolved_name = function_path_name(path)?;
+        if let Some(signature) = self.signatures.get(&resolved_name) {
+            return Some(signature.return_type);
+        }
+        let template = self
+            .generic_functions
+            .templates
+            .get(&resolved_name)
+            .cloned()?;
+        let diagnostic_count = self.diagnostics.len();
+        let result = self.infer_temporary_generic_function_signature(
+            call,
+            &template,
+            expected_result_success,
+        );
+        if result.is_none() {
+            self.diagnostics.truncate(diagnostic_count);
+        }
+        result.map(|signature| signature.return_type)
+    }
+
+    fn infer_temporary_generic_function_signature(
+        &mut self,
+        call: &ast::CallExpression,
+        template: &GenericFunctionTemplate,
+        expected_result_success: Option<Type>,
+    ) -> Option<Signature> {
+        if call.arguments.len() != template.function.parameters.len() {
+            return None;
+        }
+        let mut environment = self.types.base_environment();
+        let explicit_parameters = template
+            .parameters
+            .get(template.explicit_parameter_start..)
+            .unwrap_or_default();
+        self.bind_explicit_generic_arguments(
+            &call.generic_arguments,
+            call.has_explicit_generic_arguments,
+            call.span,
+            explicit_parameters,
+            &mut environment,
+        );
+        if let Some(expected_success) = expected_result_success
+            && let Some(success_pattern) = template
+                .function
+                .return_type
+                .as_ref()
+                .and_then(result_success_type_pattern)
+        {
+            self.types.infer_type_pattern(
+                success_pattern,
+                expected_success,
+                &template.parameters,
+                &mut environment,
+            );
+        }
+        for (argument, parameter) in call.arguments.iter().zip(&template.function.parameters) {
+            let expected = type_pattern_is_bound(&parameter.ty, &template.parameters, &environment)
+                .then(|| {
+                    self.types
+                        .resolve_type_name_in(&parameter.ty, &environment, self.diagnostics)
+                })
+                .flatten();
+            let actual = match expected {
+                Some(expected) => expected,
+                None => self.temporary_expression_type_expected(argument, None)?,
+            };
+            if !self.types.infer_type_pattern(
+                &parameter.ty,
+                actual,
+                &template.parameters,
+                &mut environment,
+            ) {
+                return None;
+            }
+        }
+        let values = self.complete_generic_environment(
+            &template.parameters,
+            &template.where_predicates,
+            &mut environment,
+            call.span,
+        )?;
+        self.instantiate_generic_function(template, values, &environment, call.span)
+    }
+
+    fn temporary_expression_type_expected(
+        &mut self,
+        expression: &AstExpression,
+        expected: Option<Type>,
+    ) -> Option<Type> {
+        match expression {
+            AstExpression::Integer(_) => {
+                Some(expected.filter(|ty| ty.is_integer()).unwrap_or(Type::I32))
+            }
+            AstExpression::Float(_) => {
+                Some(expected.filter(|ty| ty.is_float()).unwrap_or(Type::F64))
+            }
+            AstExpression::Character(_) => Some(Type::Char),
+            AstExpression::String(_) => Some(Type::Str),
+            AstExpression::CString(_) => Some(Type::CStr),
+            AstExpression::Boolean(_) => Some(Type::Bool),
+            AstExpression::Unit(_) => Some(Type::Unit),
+            _ => self.temporary_expression_type(expression),
+        }
+    }
+
     fn temporary_expression_type(&mut self, expression: &AstExpression) -> Option<Type> {
         if let Some(ty) = self.place_expression_type(expression) {
             return Some(ty);
         }
         match expression {
+            AstExpression::Integer(_) => Some(Type::I32),
+            AstExpression::Float(_) => Some(Type::F64),
+            AstExpression::Character(_) => Some(Type::Char),
+            AstExpression::String(_) => Some(Type::Str),
+            AstExpression::CString(_) => Some(Type::CStr),
+            AstExpression::Boolean(_) => Some(Type::Bool),
+            AstExpression::Unit(_) => Some(Type::Unit),
             AstExpression::Call(_) => self.temporary_method_receiver_type(expression),
             AstExpression::Path(path) => {
                 let signature = function_path_name(path)
@@ -12783,6 +13228,9 @@ fn validate_comptime_expression(
         | AstExpression::Boolean(_)
         | AstExpression::Unit(_)
         | AstExpression::Path(_) => {}
+        AstExpression::GenericFunction(function) => {
+            validate_comptime_generic_function(function, comptime_functions, diagnostics);
+        }
         AstExpression::FormattedString(formatted) => {
             validate_comptime_formatted_string(formatted, comptime_functions, diagnostics);
         }
@@ -12832,15 +13280,7 @@ fn validate_comptime_expression(
             validate_comptime_block(&looping.body, comptime_functions, diagnostics);
         }
         AstExpression::Unsafe(block) => {
-            diagnostics.push(
-                Diagnostic::error(
-                    "E7012",
-                    "`unsafe` is forbidden during compile-time evaluation",
-                    block.span,
-                )
-                .with_help("move native or raw-pointer work to runtime code"),
-            );
-            validate_comptime_block(block, comptime_functions, diagnostics);
+            validate_comptime_unsafe_block(block, comptime_functions, diagnostics);
         }
         AstExpression::Block(block) => {
             validate_comptime_block(block, comptime_functions, diagnostics);
@@ -12874,6 +13314,50 @@ fn validate_comptime_expression(
             validate_comptime_expression(value, comptime_functions, diagnostics);
         }
     }
+}
+
+fn validate_comptime_generic_function(
+    function: &ast::GenericFunctionExpression,
+    comptime_functions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(
+        Diagnostic::error(
+            "E7012",
+            "function values are not available during compile-time evaluation",
+            function.span,
+        )
+        .with_help("materialize the specialized function in runtime code"),
+    );
+    for argument in &function.generic_arguments {
+        match argument {
+            ast::GenericArgument::Type(ty) => validate_comptime_type(ty, diagnostics),
+            ast::GenericArgument::Const(value) => {
+                validate_comptime_expression(value, comptime_functions, diagnostics);
+            }
+            ast::GenericArgument::Pack { template, .. } => {
+                if let Some(template) = template {
+                    validate_comptime_type(template, diagnostics);
+                }
+            }
+        }
+    }
+}
+
+fn validate_comptime_unsafe_block(
+    block: &ast::Block,
+    comptime_functions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(
+        Diagnostic::error(
+            "E7012",
+            "`unsafe` is forbidden during compile-time evaluation",
+            block.span,
+        )
+        .with_help("move native or raw-pointer work to runtime code"),
+    );
+    validate_comptime_block(block, comptime_functions, diagnostics);
 }
 
 fn validate_comptime_array(
@@ -13440,6 +13924,19 @@ fn single_path_name(path: &ast::Path) -> Option<&str> {
         return None;
     };
     Some(&name.name)
+}
+
+fn result_success_type_pattern(type_name: &ast::TypeName) -> Option<&ast::TypeName> {
+    let TypeNameKind::Generic { path, arguments } = &type_name.kind else {
+        return None;
+    };
+    if path.segments.last()?.name != "Result" {
+        return None;
+    }
+    let ast::GenericArgument::Type(success) = arguments.first()? else {
+        return None;
+    };
+    Some(success)
 }
 
 fn assertion_mode(path: &ast::Path) -> Option<AssertionMode> {
@@ -14154,6 +14651,147 @@ mod tests {
                 .count()
                 == 2
         );
+    }
+
+    #[test]
+    fn resolve_should_materialize_monomorphized_generic_function_values() {
+        let source = "
+            fn identity<T>(value: T) -> T { value }
+            fn main() -> i32 {
+                let callback: fn(i32) -> i32 = identity::<i32>;
+                callback(42)
+            }
+        ";
+
+        let program = resolve_fixture(source).expect("generic function value should resolve");
+
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name.contains("$instance$"))
+        );
+    }
+
+    #[test]
+    fn resolve_should_lower_turbofish_calls_as_direct_calls() {
+        let source = "
+            fn identity<T>(value: T) -> T { value }
+            fn main() -> i32 { identity::<i32>(42) }
+        ";
+
+        let program = resolve_fixture(source).expect("turbofish call should resolve");
+        let main = program
+            .functions
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("main function should exist");
+
+        assert!(matches!(
+            main.body.tail.as_deref().map(|tail| &tail.kind),
+            Some(reimer_hir::ExpressionKind::Call { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_should_materialize_explicit_empty_variadic_function_values() {
+        let source = "
+            fn ready<...Types>() -> i32 { 42 }
+            fn main() -> i32 {
+                let callback: fn() -> i32 = ready::<>;
+                callback()
+            }
+        ";
+
+        resolve_fixture(source).expect("empty variadic function value should resolve");
+    }
+
+    #[test]
+    fn resolve_should_call_explicit_empty_variadic_functions() {
+        let source = "
+            fn ready<...Types>() -> i32 { 42 }
+            fn main() -> i32 { ready::<>() }
+        ";
+
+        resolve_fixture(source).expect("empty variadic function call should resolve");
+    }
+
+    #[test]
+    fn resolve_should_reject_turbofish_on_known_non_generic_function_values() {
+        let diagnostics = resolve_fixture(
+            "fn plain(value: i32) -> i32 { value }
+             fn main() -> i32 {
+                 let callback: fn(i32) -> i32 = plain::<i32>;
+                 callback(42)
+             }",
+        )
+        .expect_err("non-generic function value should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6004" && diagnostic.message.contains("is not generic")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_reject_explicit_empty_generics_on_non_generic_calls() {
+        let diagnostics = resolve_fixture(
+            "fn plain() -> i32 { 42 }
+             fn main() -> i32 { plain::<>() }",
+        )
+        .expect_err("non-generic call should reject an empty turbofish");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6004" && diagnostic.message.contains("plain")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_report_unknown_generic_function_values_as_unresolved() {
+        let diagnostics = resolve_fixture(
+            "fn main() -> i32 {
+                 let callback: fn(i32) -> i32 = missing::<i32>;
+                 callback(42)
+             }",
+        )
+        .expect_err("unknown function value should fail");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E3106" && diagnostic.message.contains("missing")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_respect_local_shadowing_for_generic_function_values() {
+        let diagnostics = resolve_fixture(
+            "fn identity<T>(value: T) -> T { value }
+             fn plain(value: i32) -> i32 { value }
+             fn main() -> i32 {
+                 let identity: fn(i32) -> i32 = plain;
+                 let callback: fn(i32) -> i32 = identity::<i32>;
+                 callback(42)
+             }",
+        )
+        .expect_err("shadowed generic function should not be selected");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E6004" && diagnostic.message.contains("local binding `identity`")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_infer_associated_function_values_from_expected_signature() {
+        let source = "
+            struct Holder<T> { value: T }
+            impl<T> Holder<T> {
+                fn new(value: T) -> Holder<T> { Holder { value: value } }
+            }
+            fn main() -> i32 {
+                let constructor: fn(i32) -> Holder<i32> = Holder::new::<>;
+                constructor(42).value
+            }
+        ";
+
+        resolve_fixture(source).expect("associated function value should infer owner type");
     }
 
     #[test]
@@ -15046,6 +15684,94 @@ mod tests {
     }
 
     #[test]
+    fn resolve_should_type_result_expect_without_error_formatting_traits() {
+        let source = "struct PlainError { code: i32 }
+            struct Resource { left: i32, right: i32 }
+            impl Resource {
+                fn total(self) -> i32 { self.left + self.right }
+            }
+            fn acquire() -> Result<Resource, PlainError> {
+                Ok(Resource { left: 20, right: 22 })
+            }
+            fn main() -> i32 {
+                acquire().expect(\"resource acquisition must succeed\").total()
+            }";
+
+        let program = resolve_fixture(source).expect("result expectation should resolve");
+        let main = program
+            .functions
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("main function should exist");
+        let tail = main.body.tail.as_deref().expect("main should have a tail");
+
+        assert!(matches!(tail.kind, reimer_hir::ExpressionKind::Call { .. }));
+    }
+
+    #[test]
+    fn resolve_should_infer_generic_result_producers_before_expect() {
+        let source = "struct PlainError { code: i32 }
+            struct Bucket<T> { value: T }
+            impl<T> Bucket<T> {
+                fn missing() -> Result<Bucket<T>, PlainError> {
+                    Err(PlainError { code: 7 })
+                }
+            }
+            fn wrap<T>(value: T) -> Result<T, PlainError> { Ok(value) }
+            fn main() -> i32 {
+                let wrapped = wrap(20).expect(\"wrapping must succeed\");
+                let bucket: Bucket<i32> =
+                    Bucket::missing().expect(\"bucket must exist\");
+                wrapped + bucket.value
+            }";
+
+        let program = resolve_fixture(source).expect("generic expectations should resolve");
+
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name.starts_with("wrap$instance$"))
+        );
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| { function.name.starts_with("Bucket::missing$instance$") })
+        );
+    }
+
+    #[test]
+    fn resolve_should_validate_result_expect_arguments() {
+        let source = "fn value() -> Result<i32, i32> { Ok(42) }
+            fn main() -> i32 {
+                let missing = value().expect();
+                let extra = value().expect(\"context\", \"extra\");
+                let generic = value().expect<i32>(\"context\");
+                let wrong_type = value().expect(42);
+                missing + extra + generic + wrong_type
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("invalid calls should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E3105")
+                .count()
+                >= 2
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E6004")
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E3103" && diagnostic.message.contains("expect message")
+        }));
+    }
+
+    #[test]
     fn resolve_should_reject_invalid_try_contexts() {
         let source = "fn not_fallible() -> i32 { 42? }
             fn mismatched(value: Option<i32>) -> Result<i32, i32> {
@@ -15561,6 +16287,31 @@ mod tests {
             }";
 
         let diagnostics = resolve_fixture(source).expect_err("fixture should fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E3143")
+        );
+    }
+
+    #[test]
+    fn resolve_should_consume_result_expect_receiver() {
+        let source = "struct Resource { id: i32 }
+            fn acquire() -> Result<Resource, i32> {
+                Ok(Resource { id: 42 })
+            }
+            fn main() -> i32 {
+                let result = acquire();
+                let resource = result.expect(\"resource acquisition must succeed\");
+                let reused = match result {
+                    Ok(value) => value.id,
+                    Err(_) => 0,
+                };
+                resource.id + reused
+            }";
+
+        let diagnostics = resolve_fixture(source).expect_err("result should have moved");
 
         assert!(
             diagnostics

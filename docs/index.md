@@ -28,10 +28,8 @@ fn greet(name: str) -> Result<(), AllocError> {
     defer message.deinit();
 
     message.push_format(f"Hello, {name}!")?;
-    match println(message.as_str()) {
-        Ok(_) => Ok(()),
-        Err(_) => Ok(()),
-    }
+    println(message.as_str()).expect("standard output must be writable");
+    Ok(())
 }
 ```
 

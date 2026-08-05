@@ -1,35 +1,8 @@
-# Allocation and collections
+# Collections
 
-Owned memory always has an allocator and an explicit cleanup path.
-
-## Choosing an allocator
-
-`general_allocator()`
-: General-purpose allocation for owners with independent lifetimes.
-
-`page_allocator()`
-: Page-backed storage for coarse allocations.
-
-`ArenaAllocator`
-: Groups many allocations under one arena lifetime. Individual owners still follow their documented cleanup contract; releasing the arena finishes the backing allocation.
-
-`FixedBufferAllocator`
-: Allocates from caller-provided storage and returns `AllocError` when capacity is exhausted.
-
-## Raw owned bytes
-
-```reimer
-from std::alloc import AllocError, OwnedBytes, allocate_bytes, page_allocator;
-
-fn reserve() -> Result<usize, AllocError> {
-    let allocator = page_allocator();
-    let bytes: OwnedBytes = allocate_bytes(&allocator, 4_096)?;
-    defer bytes.deinit();
-    Ok(bytes.len())
-}
-```
-
-`OwnedBytes` exposes length and raw pointer access for low-level integrations. Keep pointer use inside a narrow, reviewed boundary.
+Reimer collections use an explicit allocator and expose their growth and
+cleanup paths. Read [Allocators](allocators.md) first when choosing between the
+general, page, arena, and fixed-buffer strategies.
 
 ## `Vec<T>`
 
@@ -90,7 +63,3 @@ assert(seen.contains(42), "the inserted value should be present");
 ## Ring buffers
 
 `RingBuffer<T>` is useful for bounded queues, recent-history windows, and producer/consumer staging where overwriting the oldest element is acceptable. `push` returns `false` only when the configured capacity is zero; a full nonzero buffer overwrites its oldest value.
-
-## Static allocator estimates
-
-The linter and LSP recognize constant capacities and bounded reads. An editor hint such as `static allocator reservation: 4096 bytes per call` is a compile-time estimate, not a memory profile or peak-memory claim. Dynamic sizes remain labeled dynamic.

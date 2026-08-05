@@ -66,6 +66,7 @@ let pool = JobPool::init(
     &allocator,
     JobPoolConfig::fixed(workers),
 )?;
+defer pool.deinit();
 ```
 
 `available_parallelism()` reports the operating system's current estimate of

@@ -4,8 +4,9 @@ Reimer separates borrowed UTF-8 views from allocator-owned text:
 
 - `str` is an immutable `(pointer, byte length)` view. It never allocates.
 - `String` owns an allocation and remains move-only.
-- every operation that creates a `String` receives an `&Allocator` and returns
-  `Result<String, AllocError>`.
+- operations that allocate a new backing region receive an `&Allocator` and
+  are fallible. Empty construction and ownership transfers can reuse existing
+  storage without a new allocation.
 - operations that append to an existing `String` reuse its capacity and return
   `Result<(), AllocError>` because growth may fail.
 
@@ -21,8 +22,11 @@ from std::string import String, concat, concat3, repeat;
 
 let allocator = general_allocator();
 let greeting = concat(&allocator, "hello", " world")?;
+defer greeting.deinit();
 let label = concat3(&allocator, "score", ": ", "42")?;
+defer label.deinit();
 let divider = repeat(&allocator, "-", 40)?;
+defer divider.deinit();
 ```
 
 `concat` and `concat3` calculate the complete byte length and reserve exactly
@@ -41,6 +45,7 @@ An owned `String` is also the allocation-aware formatting builder:
 
 ```reimer
 let mut message = String::with_capacity(&allocator, 64)?;
+defer message.deinit();
 message.push_str("score=")?;
 message.push_u32(score)?;
 message.push_str(", ready=")?;
@@ -60,6 +65,7 @@ explicit:
 
 ```reimer
 let mut message = String::with_capacity(&allocator, 64)?;
+defer message.deinit();
 message.push_format(f"score={score}, ready={ready}")?;
 ```
 

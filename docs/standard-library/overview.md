@@ -6,8 +6,8 @@ The standard library is source-visible and ships with the compiler. Public wrapp
 
 | Need | Module | Main types and functions |
 |---|---|---|
-| Allocate owned memory | `std::alloc` | `Allocator`, `OwnedBytes`, `ArenaAllocator`, `FixedBufferAllocator` |
-| Grow collections | `std::collections` | `Vec`, `HashMap`, `HashSet`, `RingBuffer` |
+| [Allocate owned memory](allocators.md) | `std::alloc` | `Allocator`, `OwnedBytes`, `ArenaAllocator`, `FixedBufferAllocator` |
+| [Grow collections](allocation-and-collections.md) | `std::collections` | `Vec`, `HashMap`, `HashSet`, `RingBuffer` |
 | Build UTF-8 text | `std::string` | `String`, concatenation, repetition, search, Unicode conversion |
 | Format values | `std::fmt` | `Display`, `Debug`, `Formatter`, `FormatError` |
 | Read and write terminals | `std::io` | `stdin`, `stdout`, `stderr`, `print`, `println`, bounded input buffers |

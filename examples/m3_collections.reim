@@ -1,78 +1,29 @@
-from std::alloc import AllocError, general_allocator;
+from std::alloc import general_allocator;
 from std::collections import HashMap, HashSet, RingBuffer;
-
 
 fn main() -> i32 {
     let allocator = general_allocator();
     let numbers = "123\n";
-    let map_result: Result<HashMap<i32, i32>, AllocError> =
-        HashMap::new(&allocator);
-    let mut map = match map_result {
-        Ok(value) => value,
-        Err(_) => {
-            return 1;
-        },
-    };
+    let mut map: HashMap<i32, i32> =
+        HashMap::new(&allocator).expect("map allocation must succeed");
     defer map.deinit();
-    match map.insert(1, 20) {
-        Ok(_) => (),
-        Err(_) => {
-            return 2;
-        },
-    }
+    map.insert(1, 20).expect("map insertion must succeed");
 
-    let set_result: Result<HashSet<i32>, AllocError> =
-        HashSet::with_capacity(&allocator, 4);
-    let mut set = match set_result {
-        Ok(value) => value,
-        Err(_) => {
-            return 3;
-        },
-    };
+    let mut set: HashSet<i32> = HashSet::with_capacity(&allocator, 4)
+        .expect("set allocation must succeed");
     defer set.deinit();
     if !set.is_empty() || set.capacity() < 4 {
         return 9;
     }
-    match set.reserve(16) {
-        Ok(_) => (),
-        Err(_) => {
-            return 10;
-        },
-    }
-    match set.insert(7) {
-        Ok(_) => (),
-        Err(_) => {
-            return 4;
-        },
-    }
+    set.reserve(16).expect("set growth must succeed");
+    set.insert(7).expect("set insertion must succeed");
 
-    let ring_result: Result<RingBuffer<i32>, AllocError> =
-        RingBuffer::with_capacity(&allocator, 2);
-    let mut ring = match ring_result {
-        Ok(value) => value,
-        Err(_) => {
-            return 5;
-        },
-    };
+    let mut ring: RingBuffer<i32> = RingBuffer::with_capacity(&allocator, 2)
+        .expect("ring buffer allocation must succeed");
     defer ring.deinit();
-    match ring.push(1) {
-        Ok(_) => (),
-        Err(_) => {
-            return 6;
-        },
-    }
-    match ring.push(21) {
-        Ok(_) => (),
-        Err(_) => {
-            return 7;
-        },
-    }
-    match ring.push(22) {
-        Ok(_) => (),
-        Err(_) => {
-            return 8;
-        },
-    }
+    ring.push(1).expect("ring buffer insertion must succeed");
+    ring.push(21).expect("ring buffer insertion must succeed");
+    ring.push(22).expect("ring buffer growth must succeed");
 
     let mapped = match map.get(1) {
         Some(value) => value,

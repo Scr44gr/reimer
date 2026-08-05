@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use reimer_ast::{
     self as ast, BinaryOperator, Expression, FieldName, ImportKind, Item, Pattern, Statement,
@@ -25,8 +25,10 @@ pub(crate) fn lint(source: &str, program: &ast::Program) -> Vec<Finding> {
     }
 
     let consuming_methods = consuming_method_names(program);
+    let declared_result_functions = declared_result_functions(program);
     for function in functions(program) {
-        let mut linter = FunctionLinter::new(source, &consuming_methods);
+        let mut linter =
+            FunctionLinter::new(source, &consuming_methods, &declared_result_functions);
         walk::function_declaration(&mut linter, function);
         findings.extend(linter.finish());
     }
@@ -91,6 +93,21 @@ fn consuming_method_names(program: &ast::Program) -> HashSet<&str> {
         .collect()
 }
 
+fn declared_result_functions(program: &ast::Program) -> HashMap<&str, bool> {
+    let mut declarations = HashMap::new();
+    for function in functions(program) {
+        let returns_result = function
+            .return_type
+            .as_ref()
+            .is_some_and(type_name_is_result);
+        declarations
+            .entry(function.name.name.as_str())
+            .and_modify(|known_result| *known_result &= returns_result)
+            .or_insert(returns_result);
+    }
+    declarations
+}
+
 struct MutableBinding {
     name: String,
     span: Span,
@@ -105,25 +122,33 @@ struct ResourceBinding {
 struct FunctionLinter<'source, 'program> {
     source: &'source str,
     consuming_methods: &'program HashSet<&'program str>,
+    declared_result_functions: &'program HashMap<&'program str, bool>,
     findings: Vec<Finding>,
     mutable_bindings: Vec<MutableBinding>,
     assigned: HashSet<String>,
     resources: Vec<ResourceBinding>,
     released: HashSet<String>,
     transferred: HashSet<String>,
+    result_bindings: HashSet<String>,
 }
 
 impl<'source, 'program> FunctionLinter<'source, 'program> {
-    fn new(source: &'source str, consuming_methods: &'program HashSet<&'program str>) -> Self {
+    fn new(
+        source: &'source str,
+        consuming_methods: &'program HashSet<&'program str>,
+        declared_result_functions: &'program HashMap<&'program str, bool>,
+    ) -> Self {
         Self {
             source,
             consuming_methods,
+            declared_result_functions,
             findings: Vec::new(),
             mutable_bindings: Vec::new(),
             assigned: HashSet::new(),
             resources: Vec::new(),
             released: HashSet::new(),
             transferred: HashSet::new(),
+            result_bindings: HashSet::new(),
         }
     }
 
@@ -169,6 +194,51 @@ impl<'source, 'program> FunctionLinter<'source, 'program> {
             });
         }
         self.findings
+    }
+
+    fn resource_kind(&self, expression: &Expression) -> Option<&'static str> {
+        resource_kind(expression).or_else(|| {
+            let receiver = self.result_expect_receiver(expression)?;
+            resource_kind(receiver).or_else(|| {
+                let owner = root_name(receiver)?;
+                self.resources
+                    .iter()
+                    .find(|resource| resource.name == owner)
+                    .map(|resource| resource.kind)
+            })
+        })
+    }
+
+    fn expression_returns_result(&self, expression: &Expression) -> bool {
+        match expression {
+            Expression::Path(path) if path.segments.len() == 1 => path
+                .segments
+                .first()
+                .is_some_and(|name| self.result_bindings.contains(&name.name)),
+            Expression::Call(call) => {
+                let Some(name) = call_name(&call.callee) else {
+                    return false;
+                };
+                if name == "expect" {
+                    return false;
+                }
+                self.declared_result_functions
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        matches!(name, "Ok" | "Err") || resource_kind(expression).is_some()
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn result_expect_receiver<'expression>(
+        &self,
+        expression: &'expression Expression,
+    ) -> Option<&'expression Expression> {
+        let receiver = expect_receiver(expression)?;
+        self.expression_returns_result(receiver).then_some(receiver)
     }
 
     fn lint_boolean_comparison(&mut self, binary: &ast::BinaryExpression) {
@@ -228,7 +298,7 @@ impl<'source, 'program> FunctionLinter<'source, 'program> {
                 self.transferred.insert(owner.to_owned());
             }
         }
-        if name == "deinit" {
+        if matches!(name, "deinit" | "release") {
             if let Expression::Field(field) = &call.callee
                 && let Some(owner) = root_name(&field.base)
             {
@@ -257,16 +327,33 @@ impl Visitor for FunctionLinter<'_, '_> {
                         span: binding.name.span,
                     });
                 }
-                if let Some(kind) = resource_kind(&binding.initializer) {
+                let returns_result = binding.ty.as_ref().is_some_and(type_name_is_result)
+                    || self.expression_returns_result(&binding.initializer);
+                if let Some(owner) = self
+                    .result_expect_receiver(&binding.initializer)
+                    .and_then(root_name)
+                    && self.resources.iter().any(|resource| resource.name == owner)
+                {
+                    self.transferred.insert(owner.to_owned());
+                }
+                if let Some(kind) = self.resource_kind(&binding.initializer) {
                     self.resources.push(ResourceBinding {
                         name: binding.name.name.clone(),
                         span: binding.name.span,
                         kind,
                     });
                 }
+                self.result_bindings.remove(&binding.name.name);
+                if returns_result {
+                    self.result_bindings.insert(binding.name.name.clone());
+                }
             }
             Statement::Return(statement) => {
-                if let Some(name) = statement.value.as_ref().and_then(root_name) {
+                let owner = statement.value.as_ref().and_then(|value| {
+                    root_name(value)
+                        .or_else(|| self.result_expect_receiver(value).and_then(root_name))
+                });
+                if let Some(name) = owner {
                     self.transferred.insert(name.to_owned());
                 }
             }
@@ -360,15 +447,14 @@ fn mut_keyword_span(source: &str, name_span: Span) -> Option<Span> {
 }
 
 fn resource_kind(expression: &Expression) -> Option<&'static str> {
-    let expression = match expression {
-        Expression::Try { value, .. } => value,
-        _ => expression,
-    };
+    if let Expression::Try { value, .. } = expression {
+        return resource_kind(value);
+    }
     let Expression::Call(call) = expression else {
         return None;
     };
     match call_name(&call.callee)? {
-        "allocate_bytes" => Some("owned allocation"),
+        "allocate_bytes" | "allocate_aligned_bytes" => Some("owned allocation"),
         "read" | "read_exact" | "read_line" | "read_to_end" => Some("owned input buffer"),
         "from" | "with_capacity" if callee_contains_name(&call.callee, "String") => {
             Some("owned string")
@@ -383,6 +469,28 @@ fn resource_kind(expression: &Expression) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+fn expect_receiver(expression: &Expression) -> Option<&Expression> {
+    let Expression::Call(call) = expression else {
+        return None;
+    };
+    if call_name(&call.callee) != Some("expect") {
+        return None;
+    }
+    let Expression::Field(field) = &call.callee else {
+        return None;
+    };
+    Some(&field.base)
+}
+
+fn type_name_is_result(type_name: &ast::TypeName) -> bool {
+    let TypeNameKind::Generic { path, .. } = &type_name.kind else {
+        return false;
+    };
+    path.segments
+        .last()
+        .is_some_and(|name| name.name == "Result")
 }
 
 fn call_name(callee: &Expression) -> Option<&str> {
@@ -669,6 +777,35 @@ mod tests {
     }
 
     #[test]
+    fn lint_should_track_aligned_allocations_and_release_cleanup() {
+        let source = "fn main() -> i32 {
+            let mut bytes = allocate_aligned_bytes(&allocator, 64, 16)?;
+            bytes.release();
+            0
+        }";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_report_an_unreleased_aligned_allocation() {
+        let source = "fn main() -> i32 {
+            let bytes = allocate_aligned_bytes(&allocator, 64, 16)?;
+            bytes.len() as i32
+        }";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
     fn lint_should_treat_match_scrutinee_as_ownership_transfer() {
         let source = "
             fn main() -> i32 {
@@ -757,6 +894,94 @@ mod tests {
         let findings = lint(source, &syntax);
 
         assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_treat_result_expect_receiver_as_ownership_transfer() {
+        let source = "
+            fn main() -> i32 {
+                let allocation = allocate_bytes(&allocator, 64);
+                let bytes = allocation.expect(\"allocation must succeed\");
+                defer bytes.deinit();
+                0
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(!findings.iter().any(|finding| finding.code == "L2010"));
+    }
+
+    #[test]
+    fn lint_should_track_owner_returned_by_result_expect() {
+        let source = "
+            fn main() -> i32 {
+                let allocation = allocate_bytes(&allocator, 64);
+                let bytes = allocation.expect(\"allocation must succeed\");
+                bytes.len() as i32
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding.code == "L2010" && finding.message.contains("`bytes`") })
+        );
+        assert!(!findings.iter().any(|finding| {
+            finding.code == "L2010" && finding.message.contains("`allocation`")
+        }));
+    }
+
+    #[test]
+    fn lint_should_track_direct_owner_returned_by_result_expect() {
+        let source = "
+            fn main() -> i32 {
+                let bytes = allocate_bytes(&allocator, 64)
+                    .expect(\"allocation must succeed\");
+                0
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding.code == "L2010" && finding.message.contains("`bytes`") })
+        );
+    }
+
+    #[test]
+    fn lint_should_not_assume_a_borrowed_user_expect_consumes_its_receiver() {
+        let source = "
+            struct Buffer { value: i32 }
+            impl Buffer {
+                fn expect(&self, message: str) -> i32 { self.value }
+            }
+            fn read_to_end() -> Buffer { Buffer { value: 42 } }
+            fn main() -> i32 {
+                let buffer = read_to_end();
+                buffer.expect(\"inspect without consuming\")
+            }
+        ";
+        let syntax =
+            parse(&lex(source).expect("fixture should lex")).expect("fixture should parse");
+
+        let findings = lint(source, &syntax);
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding.code == "L2010" && finding.message.contains("`buffer`") })
+        );
     }
 
     #[test]

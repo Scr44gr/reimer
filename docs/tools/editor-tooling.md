@@ -74,9 +74,10 @@ signatures and behavior of integer overflow modes, recoverable slice
 Completion advertises those method names alongside source declarations.
 
 Memory figures always say **static estimate**. The analyzer currently
-recognizes explicit byte reservations, bounded input buffers, fixed buffers,
-`String::from`, dynamic `clone_in`, and allocator-backed capacity operations.
-It evaluates checked constant arithmetic and distinguishes:
+recognizes `allocate_bytes`, `allocate_aligned_bytes`, bounded input buffers, fixed-buffer capacity,
+`String::with_capacity`, `String::from`, dynamic `clone_in`, concatenation,
+repetition, case conversion, and formatted-string growth. It evaluates checked
+constant arithmetic and distinguishes:
 
 - exact bytes per call;
 - maximum bounds;

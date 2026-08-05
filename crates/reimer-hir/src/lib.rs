@@ -607,6 +607,11 @@ pub enum ExpressionKind {
         /// Concrete pointee type after generic monomorphization.
         target: Type,
     },
+    /// Returns the native byte alignment of a raw pointer's target type.
+    TypeAlignment {
+        /// Concrete pointee type after generic monomorphization.
+        target: Type,
+    },
     /// Computes one seeded structural hash for a `Hash`-capable value.
     HashValue {
         /// Concrete value after generic monomorphization.
@@ -620,6 +625,8 @@ pub enum ExpressionKind {
         allocator: Box<Expression>,
         /// Requested byte length.
         length: Box<Expression>,
+        /// Requested power-of-two alignment, or byte alignment for the compatibility intrinsic.
+        alignment: Option<Box<Expression>>,
         /// Struct stored in the success variant.
         allocation_type: Type,
         /// Enum stored in the error variant.
@@ -635,6 +642,8 @@ pub enum ExpressionKind {
         data: Box<Expression>,
         /// Allocation byte length.
         length: Box<Expression>,
+        /// Original power-of-two alignment, or byte alignment for the compatibility intrinsic.
+        alignment: Option<Box<Expression>>,
     },
     /// Starts one native thread with a moved argument.
     ThreadSpawn {
@@ -798,6 +807,17 @@ pub enum ExpressionKind {
         worker_panicked_variant: u32,
         /// `ResultMismatch` discriminant.
         result_mismatch_variant: u32,
+    },
+    /// Extracts a successful result payload or panics with caller-provided context.
+    Expect {
+        /// `Result<T, E>` value consumed by the operation.
+        value: Box<Expression>,
+        /// UTF-8 diagnostic emitted when the result contains `Err`.
+        message: Box<Expression>,
+        /// `Ok` variant discriminant.
+        success_variant: u32,
+        /// Type stored by the `Ok` variant.
+        output_type: Type,
     },
     /// Extracts a success payload or returns the original failure.
     Try {

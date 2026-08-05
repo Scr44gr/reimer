@@ -1,9 +1,31 @@
-from std::alloc import AllocError, Allocator, OwnedBytes, allocate_bytes;
+from std::alloc import AllocError, Allocator, FixedBufferAllocator, OwnedBytes, allocate_aligned_bytes, general_allocator;
 import std::slice as slice;
 
 const CONTROL_EMPTY: u8 = 0x80;
 const CONTROL_DELETED: u8 = 0xfe;
 const CONTROL_GROUP_WIDTH: usize = 16;
+
+fn checked_allocation_product(
+    left: usize,
+    right: usize,
+) -> Result<usize, AllocError> {
+    let maximum: usize = !0;
+    if right != 0 && left > maximum / right {
+        Err(AllocError::OutOfMemory)
+    } else {
+        Ok(left * right)
+    }
+}
+
+fn checked_allocation_sum(
+    left: usize,
+    right: usize,
+) -> Result<usize, AllocError> {
+    match left.checked_add(right) {
+        Some(total) => Ok(total),
+        None => Err(AllocError::OutOfMemory),
+    }
+}
 
 @link("runtime")
 extern "C" {
@@ -47,8 +69,10 @@ impl<T> Vec<T> {
     ) -> Result<Vec<T>, AllocError> {
         let empty = 0 as usize as *mut T;
         let stride = __pointee_stride(empty);
-        let byte_capacity = capacity * stride;
-        let mut storage = allocate_bytes(allocator, byte_capacity)?;
+        let alignment = __pointee_alignment(empty);
+        let byte_capacity = checked_allocation_product(capacity, stride)?;
+        let mut storage =
+            allocate_aligned_bytes(allocator, byte_capacity, alignment)?;
         let data = storage.as_mut_ptr() as *mut T;
         Ok(Vec {
             storage: storage,
@@ -103,8 +127,10 @@ impl<T> Vec<T> {
                 None => required,
             };
         }
-        let byte_capacity = next_capacity * stride;
-        self.storage.grow(byte_capacity)?;
+        let byte_capacity =
+            checked_allocation_product(next_capacity, stride)?;
+        let alignment = __pointee_alignment(self.data);
+        self.storage.grow_aligned(byte_capacity, alignment)?;
         self.data = self.storage.as_mut_ptr() as *mut T;
         Ok(())
     }
@@ -372,8 +398,18 @@ impl<K: Copy, V: Copy> HashTable<K, V> {
         capacity: usize,
         probe: *const Entry<K, V>,
     ) -> Result<HashTable<K, V>, AllocError> {
-        let entries_bytes = capacity * __pointee_stride(probe);
-        let mut storage = allocate_bytes(allocator, entries_bytes + capacity)?;
+        let entries_bytes = checked_allocation_product(
+            capacity,
+            __pointee_stride(probe),
+        )?;
+        let storage_bytes =
+            checked_allocation_sum(entries_bytes, capacity)?;
+        let alignment = __pointee_alignment(probe);
+        let mut storage = allocate_aligned_bytes(
+            allocator,
+            storage_bytes,
+            alignment,
+        )?;
         let entries = storage.as_mut_ptr() as *mut Entry<K, V>;
         let controls = (storage.as_mut_ptr() as usize + entries_bytes) as *mut u8;
         let mut index: usize = 0;
@@ -833,6 +869,79 @@ fn first_control_lane(mask: u16) -> usize {
         lane += 1;
     }
     lane
+}
+
+@derive(Copy, Eq)
+@align(64)
+struct AlignedCollectionValue {
+    value: u64,
+}
+
+@test
+fn vector_storage_should_align_over_aligned_elements_from_a_misaligned_buffer() {
+    let mut backing: [u8; 256] = [0; 256];
+    let base = &mut backing as *mut u8;
+    let misaligned = (base as usize + 1) as *mut u8;
+    let fixed = FixedBufferAllocator::init(misaligned, 255)
+        .expect("fixed allocator creation must succeed");
+    defer fixed.deinit();
+    let mut values: Vec<AlignedCollectionValue> =
+        Vec::with_capacity(fixed.allocator(), 2)
+            .expect("aligned vector allocation must succeed");
+    defer values.deinit();
+
+    assert((values.data as usize & 63) == 0);
+    values.push(AlignedCollectionValue { value: 42 })
+        .expect("aligned vector insertion must succeed");
+    match values.get(0) {
+        Some(value) => assert(value.value == 42),
+        None => panic("aligned vector value is missing"),
+    }
+}
+
+@test
+fn hash_table_storage_should_align_over_aligned_entries_from_a_misaligned_buffer() {
+    let mut backing: [u8; 2305] = [0; 2305];
+    let base = &mut backing as *mut u8;
+    let misaligned = (base as usize + 1) as *mut u8;
+    let fixed = FixedBufferAllocator::init(misaligned, 2304)
+        .expect("fixed allocator creation must succeed");
+    defer fixed.deinit();
+    let mut values: HashMap<u32, AlignedCollectionValue> =
+        HashMap::with_capacity(fixed.allocator(), 4)
+            .expect("aligned hash table allocation must succeed");
+    defer values.deinit();
+
+    assert((values.table.entries as usize & 63) == 0);
+    values.insert(7, AlignedCollectionValue { value: 42 })
+        .expect("aligned hash table insertion must succeed");
+    match values.get(7) {
+        Some(value) => assert(value.value == 42),
+        None => panic("aligned hash table value is missing"),
+    }
+}
+
+@test
+fn typed_allocation_size_overflow_should_report_out_of_memory() {
+    let allocator = general_allocator();
+    let maximum: usize = !0;
+
+    let vector_result: Result<Vec<AlignedCollectionValue>, AllocError> =
+        Vec::with_capacity(&allocator, maximum);
+    match vector_result {
+        Err(AllocError::OutOfMemory) => (),
+        _ => panic("vector capacity overflow did not report out of memory"),
+    }
+    let table_result: Result<HashTable<u8, u8>, AllocError> =
+        HashTable::with_capacity(
+        &allocator,
+        maximum / 2,
+        0 as usize as *const Entry<u8, u8>,
+    );
+    match table_result {
+        Err(AllocError::OutOfMemory) => (),
+        _ => panic("hash table size overflow did not report out of memory"),
+    }
 }
 
 /// A collection of unique `Copy + Eq + Hash` values.

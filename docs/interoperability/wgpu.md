@@ -55,7 +55,7 @@ fn initialize() -> Result<(), Error> {
 Run the complete headless and mapped-buffer check from the repository root:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File vendor\wgpu\tools\invoke.ps1 -Project examples\wgpu_info
+reimer run examples\wgpu_info --release
 ```
 
 ## SDL3 surfaces
@@ -88,8 +88,11 @@ requests an adapter compatible with that surface. The currently bundled SDL3
 runtime is Windows x64, so its convenience runner is:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File vendor\wgpu-sdl3\tools\invoke.ps1 -Project examples\wgpu_window
+reimer run examples\wgpu_window --release
 ```
+
+The SDL3 and wgpu manifests provide their loader and linker paths transitively;
+the commands do not modify `PATH`.
 
 The adapter source is portable; Linux and macOS execution additionally require
 the matching SDL3 runtime artifact in `vendor/sdl3/native/<platform>`.

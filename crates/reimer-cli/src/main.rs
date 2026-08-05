@@ -11,12 +11,13 @@ use std::thread;
 use reimer_cli::{
     check_file, check_graph, compile_file_to_object, compile_file_to_object_with_options,
     compile_graph_to_object, execute_file_test, execute_file_tests_with_progress,
-    execute_file_with_arguments, execute_graph, execute_graph_test,
-    execute_graph_tests_with_progress, execute_graph_with_arguments, file_test_names,
-    graph_test_names,
+    execute_file_with_arguments, execute_graph_test_with_native_dependencies,
+    execute_graph_tests_with_native_dependencies_and_progress,
+    execute_graph_with_arguments_and_native_dependencies, execute_graph_with_native_dependencies,
+    file_test_names, graph_test_names,
 };
 use reimer_codegen_native::OptimizationLevel;
-use reimer_project::{BuildProfile, LockMode, Project};
+use reimer_project::{BuildProfile, LockMode, NativeDependencies, Project};
 
 mod documentation;
 mod generated_output;
@@ -197,11 +198,13 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
             Path::to_path_buf,
         );
         let artifact_directory = source_artifact_directory(&options.path, options.profile);
+        let native = NativeDependencies::default();
         let object_path = native_linker::link_executable(
             &object,
             &output,
             &artifact_directory,
             Path::new("."),
+            &native,
             generated,
         )?;
         println!(
@@ -245,6 +248,7 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
         &output,
         &artifact_directory,
         project.root_directory(),
+        project.native_dependencies(),
         generated,
     )?;
     println!(
@@ -275,10 +279,11 @@ fn execute(options: &ProjectOptions, arguments: &[OsString]) -> Result<(), Strin
     let project = open_project(options)?;
     let entry = project.entry().map_err(|error| error.to_string())?;
     let optimization = selected_optimization(&project, options.profile)?;
-    let result = execute_graph_with_arguments(
+    let result = execute_graph_with_arguments_and_native_dependencies(
         &project.source_graph(&entry),
         optimization,
         runtime_arguments(&entry, arguments),
+        project.native_dependencies(),
     )
     .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
     println!("program returned {result}");
@@ -321,7 +326,11 @@ fn test(options: &ProjectOptions) -> Result<(), String> {
         let project = project
             .as_ref()
             .ok_or_else(|| "integration test has no containing project".to_owned())?;
-        match execute_graph(&project.source_graph(entry), optimization) {
+        match execute_graph_with_native_dependencies(
+            &project.source_graph(entry),
+            optimization,
+            project.native_dependencies(),
+        ) {
             Ok(0) => println!("pass {}", entry.display()),
             Ok(code) => {
                 println!("fail {} (returned {code})", entry.display());
@@ -397,8 +406,13 @@ fn run_unit_test(options: &ProjectOptions, test_index: usize) -> Result<(), Stri
     let project = open_project(options)?;
     let entry = project.entry().map_err(|error| error.to_string())?;
     let optimization = selected_optimization(&project, options.profile)?;
-    execute_graph_test(&project.source_graph(&entry), test_index, optimization)
-        .map_err(|diagnostics| render_diagnostics(&diagnostics))
+    execute_graph_test_with_native_dependencies(
+        &project.source_graph(&entry),
+        test_index,
+        optimization,
+        project.native_dependencies(),
+    )
+    .map_err(|diagnostics| render_diagnostics(&diagnostics))
 }
 
 fn run_unit_tests(options: &ProjectOptions) -> Result<(), String> {
@@ -414,9 +428,10 @@ fn run_unit_tests(options: &ProjectOptions) -> Result<(), String> {
     let project = open_project(options)?;
     let entry = project.entry().map_err(|error| error.to_string())?;
     let optimization = selected_optimization(&project, options.profile)?;
-    execute_graph_tests_with_progress(
+    execute_graph_tests_with_native_dependencies_and_progress(
         &project.source_graph(&entry),
         optimization,
+        project.native_dependencies(),
         report_test_start,
     )
     .map_err(|diagnostics| render_diagnostics(&diagnostics))

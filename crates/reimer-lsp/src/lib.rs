@@ -1338,6 +1338,11 @@ const STANDARD_SYMBOLS: &[(&str, CompletionItemKind, &str)] = &[
     ),
     ("Option", CompletionItemKind::ENUM, "core"),
     ("Result", CompletionItemKind::ENUM, "core"),
+    (
+        "expect",
+        CompletionItemKind::METHOD,
+        "fn expect(self: Result<T, E>, message: str) -> T",
+    ),
     ("String", CompletionItemKind::STRUCT, "std::string"),
     ("Debug", CompletionItemKind::INTERFACE, "std::fmt"),
     ("Display", CompletionItemKind::INTERFACE, "std::fmt"),
@@ -1620,7 +1625,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Position, Url};
+    use tower_lsp::lsp_types::{
+        DiagnosticSeverity, HoverContents, NumberOrString, Position, PrepareRenameResponse, Url,
+    };
 
     use super::{Document, LineIndex, Workspace};
 
@@ -1708,6 +1715,7 @@ mod tests {
             "wrapping_add",
             "checked_add",
             "saturating_add",
+            "expect",
             "Debug",
             "Display",
             "Formatter",
@@ -1773,6 +1781,52 @@ mod tests {
             debug_contents
                 .value
                 .contains("Optimized builds do not evaluate")
+        );
+    }
+
+    #[test]
+    fn document_should_describe_result_expect_on_hover() {
+        let source = "struct PlainError { code: i32 }
+        struct Resource { id: i32 }
+        fn acquire() -> Result<Resource, PlainError> {
+            Ok(Resource { id: 42 })
+        }
+        fn main() -> i32 {
+            acquire().expect(\"resource acquisition must succeed\").id
+        }";
+        let document = Document::new(
+            Url::parse("untitled:main.reim").expect("URL should parse"),
+            source.to_owned(),
+        );
+        let lines = LineIndex::new(Arc::from(source));
+        let position = lines.position(source.find("expect(").expect("expect call should exist"));
+
+        let hover = document
+            .hover(position)
+            .expect("expect call should have hover");
+        let tower_lsp::lsp_types::HoverContents::Markup(contents) = hover.contents else {
+            panic!("expect hover should use markdown");
+        };
+
+        assert!(
+            contents.value.contains(
+                "fn expect(self: Result<Resource, PlainError>, message: str) -> Resource"
+            )
+        );
+        assert!(contents.value.contains("returns its `Ok` value"));
+        assert!(
+            contents
+                .value
+                .contains("does not need `Display` or `Debug`")
+        );
+        let completion = document
+            .completions()
+            .into_iter()
+            .find(|item| item.label == "expect")
+            .expect("expect should be offered as a completion");
+        assert_eq!(
+            completion.detail.as_deref(),
+            Some("fn expect(self: Result<T, E>, message: str) -> T")
         );
     }
 
@@ -1844,6 +1898,123 @@ mod tests {
                 .all(|offset| *offset < source.find("fn second").expect("function should exist"))
         );
         assert!(document.rename(lines.position(declaration), "fn").is_none());
+    }
+
+    #[test]
+    fn document_should_navigate_and_rename_only_a_specialized_function_identifier() {
+        let source = "fn identity<T>(value: T) -> T { value }\n\
+                      fn main() -> i32 {\n\
+                          let callback: fn(i32) -> i32 = identity::<i32>;\n\
+                          callback(42)\n\
+                      }\n"
+        .to_owned();
+        let lines = LineIndex::new(Arc::from(source.as_str()));
+        let declaration = source
+            .find("identity<T>")
+            .expect("generic declaration should exist");
+        let specialization = source
+            .find("identity::<i32>")
+            .expect("generic function value should exist");
+        let document = Document::new(
+            Url::parse("untitled:generic-rename.reim").expect("URL should parse"),
+            source.clone(),
+        );
+
+        let definition = document
+            .definition(lines.position(specialization))
+            .expect("generic function value should resolve to its declaration");
+        assert_eq!(
+            document.lines.byte(definition.range.start),
+            Some(declaration)
+        );
+        assert_eq!(
+            document.lines.byte(definition.range.end),
+            Some(declaration + "identity".len())
+        );
+
+        let prepared = document
+            .prepare_rename(lines.position(specialization))
+            .expect("generic function value should be renameable");
+        let PrepareRenameResponse::RangeWithPlaceholder { range, placeholder } = prepared else {
+            panic!("prepare rename should include the current spelling");
+        };
+        assert_eq!(placeholder, "identity");
+        assert_eq!(document.lines.byte(range.start), Some(declaration));
+        assert_eq!(
+            document.lines.byte(range.end),
+            Some(declaration + "identity".len())
+        );
+
+        let edit = document
+            .rename(lines.position(specialization), "convert")
+            .expect("generic function value should produce rename edits");
+        let edits = edit
+            .changes
+            .expect("rename should contain document changes")
+            .remove(&Url::parse("untitled:generic-rename.reim").expect("URL should parse"))
+            .expect("the active document should be edited");
+        let edited_spans = edits
+            .iter()
+            .map(|edit| {
+                let start = document
+                    .lines
+                    .byte(edit.range.start)
+                    .expect("edit start should map to a byte");
+                let end = document
+                    .lines
+                    .byte(edit.range.end)
+                    .expect("edit end should map to a byte");
+                (start, end)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|edit| edit.new_text == "convert"));
+        assert!(edited_spans.contains(&(declaration, declaration + "identity".len())));
+        assert!(edited_spans.contains(&(specialization, specialization + "identity".len())));
+        assert_eq!(
+            &source[specialization + "identity".len()..specialization + "identity::<i32>".len()],
+            "::<i32>"
+        );
+    }
+
+    #[test]
+    fn document_should_show_source_name_for_a_specialized_function_value() {
+        let source = "/// Returns a value without changing its type.\n\
+                      fn identity<T>(value: T) -> T { value }\n\
+                      fn main() -> i32 {\n\
+                          let callback: fn(i32) -> i32 = identity::<i32>;\n\
+                          callback(42)\n\
+                      }\n";
+        let lines = LineIndex::new(Arc::from(source));
+        let specialization = source
+            .find("identity::<i32>")
+            .expect("generic function value should exist");
+        let document = Document::new(
+            Url::parse("untitled:generic-hover.reim").expect("URL should parse"),
+            source.to_owned(),
+        );
+
+        let hover = document
+            .hover(lines.position(specialization))
+            .expect("generic function value should have hover information");
+        let HoverContents::Markup(contents) = hover.contents else {
+            panic!("generic function value hover should use markdown");
+        };
+
+        assert!(contents.value.contains("fn identity(value: i32) -> i32"));
+        assert!(
+            contents
+                .value
+                .contains("Returns a value without changing its type.")
+        );
+        assert!(!contents.value.contains("$instance$"));
+        let range = hover.range.expect("hover should identify the source name");
+        assert_eq!(document.lines.byte(range.start), Some(specialization));
+        assert_eq!(
+            document.lines.byte(range.end),
+            Some(specialization + "identity".len())
+        );
     }
 
     #[test]

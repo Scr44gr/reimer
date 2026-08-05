@@ -17,6 +17,6 @@ id = "ba665127e4683f3f1dee0e46"
 name = "wgpu"
 version = "29.0.1"
 source = "path+../../vendor/wgpu"
-checksum = "0f9d8daf9c1f30d6ecdf8ebe290261f17370c009f70e78d4b3841d83b90ccb65"
+checksum = "b50158a5ce76857dc80a2054162eb139fafcbae212e922df93bf5cfe446751a6"
 dependencies = []
 

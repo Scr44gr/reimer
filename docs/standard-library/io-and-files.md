@@ -79,7 +79,7 @@ High-level helpers cover common complete-file operations:
 ```reimer
 import std::fs;
 
-let text = std::fs::read_to_string(&allocator, "settings.txt")?;
+let text = std::fs::read_to_string("settings.txt", &allocator)?;
 defer text.deinit();
 
 std::fs::write_string("snapshot.txt", text.as_str())?;

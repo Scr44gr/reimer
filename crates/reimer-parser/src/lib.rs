@@ -9,10 +9,10 @@ use reimer_ast::{
     DeferStatement, EnumDeclaration, EnumVariant, EnumVariantPayload, Expression,
     ExpressionStatement, ExternFunction, FieldExpression, FieldInitializer, FieldName,
     FloatLiteral, ForStatement, FormattedStringExpression, FormattedStringFragment, Function,
-    GenericArgument, GenericParameter, Identifier, IfExpression, ImplDeclaration,
-    ImportDeclaration, ImportKind, ImportedName, IndexExpression, IntegerLiteral, Item,
-    LetStatement, LoopExpression, MatchArm, MatchExpression, PackExpansionExpression, Parameter,
-    Path, Pattern, PatternField, Program, ReturnStatement, Statement, StaticDeclaration,
+    GenericArgument, GenericFunctionExpression, GenericParameter, Identifier, IfExpression,
+    ImplDeclaration, ImportDeclaration, ImportKind, ImportedName, IndexExpression, IntegerLiteral,
+    Item, LetStatement, LoopExpression, MatchArm, MatchExpression, PackExpansionExpression,
+    Parameter, Path, Pattern, PatternField, Program, ReturnStatement, Statement, StaticDeclaration,
     StringLiteral, StructDeclaration, StructExpression, StructField, TraitDeclaration, TraitMethod,
     TupleExpression, TypeAliasDeclaration, TypeName, TypeNameKind, UnaryExpression, UnaryOperator,
     WherePredicate, WhileStatement,
@@ -938,7 +938,8 @@ impl<'tokens> Parser<'tokens> {
         let mut end = first.span.end;
         let mut segments = vec![first];
 
-        while self.take(&TokenKind::ColonColon).is_some() {
+        while self.at(&TokenKind::ColonColon) && !self.at_offset(1, &TokenKind::Less) {
+            self.advance();
             let segment = self.expect_associated_path_segment()?;
             end = segment.span.end;
             segments.push(segment);
@@ -1641,27 +1642,31 @@ impl<'tokens> Parser<'tokens> {
         let mut expression = self.parse_primary()?;
 
         loop {
-            let generic_arguments =
-                if matches!(&expression, Expression::Path(_) | Expression::Field(_))
-                    && self.generic_call_arguments_follow()
-                {
-                    self.expect_symbol(&TokenKind::Less, "`<` before generic call arguments")?;
-                    let arguments = self.parse_generic_argument_list()?;
-                    self.expect_type_greater()?;
-                    arguments
-                } else {
-                    Vec::new()
-                };
-            if self.take(&TokenKind::LeftParen).is_some() {
-                let start = expression.span().start;
-                let arguments = self.parse_arguments()?;
-                let end = self.expect_symbol(&TokenKind::RightParen, "`)` after call arguments")?;
-                expression = Expression::Call(Box::new(CallExpression {
-                    callee: expression,
+            if let Expression::Path(path) = &expression
+                && self.at(&TokenKind::ColonColon)
+                && self.at_offset(1, &TokenKind::Less)
+            {
+                let path = path.clone();
+                expression = self.parse_explicit_generic_function(path)?;
+                continue;
+            }
+            let has_explicit_generic_arguments =
+                matches!(&expression, Expression::Path(_) | Expression::Field(_))
+                    && self.generic_call_arguments_follow();
+            let generic_arguments = if has_explicit_generic_arguments {
+                self.expect_symbol(&TokenKind::Less, "`<` before generic call arguments")?;
+                let arguments = self.parse_generic_argument_list()?;
+                self.expect_type_greater()?;
+                arguments
+            } else {
+                Vec::new()
+            };
+            if self.at(&TokenKind::LeftParen) {
+                expression = self.parse_call_postfix(
+                    expression,
                     generic_arguments,
-                    arguments,
-                    span: Span::new(start, end.span.end),
-                }));
+                    has_explicit_generic_arguments,
+                )?;
             } else if self.take(&TokenKind::LeftBracket).is_some() {
                 let start = expression.span().start;
                 let indices = self.parse_expression_list(&TokenKind::RightBracket)?;
@@ -1680,47 +1685,12 @@ impl<'tokens> Parser<'tokens> {
                 }));
             } else if self.take(&TokenKind::Dot).is_some() {
                 let start = expression.span().start;
-                let token = self.current().clone();
-                let field = match token.kind {
-                    TokenKind::Identifier(name) => {
-                        self.advance();
-                        FieldName::Named(Identifier {
-                            name,
-                            span: token.span,
-                        })
-                    }
-                    TokenKind::Integer(spelling) => {
-                        self.advance();
-                        let normalized = spelling.replace('_', "");
-                        let Ok(index) = normalized.parse::<u32>() else {
-                            self.diagnostics.push(Diagnostic::error(
-                                "E1004",
-                                "tuple field index is too large",
-                                token.span,
-                            ));
-                            return None;
-                        };
-                        FieldName::TupleIndex {
-                            index,
-                            span: token.span,
-                        }
-                    }
-                    _ => {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "E1005",
-                                "expected a field name or tuple index after `.`",
-                                token.span,
-                            )
-                            .with_help("use `.field` or `.0`"),
-                        );
-                        return None;
-                    }
-                };
+                let end = self.current().span.end;
+                let field = self.parse_field_name()?;
                 expression = Expression::Field(Box::new(FieldExpression {
                     base: expression,
                     field,
-                    span: Span::new(start, token.span.end),
+                    span: Span::new(start, end),
                 }));
             } else if let Some(question) = self.take(&TokenKind::Question) {
                 let start = expression.span().start;
@@ -1734,6 +1704,89 @@ impl<'tokens> Parser<'tokens> {
         }
 
         Some(expression)
+    }
+
+    fn parse_explicit_generic_function(&mut self, path: Path) -> Option<Expression> {
+        self.expect_symbol(
+            &TokenKind::ColonColon,
+            "`::` before explicit generic arguments",
+        )?;
+        self.expect_symbol(&TokenKind::Less, "`<` before generic arguments")?;
+        let generic_arguments = self.parse_generic_argument_list()?;
+        self.expect_type_greater()?;
+        let end = self.previous_type_end(path.span.end);
+
+        if self.at(&TokenKind::LeftParen) {
+            return self.parse_call_postfix(Expression::Path(path), generic_arguments, true);
+        }
+
+        let start = path.span.start;
+        Some(Expression::GenericFunction(Box::new(
+            GenericFunctionExpression {
+                path,
+                generic_arguments,
+                span: Span::new(start, end),
+            },
+        )))
+    }
+
+    fn parse_call_postfix(
+        &mut self,
+        callee: Expression,
+        generic_arguments: Vec<GenericArgument>,
+        has_explicit_generic_arguments: bool,
+    ) -> Option<Expression> {
+        let start = callee.span().start;
+        self.expect_symbol(&TokenKind::LeftParen, "`(` before call arguments")?;
+        let arguments = self.parse_arguments()?;
+        let end = self.expect_symbol(&TokenKind::RightParen, "`)` after call arguments")?;
+        Some(Expression::Call(Box::new(CallExpression {
+            callee,
+            generic_arguments,
+            has_explicit_generic_arguments,
+            arguments,
+            span: Span::new(start, end.span.end),
+        })))
+    }
+
+    fn parse_field_name(&mut self) -> Option<FieldName> {
+        let token = self.current().clone();
+        match token.kind {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                Some(FieldName::Named(Identifier {
+                    name,
+                    span: token.span,
+                }))
+            }
+            TokenKind::Integer(spelling) => {
+                self.advance();
+                let normalized = spelling.replace('_', "");
+                let Ok(index) = normalized.parse::<u32>() else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E1004",
+                        "tuple field index is too large",
+                        token.span,
+                    ));
+                    return None;
+                };
+                Some(FieldName::TupleIndex {
+                    index,
+                    span: token.span,
+                })
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E1005",
+                        "expected a field name or tuple index after `.`",
+                        token.span,
+                    )
+                    .with_help("use `.field` or `.0`"),
+                );
+                None
+            }
+        }
     }
 
     fn parse_generic_argument_list(&mut self) -> Option<Vec<GenericArgument>> {
@@ -2649,6 +2702,70 @@ mod tests {
         };
 
         assert!(matches!(binding.initializer, Expression::Call(_)));
+    }
+
+    #[test]
+    fn parse_should_build_explicit_generic_function_value() {
+        let tokens = lex("fn identity<T>(value: T) -> T { value }
+             fn main() -> i32 {
+                 let callback: fn(i32) -> i32 = identity::<i32>;
+                 callback(42)
+             }")
+        .expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+        let Item::Function(function) = &program.items[1] else {
+            panic!("expected main function");
+        };
+        let Statement::Let(binding) = &function.body.statements[0] else {
+            panic!("expected callback binding");
+        };
+        let Expression::GenericFunction(function) = &binding.initializer else {
+            panic!("expected specialized generic function value");
+        };
+
+        assert_eq!(function.path.display(), "identity");
+        assert_eq!(function.generic_arguments.len(), 1);
+    }
+
+    #[test]
+    fn parse_should_lower_turbofish_calls_to_direct_paths() {
+        let tokens = lex("fn identity<T>(value: T) -> T { value }
+             fn main() -> i32 { identity::<i32>(42) }")
+        .expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+        let Item::Function(function) = &program.items[1] else {
+            panic!("expected main function");
+        };
+        let Some(Expression::Call(call)) = function.body.tail.as_deref() else {
+            panic!("expected direct call tail");
+        };
+
+        assert!(matches!(
+            &call.callee,
+            Expression::Path(path)
+                if path.display() == "identity"
+                    && call.has_explicit_generic_arguments
+                    && call.generic_arguments.len() == 1
+        ));
+    }
+
+    #[test]
+    fn parse_should_preserve_explicit_empty_generic_call_lists() {
+        let tokens = lex("fn ready<...Types>() -> bool { true }
+             fn main() -> bool { ready::<>() }")
+        .expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+        let Item::Function(function) = &program.items[1] else {
+            panic!("expected main function");
+        };
+        let Some(Expression::Call(call)) = function.body.tail.as_deref() else {
+            panic!("expected direct call tail");
+        };
+
+        assert!(call.has_explicit_generic_arguments && call.generic_arguments.is_empty());
     }
 
     #[test]
