@@ -56,11 +56,11 @@ It produces archives for:
 
 Each compiler archive contains `reimer`, `reimer-lsp`, `reimer-lint`, and the matching `std` directory. The binaries and standard library are kept together so standard imports work outside a source checkout.
 
-The final job uses GitHub CLI's generated notes and `--verify-tag`, then uploads every archive, checksum, and VSIX as release assets.
+The final job verifies the tag through GitHub's API, creates the release when needed, and uploads every archive, checksum, and VSIX as durable release assets. It validates the published asset list and writes the release URL plus direct build links to the job summary.
 
 ## Manual rerun
 
-The release workflow supports **Run workflow** with an existing tag. This is for recovering from transient CI infrastructure failures, not for replacing the contents of an already published release.
+The release workflow supports **Run workflow** with an existing tag. This is for recovering from transient CI infrastructure failures or completing a release whose build assets were not published. Existing assets with matching names are replaced, while the release title and notes are preserved.
 
 ## Current trust model
 

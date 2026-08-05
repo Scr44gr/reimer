@@ -235,6 +235,8 @@ jobs:
     name: Publish GitHub Release
     needs: [validate, build]
     runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.release.outputs.url }}
     permissions:
       contents: write
     steps:
@@ -245,7 +247,8 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
+        id: release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -267,13 +270,54 @@ jobs:
             throw "Release tag '$env:RELEASE_TAG' no longer identifies validated commit '$env:RELEASE_COMMIT'."
           }
 
-          $arguments = @(
-            'release', 'create', $env:RELEASE_TAG,
-            '--verify-tag',
-            '--target', $env:RELEASE_COMMIT,
-            '--generate-notes',
-            '--title', "Reimer $env:RELEASE_TAG"
-          )
-          $arguments += $assets.FullName
-          & gh @arguments
-          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }
+          $repository = $env:GITHUB_REPOSITORY
+          $releaseEndpoint = "repos/$repository/releases/tags/$env:RELEASE_TAG"
+          $existingRelease = & gh api $releaseEndpoint 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $arguments = @(
+              'release', 'upload', $env:RELEASE_TAG,
+              '--repo', $repository,
+              '--clobber'
+            )
+            $arguments += $assets.FullName
+            & gh @arguments
+            if ($LASTEXITCODE -ne 0) { throw 'GitHub Release asset upload failed' }
+          } else {
+            $arguments = @(
+              'release', 'create', $env:RELEASE_TAG,
+              '--repo', $repository,
+              '--target', $env:RELEASE_COMMIT,
+              '--generate-notes',
+              '--title', "Reimer $env:RELEASE_TAG"
+            )
+            $arguments += $assets.FullName
+            & gh @arguments
+            if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }
+          }
+
+          $release = & gh api $releaseEndpoint | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($release.html_url)) {
+            throw 'Published GitHub Release could not be inspected'
+          }
+
+          $publishedAssets = @($release.assets)
+          $publishedNames = @($publishedAssets | ForEach-Object { $_.name })
+          $missingAssets = @($assets | Where-Object { $_.Name -notin $publishedNames })
+          if ($missingAssets.Count -ne 0) {
+            $missingNames = ($missingAssets.Name | Sort-Object) -join ', '
+            throw "GitHub Release is missing expected assets: $missingNames"
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "url=$($release.html_url)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "## Reimer $env:RELEASE_TAG"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ''
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "[Open the GitHub Release]($($release.html_url))"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ''
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Build downloads'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ''
+          foreach ($asset in $publishedAssets | Sort-Object name) {
+            if ($asset.name -in $assets.Name) {
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- [$($asset.name)]($($asset.browser_download_url))"
+            }
+          }
+          Write-Output "::notice title=GitHub Release::$($release.html_url)"
