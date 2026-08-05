@@ -144,7 +144,7 @@ npm test
 npm run package
 ```
 
-`reimer-language-win32-x64-0.1.0.vsix` includes
+`reimer-language-win32-x64-0.1.1.vsix` includes
 `extension/server/reimer-lsp.exe`, and the extension client is bundled into one
 JavaScript entry point without external runtime dependencies.
 `scripts/test-grammar.mjs` loads Oniguruma and tokenizes real cases, including

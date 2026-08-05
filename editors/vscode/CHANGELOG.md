@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Ships the extension with the Reimer 0.1.1 compiler and standard library.
+- Recognizes variadic type packs, typed registry queries, disjoint field
+  borrows, and consuming tuple-field access through the compiler-backed LSP.
+- Includes the latest formatter, ownership diagnostics, and vendor API
+  documentation.
+
 ## 0.1.0
 
 - Syntax highlighting and language configuration for `.reim`.

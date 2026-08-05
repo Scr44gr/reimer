@@ -5,7 +5,7 @@ id = "2af63601e81063d8276e4688"
 name = "imgui"
 version = "1.92.8"
 source = "path+../../vendor/imgui"
-checksum = "ae4d9d017b6efd1291eaced564ad966a35c31f8b33c915b021c32064a521f9e8"
+checksum = "df130d6e2f543d3ffa8b35bcf496c89f6adc11e61971ba7cc12222ac7e304b28"
 
 [[package.dependencies]]
 alias = "sdl3"
