@@ -2163,4 +2163,3 @@ pub const ImGuiViewportFlags_IsPlatformMonitor: c::Int = 2;
 
     /// Platform Window: Is created/managed by the application (rather than a dear imgui backend)
 pub const ImGuiViewportFlags_OwnedByApp: c::Int = 4;
-

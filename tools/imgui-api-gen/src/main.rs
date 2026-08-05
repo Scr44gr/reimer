@@ -660,11 +660,17 @@ fn write_generated(path: &Path, content: &str) -> Result<(), GeneratorError> {
             source,
         })?;
     }
-    fs::write(path, content).map_err(|source| GeneratorError::Io {
+    fs::write(path, normalize_generated_content(content)).map_err(|source| GeneratorError::Io {
         operation: "write generated binding",
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn normalize_generated_content(content: &str) -> String {
+    let mut normalized = content.trim_end().to_owned();
+    normalized.push('\n');
+    normalized
 }
 
 fn array<'a>(value: &'a Value, key: &str) -> Result<&'a [Value], GeneratorError> {
@@ -831,9 +837,14 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        FunctionDomain, TypeDomain, condition_mentions, documentation_lines, render_functions,
-        render_type, render_wgpu_bridge,
+        FunctionDomain, TypeDomain, condition_mentions, documentation_lines,
+        normalize_generated_content, render_functions, render_type, render_wgpu_bridge,
     };
+
+    #[test]
+    fn generated_content_should_end_with_exactly_one_newline() {
+        assert_eq!(normalize_generated_content("value\n\n"), "value\n");
+    }
 
     #[test]
     fn comments_should_become_clean_documentation_lines() {

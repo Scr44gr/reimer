@@ -1,11 +1,25 @@
 param(
     [string]$ImGuiSource = "",
-    [string]$SdlSource = ""
+    [string]$SdlSource = "",
+    [string]$CompilerRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $packageRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $workspaceRoot = (Resolve-Path (Join-Path $packageRoot "..\..")).Path
+if ([string]::IsNullOrWhiteSpace($CompilerRoot)) {
+    $localCompiler = Join-Path $workspaceRoot "Cargo.toml"
+    $CompilerRoot = if (Test-Path -LiteralPath $localCompiler) {
+        $workspaceRoot
+    }
+    else {
+        Join-Path (Split-Path $workspaceRoot -Parent) "reimer"
+    }
+}
+$compilerRoot = (Resolve-Path -LiteralPath $CompilerRoot).Path
+if (-not (Test-Path -LiteralPath (Join-Path $compilerRoot "Cargo.toml"))) {
+    throw "The Reimer compiler workspace was not found at '$compilerRoot'."
+}
 $cacheRoot = Join-Path $workspaceRoot "target\imgui-api-gen"
 $downloadRoot = Join-Path $cacheRoot "downloads"
 $sourceRoot = Join-Path $cacheRoot "sources"
@@ -161,7 +175,7 @@ foreach ($asset in $assets) {
     Get-PinnedFile -Url "$dearBindingsRoot/$($asset.Name)" -Destination $destination -ExpectedHash $asset.Hash
 }
 
-Push-Location -LiteralPath $workspaceRoot
+Push-Location -LiteralPath $compilerRoot
 try {
     cargo run -q -p imgui-api-gen -- `
         (Join-Path $bindingRoot "dcimgui.json") `
@@ -272,5 +286,16 @@ $checksumLines = foreach ($relativePath in $checksumFiles) {
     ($checksumLines -join "`n") + "`n",
     [System.Text.UTF8Encoding]::new($false)
 )
+
+Push-Location -LiteralPath $compilerRoot
+try {
+    cargo run -q -p reimer-cli -- check $packageRoot --refresh
+    if ($LASTEXITCODE -ne 0) {
+        throw "Refreshing the generated package lockfile failed with exit code $LASTEXITCODE."
+    }
+}
+finally {
+    Pop-Location
+}
 
 Write-Host "Generated documented bindings and built the Dear ImGui SDL3/OpenGL3/wgpu bridge."
