@@ -62,6 +62,15 @@ impl OptimizationLevel {
     }
 }
 
+const fn cranelift_flags(optimization: OptimizationLevel) -> [(&'static str, &'static str); 4] {
+    [
+        ("enable_llvm_abi_extensions", "true"),
+        ("enable_probestack", "true"),
+        ("probestack_strategy", "inline"),
+        ("opt_level", optimization.setting()),
+    ]
+}
+
 struct NativeLibraries {
     libraries: Vec<libloading::Library>,
 }
@@ -380,10 +389,7 @@ fn execute_internal_with_symbols(
     arguments: Option<Vec<OsString>>,
     additional_symbols: &[(&str, *const u8)],
 ) -> Result<i32, Vec<Diagnostic>> {
-    let flags = [
-        ("enable_llvm_abi_extensions", "true"),
-        ("opt_level", optimization.setting()),
-    ];
+    let flags = cranelift_flags(optimization);
     let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
         .map_err(|error| backend_error(error.to_string()))?;
     register_runtime_symbols(&mut builder);
@@ -505,10 +511,7 @@ fn execute_selected_tests(
         }
     }
 
-    let flags = [
-        ("enable_llvm_abi_extensions", "true"),
-        ("opt_level", optimization.setting()),
-    ];
+    let flags = cranelift_flags(optimization);
     let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
         .map_err(|error| backend_error(error.to_string()))?;
     register_runtime_symbols(&mut builder);
@@ -1335,12 +1338,11 @@ fn register_coordination_symbols(builder: &mut JITBuilder) {
 
 fn host_isa(optimization: OptimizationLevel) -> Result<OwnedTargetIsa, String> {
     let mut flag_builder = settings::builder();
-    flag_builder
-        .set("enable_llvm_abi_extensions", "true")
-        .map_err(|error| error.to_string())?;
-    flag_builder
-        .set("opt_level", optimization.setting())
-        .map_err(|error| error.to_string())?;
+    for (name, value) in cranelift_flags(optimization) {
+        flag_builder
+            .set(name, value)
+            .map_err(|error| error.to_string())?;
+    }
     let flags = settings::Flags::new(flag_builder);
     let builder = cranelift_native::builder().map_err(str::to_owned)?;
     builder.finish(flags).map_err(|error| error.to_string())
@@ -1718,7 +1720,12 @@ fn declare_functions<M: Module>(
         let id = module
             .declare_function(&function.symbol, Linkage::Import, &signature)
             .map_err(|error| error.to_string())?;
-        declarations.insert(function.id, id);
+        if declarations.insert(function.id, id).is_some() {
+            return Err(format!(
+                "duplicate function id {} while declaring external `{}`",
+                function.id.0, function.name
+            ));
+        }
         extern_abis.insert(function.id, abi);
     }
 
@@ -1733,7 +1740,12 @@ fn declare_functions<M: Module>(
         let id = module
             .declare_function(&symbol, linkage, &signature)
             .map_err(|error| error.to_string())?;
-        declarations.insert(function.id, id);
+        if declarations.insert(function.id, id).is_some() {
+            return Err(format!(
+                "duplicate function id {} while declaring `{}`",
+                function.id.0, function.name
+            ));
+        }
     }
     Ok(FunctionDeclarations {
         functions: declarations,
@@ -8184,8 +8196,9 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     use super::execute_internal_with_symbols;
     use super::{
-        OptimizationLevel, coff_library_filename, emit_object, emit_object_with_options, execute,
-        execute_test, execute_tests_with_options, execute_with_options,
+        OptimizationLevel, coff_library_filename, cranelift_flags, emit_object,
+        emit_object_with_options, execute, execute_test, execute_tests_with_options,
+        execute_with_options,
     };
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -8226,6 +8239,31 @@ mod tests {
         let tokens = lex(source).expect("fixture should lex");
         let ast = parse(&tokens).expect("fixture should parse");
         resolve(&ast).expect("fixture should resolve")
+    }
+
+    #[test]
+    fn cranelift_configuration_should_enable_inline_stack_probes() {
+        let flags = cranelift_flags(OptimizationLevel::Speed);
+
+        assert!(flags.contains(&("enable_probestack", "true")));
+        assert!(flags.contains(&("probestack_strategy", "inline")));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn execute_should_probe_large_stack_frames() {
+        let program = compile_fixture(
+            "fn main() -> i32 {
+                 let mut values: [u8; 300_000] = [0; 300_000];
+                 values[0] = 20;
+                 values[299_999] = 22;
+                 values[0] as i32 + values[299_999] as i32
+             }",
+        );
+
+        let result = execute(&program).expect("large stack fixture should execute");
+
+        assert_eq!(result, 42);
     }
 
     #[test]
@@ -8421,6 +8459,20 @@ mod tests {
         );
 
         let result = execute(&program).expect("fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_read_static_storage_larger_than_one_windows_allocation_granule() {
+        let program = compile_fixture(
+            "static VALUES: [u16; 34_788] = [21; 34_788];
+             fn main() -> i32 {
+                 VALUES[0] as i32 + VALUES[34_787] as i32
+             }",
+        );
+
+        let result = execute(&program).expect("large static fixture should execute");
 
         assert_eq!(result, 42);
     }
@@ -8739,6 +8791,35 @@ mod tests {
     }
 
     #[test]
+    fn execute_should_dispatch_traits_for_function_pointers() {
+        let program = compile_fixture(
+            "trait Callback {
+                 fn invoke(&self, value: &mut i32);
+             }
+             impl Callback for fn(&mut i32) -> () {
+                 fn invoke(&self, value: &mut i32) {
+                     let function = *self;
+                     function(value);
+                 }
+             }
+             fn increment(value: &mut i32) { *value += 1; }
+             fn dispatch<Handler: Callback>(handler: Handler, value: &mut i32) {
+                 handler.invoke(value);
+             }
+             fn main() -> i32 {
+                 let handler: fn(&mut i32) -> () = increment;
+                 let mut value: i32 = 41;
+                 dispatch(handler, &mut value);
+                 value
+             }",
+        );
+
+        let result = execute(&program).expect("function trait fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
     fn execute_should_lower_variadic_generic_expansions() {
         let program = compile_fixture(
             "struct Marker<T> { value: i32 }
@@ -8753,6 +8834,34 @@ mod tests {
         );
 
         let result = execute(&program).expect("variadic fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_collect_marker_derives_into_omitted_type_packs() {
+        let program = compile_fixture(
+            "trait Component: Copy {}
+             @derive(Copy, Component)
+             struct Position { x: i32 }
+             @derive(Copy, Component)
+             struct Velocity { x: i32 }
+             struct Registry<...Components: Component> { values: (...Components) }
+             fn components_ready<...Components: Component>() -> bool { true }
+             type GameComponents = Registry;
+             fn main() -> i32 {
+                 let registry: GameComponents = Registry {
+                     values: (Position { x: 20 }, Velocity { x: 22 }),
+                 };
+                 if components_ready() {
+                     registry.values.0.x + registry.values.1.x
+                 } else {
+                     0
+                 }
+             }",
+        );
+
+        let result = execute(&program).expect("derived component pack should execute");
 
         assert_eq!(result, 42);
     }
@@ -8794,6 +8903,26 @@ mod tests {
         );
 
         let result = execute(&program).expect("heterogeneous tuple fixture should execute");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn execute_should_mutably_split_multiple_tuple_fields_by_type() {
+        let program = compile_fixture(
+            "fn main() -> i32 {
+                 let mut values: (i32, bool, u8) = (20, true, 20);
+                 {
+                     let selected: (&mut i32, &mut u8) =
+                         values.split_types_mut<i32, u8>();
+                     *selected.0 += 1;
+                     *selected.1 += 1;
+                 };
+                 *values.get_type<i32>() + *values.get_type<u8>() as i32
+             }",
+        );
+
+        let result = execute(&program).expect("multi-mutable tuple split should execute");
 
         assert_eq!(result, 42);
     }
