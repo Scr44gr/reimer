@@ -363,9 +363,10 @@ fn render_function(function: &Value, domain: FunctionDomain) -> Result<String, G
 }
 
 fn render_backends(sdl: &Value, opengl: &Value) -> Result<(String, Coverage), GeneratorError> {
-    let mut output = generated_header("SDL3 and OpenGL3 backend functions");
+    let mut output = generated_header("SDL3, OpenGL3, and wgpu backend functions");
     writeln!(output, "import std::c;")?;
     writeln!(output, "import sdl3::raw::types as sdl_types;")?;
+    writeln!(output, "import wgpu::raw::types as wgpu_types;")?;
     writeln!(output, "import self::types as types;\n")?;
 
     for enumeration in array(sdl, "enums")? {
@@ -413,8 +414,17 @@ fn render_backends(sdl: &Value, opengl: &Value) -> Result<(String, Coverage), Ge
             }
         }
     }
+    coverage.generated += render_wgpu_bridge(&mut output)?;
     writeln!(output, "}}")?;
     Ok((output, coverage))
+}
+
+fn render_wgpu_bridge(output: &mut String) -> Result<usize, fmt::Error> {
+    writeln!(
+        output,
+        "    /// Initializes the official Dear ImGui wgpu renderer backend.\n    pub fn imgui_bridge_wgpu_init(device: wgpu_types::WGPUDevice, render_target_format: wgpu_types::WGPUTextureFormat, frames_in_flight: c::Int) -> bool;\n\n    /// Releases renderer resources owned by the Dear ImGui wgpu backend.\n    pub fn imgui_bridge_wgpu_shutdown();\n\n    /// Prepares the Dear ImGui wgpu renderer backend for a new frame.\n    pub fn imgui_bridge_wgpu_new_frame();\n\n    /// Records Dear ImGui draw data into a borrowed active wgpu render pass.\n    pub fn imgui_bridge_wgpu_render_draw_data(draw_data: *mut types::ImDrawData, pass: wgpu_types::WGPURenderPassEncoder);\n\n    /// Draws a length-delimited UTF-8 string without treating it as a format string.\n    pub fn imgui_bridge_text_unformatted(value: *const u8, byte_length: usize);\n\n    /// Reports whether Dear ImGui wants to consume mouse input this frame.\n    pub fn imgui_bridge_wants_mouse() -> bool;\n\n    /// Reports whether Dear ImGui wants to consume keyboard input this frame.\n    pub fn imgui_bridge_wants_keyboard() -> bool;\n\n    /// Draws a UTF-8 label followed by one signed integer.\n    pub fn imgui_bridge_text_i64(label: *const u8, byte_length: usize, value: i64);\n\n    /// Draws a UTF-8 label followed by one floating-point value.\n    pub fn imgui_bridge_text_f64(label: *const u8, byte_length: usize, value: f64);\n"
+    )?;
+    Ok(9)
 }
 
 fn render_array_parameter(
@@ -822,7 +832,7 @@ mod tests {
 
     use super::{
         FunctionDomain, TypeDomain, condition_mentions, documentation_lines, render_functions,
-        render_type,
+        render_type, render_wgpu_bridge,
     };
 
     #[test]
@@ -889,5 +899,16 @@ mod tests {
             .expect("conditional catalog should render");
         assert!(!rendered.contains("ImStr_FromCharStr"));
         assert_eq!(coverage.conditionally_unavailable, 1);
+    }
+
+    #[test]
+    fn wgpu_bridge_should_keep_native_handles_typed() {
+        let mut output = String::new();
+        let generated = render_wgpu_bridge(&mut output).expect("bridge declarations should render");
+
+        assert_eq!(generated, 9);
+        assert!(output.contains("device: wgpu_types::WGPUDevice"));
+        assert!(output.contains("pass: wgpu_types::WGPURenderPassEncoder"));
+        assert!(output.contains("byte_length: usize"));
     }
 }

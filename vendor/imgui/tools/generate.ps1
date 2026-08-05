@@ -12,6 +12,9 @@ $sourceRoot = Join-Path $cacheRoot "sources"
 $bindingRoot = Join-Path $cacheRoot "dear-bindings"
 $buildRoot = Join-Path $cacheRoot "native\windows-x86_64"
 $nativeRoot = Join-Path $packageRoot "native\windows-x86_64"
+$wgpuVendorRoot = Join-Path $workspaceRoot "vendor\wgpu"
+$webgpuIncludeRoot = Join-Path $cacheRoot "native\webgpu-include"
+$webgpuHeaderRoot = Join-Path $webgpuIncludeRoot "webgpu"
 
 $imguiVersion = "1.92.8"
 $imguiArchiveHash = "27765c56ab27ce47472d0bea43cf1e3301c726362ce585e99a059e3b37616870"
@@ -85,11 +88,49 @@ function Initialize-Msvc {
     return $compiler.Source
 }
 
+function New-Wgpu29CompatibleBackend {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    # wgpu-native 29 adopted the same standard C structure layouts and names
+    # already used by Dear ImGui's Dawn/WGVK branches. Dear ImGui 1.92.8 still
+    # classifies its WGPU branch as the older layout, so make that classification
+    # explicit in a generated copy while leaving the pinned upstream source intact.
+    $text = [System.IO.File]::ReadAllText($Source)
+    $legacyCondition = '#if defined IMGUI_IMPL_WEBGPU_BACKEND_DAWN || defined IMGUI_IMPL_WEBGPU_BACKEND_WGVK'
+    $standardCondition = '#if defined IMGUI_IMPL_WEBGPU_BACKEND_DAWN || defined IMGUI_IMPL_WEBGPU_BACKEND_WGVK || defined IMGUI_IMPL_WEBGPU_BACKEND_WGPU'
+    $parenthesizedLegacy = '#if defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN) || defined(IMGUI_IMPL_WEBGPU_BACKEND_WGVK)'
+    $parenthesizedStandard = '#if defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN) || defined(IMGUI_IMPL_WEBGPU_BACKEND_WGVK) || defined(IMGUI_IMPL_WEBGPU_BACKEND_WGPU)'
+    if ([regex]::Matches($text, [regex]::Escape($legacyCondition)).Count -ne 2) {
+        throw 'Dear ImGui WGPU compatibility sites changed; review the pinned backend before updating.'
+    }
+    if ([regex]::Matches($text, [regex]::Escape($parenthesizedLegacy)).Count -ne 2) {
+        throw 'Dear ImGui WGPU status compatibility sites changed; review the pinned backend before updating.'
+    }
+    $text = $text.Replace($legacyCondition, $standardCondition)
+    $text = $text.Replace($parenthesizedLegacy, $parenthesizedStandard)
+    [System.IO.File]::WriteAllText(
+        $Destination,
+        $text,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
 if ($env:OS -ne "Windows_NT" -or -not [Environment]::Is64BitProcess) {
     throw "The bundled Dear ImGui bridge currently targets Windows x64."
 }
 
-New-Item -ItemType Directory -Force $downloadRoot, $sourceRoot, $bindingRoot, $buildRoot, $nativeRoot | Out-Null
+New-Item -ItemType Directory -Force $downloadRoot, $sourceRoot, $bindingRoot, $buildRoot, $nativeRoot, $webgpuHeaderRoot | Out-Null
+
+foreach ($header in @("webgpu.h", "wgpu.h")) {
+    $source = Join-Path $wgpuVendorRoot "upstream\include\$header"
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "The pinned wgpu header is missing at '$source'."
+    }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $webgpuHeaderRoot $header) -Force
+}
 
 if ([string]::IsNullOrWhiteSpace($ImGuiSource)) {
     $imguiArchive = Join-Path $downloadRoot "imgui-$imguiVersion.zip"
@@ -144,11 +185,15 @@ finally {
 }
 
 $compiler = Initialize-Msvc
+$wgpuBackendSource = Join-Path $resolvedImGuiSource "backends\imgui_impl_wgpu.cpp"
+$compatibleWgpuBackend = Join-Path $buildRoot "imgui_impl_wgpu_wgpu29.cpp"
+New-Wgpu29CompatibleBackend -Source $wgpuBackendSource -Destination $compatibleWgpuBackend
 $includeArguments = @(
     "/I$resolvedImGuiSource",
     "/I$(Join-Path $resolvedImGuiSource 'backends')",
     "/I$bindingRoot",
-    "/I$(Join-Path $resolvedSdlSource 'include')"
+    "/I$(Join-Path $resolvedSdlSource 'include')",
+    "/I$webgpuIncludeRoot"
 )
 $compileArguments = @(
     "/nologo",
@@ -161,6 +206,7 @@ $compileArguments = @(
     "/utf-8",
     "/permissive-",
     "/D_CRT_SECURE_NO_WARNINGS",
+    "/DIMGUI_IMPL_WEBGPU_BACKEND_WGPU",
     "/DCIMGUI_API=__declspec(dllexport)",
     "/DCIMGUI_IMPL_API=__declspec(dllexport)"
 ) + $includeArguments
@@ -172,9 +218,11 @@ $sources = @(
     (Join-Path $resolvedImGuiSource "imgui_demo.cpp"),
     (Join-Path $resolvedImGuiSource "backends\imgui_impl_sdl3.cpp"),
     (Join-Path $resolvedImGuiSource "backends\imgui_impl_opengl3.cpp"),
+    $compatibleWgpuBackend,
     (Join-Path $bindingRoot "dcimgui.cpp"),
     (Join-Path $bindingRoot "dcimgui_impl_sdl3.cpp"),
-    (Join-Path $bindingRoot "dcimgui_impl_opengl3.cpp")
+    (Join-Path $bindingRoot "dcimgui_impl_opengl3.cpp"),
+    (Join-Path $packageRoot "bridge\wgpu_bridge.cpp")
 )
 $objects = @()
 foreach ($source in $sources) {
@@ -191,10 +239,14 @@ $linker = (Get-Command link.exe -ErrorAction Stop).Source
 $outputDll = Join-Path $buildRoot "imgui.dll"
 $outputLibrary = Join-Path $buildRoot "imgui.lib"
 $sdlLibrary = Join-Path $workspaceRoot "vendor\sdl3\native\windows-x86_64\SDL3.lib"
+$wgpuLibrary = Join-Path $wgpuVendorRoot "native\windows-x86_64\wgpu_native.lib"
 if (-not (Test-Path -LiteralPath $sdlLibrary)) {
     throw "The SDL3 import library is missing at '$sdlLibrary'."
 }
-& $linker /nologo /DLL /Brepro "/OUT:$outputDll" "/IMPLIB:$outputLibrary" /OPT:REF /OPT:ICF @objects $sdlLibrary opengl32.lib
+if (-not (Test-Path -LiteralPath $wgpuLibrary)) {
+    throw "The wgpu-native import library is missing at '$wgpuLibrary'."
+}
+& $linker /nologo /DLL /Brepro "/OUT:$outputDll" "/IMPLIB:$outputLibrary" /OPT:REF /OPT:ICF @objects $sdlLibrary $wgpuLibrary opengl32.lib
 if ($LASTEXITCODE -ne 0) {
     throw "Linking the Dear ImGui bridge failed with exit code $LASTEXITCODE."
 }
@@ -221,4 +273,4 @@ $checksumLines = foreach ($relativePath in $checksumFiles) {
     [System.Text.UTF8Encoding]::new($false)
 )
 
-Write-Host "Generated documented bindings and built the Dear ImGui SDL3/OpenGL3 bridge."
+Write-Host "Generated documented bindings and built the Dear ImGui SDL3/OpenGL3/wgpu bridge."

@@ -5,6 +5,7 @@ edition = "2026"
 
 [dependencies]
 sdl3 = { path = "../sdl3", version = "^3.4" }
+wgpu = { path = "../wgpu", version = "^29.0" }
 
 [profile.debug]
 optimization = 0

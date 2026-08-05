@@ -1,10 +1,11 @@
-// Generated from Dear ImGui 1.92.8 with Dear Bindings 0.21: SDL3 and OpenGL3 backend functions. Do not edit by hand.
+// Generated from Dear ImGui 1.92.8 with Dear Bindings 0.21: SDL3, OpenGL3, and wgpu backend functions. Do not edit by hand.
 // Run `vendor/imgui/tools/generate.ps1` to update this file.
 
 import std::c;
 
 import sdl3::raw::types as sdl_types;
 import self::types as types;
+import wgpu::raw::types as wgpu_types;
 
     /// Gamepad selection automatically starts in AutoFirst mode, picking first available SDL_Gamepad. You may override this.
     /// When using manual mode, caller is responsible for opening/closing gamepad.
@@ -99,5 +100,32 @@ extern "C" {
 
     /// (Advanced) Use e.g. if you need to precisely control the timing of texture updates (e.g. for staged rendering), by setting ImDrawData::Textures = nullptr to handle this manually.
     pub fn cImGui_ImplOpenGL3_UpdateTexture(tex: *mut types::ImTextureData);
+
+    /// Initializes the official Dear ImGui wgpu renderer backend.
+    pub fn imgui_bridge_wgpu_init(device: wgpu_types::WGPUDevice, render_target_format: wgpu_types::WGPUTextureFormat, frames_in_flight: c::Int) -> bool;
+
+    /// Releases renderer resources owned by the Dear ImGui wgpu backend.
+    pub fn imgui_bridge_wgpu_shutdown();
+
+    /// Prepares the Dear ImGui wgpu renderer backend for a new frame.
+    pub fn imgui_bridge_wgpu_new_frame();
+
+    /// Records Dear ImGui draw data into a borrowed active wgpu render pass.
+    pub fn imgui_bridge_wgpu_render_draw_data(draw_data: *mut types::ImDrawData, pass: wgpu_types::WGPURenderPassEncoder);
+
+    /// Draws a length-delimited UTF-8 string without treating it as a format string.
+    pub fn imgui_bridge_text_unformatted(value: *const u8, byte_length: usize);
+
+    /// Reports whether Dear ImGui wants to consume mouse input this frame.
+    pub fn imgui_bridge_wants_mouse() -> bool;
+
+    /// Reports whether Dear ImGui wants to consume keyboard input this frame.
+    pub fn imgui_bridge_wants_keyboard() -> bool;
+
+    /// Draws a UTF-8 label followed by one signed integer.
+    pub fn imgui_bridge_text_i64(label: *const u8, byte_length: usize, value: i64);
+
+    /// Draws a UTF-8 label followed by one floating-point value.
+    pub fn imgui_bridge_text_f64(label: *const u8, byte_length: usize, value: f64);
 
 }

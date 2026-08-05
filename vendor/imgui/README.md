@@ -1,16 +1,17 @@
 # Dear ImGui vendor package
 
 This package pins Dear ImGui 1.92.8 and Dear Bindings 0.21. It exposes 730
-documented core C functions, 21 SDL3/OpenGL3 backend functions, public flag
-constants, ABI types, and a safe `SdlOpenGl` lifecycle facade. The bundled
-native artifact currently targets Windows x64.
+documented core C functions, 30 SDL3/OpenGL3/wgpu backend functions, public
+flag constants, ABI types, and safe `SdlOpenGl` and `SdlWgpu` lifecycle
+facades. The bundled native artifact currently targets Windows x64.
 
-The public facade owns the Dear ImGui context and borrows the SDL OpenGL
-context. It processes SDL events, validates frame ordering, shows the official
-demo window, renders with the official OpenGL3 backend, and shuts everything
-down in the required reverse order. Application code does not need `unsafe`.
-The generated `raw` module remains available for advanced integrations and
-does require `unsafe` at native calls.
+Both public facades own the Dear ImGui context, process SDL events, validate
+frame ordering, expose documented widgets, and shut everything down in the
+required reverse order. `SdlOpenGl` borrows an SDL OpenGL context and renders
+through the official OpenGL3 backend. `SdlWgpu` borrows a wgpu device and
+records draw data into an active render pass. Application code does not need
+`unsafe`. The generated `raw` module remains available for advanced
+integrations and does require `unsafe` at native calls.
 
 Every generated function and constant carries the comments preserved by Dear
 Bindings. The Reimer language server therefore shows the signature and its
@@ -18,15 +19,21 @@ Dear ImGui documentation in VS Code hover and completion details.
 
 ## Use the package
 
-Add `imgui`, `sdl3`, and `opengl` as direct path dependencies when the
-application imports all three packages. Create and make the SDL OpenGL context
-current before calling `SdlOpenGl::create`. During each iteration:
+Add `imgui`, `sdl3`, and the selected renderer package as direct path
+dependencies. For OpenGL, create and make the SDL OpenGL context current before
+calling `SdlOpenGl::create`. During each iteration:
 
 1. Pass every polled SDL event to `process_event`.
 2. Call `new_frame`.
 3. Submit the demo window or other widgets.
 4. Clear the framebuffer.
 5. Call `render` and swap the SDL window.
+
+For wgpu, create `SdlWgpu` from the application's SDL window, wgpu device, and
+surface format. Start the UI with `new_frame`, build widgets, then call
+`render_to_pass` with the active render-pass encoder before submitting the
+frame. Use `wants_mouse` and `wants_keyboard` to prevent captured debug input
+from reaching gameplay systems.
 
 Run the complete example from the repository root:
 
@@ -35,13 +42,13 @@ vendor\imgui\tools\invoke.ps1 -Project examples\imgui_demo -Command run -Release
 ```
 
 For a distributable executable, use `-Command build`; the helper copies
-`imgui.dll` and `SDL3.dll` beside the generated program.
+`imgui.dll`, `SDL3.dll`, and `wgpu_native.dll` beside the generated program.
 
 ## Reproduce the bindings and native bridge
 
 The update script downloads only pinned upstream archives and release assets,
 verifies each SHA-256 digest, regenerates the Reimer API from Dear Bindings
-metadata, compiles the official SDL3/OpenGL3 backends, and records output
+metadata, compiles the official SDL3/OpenGL3/wgpu backends, and records output
 checksums:
 
 ```powershell

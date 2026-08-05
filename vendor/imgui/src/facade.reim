@@ -12,6 +12,7 @@ pub enum Error {
     ContextCreationFailed,
     SdlInitializationFailed,
     OpenGlInitializationFailed,
+    WgpuInitializationFailed,
 }
 
 /// A frame operation was requested in the wrong lifecycle state.

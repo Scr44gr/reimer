@@ -5,7 +5,15 @@ id = "507b520321b7bf65197c931d"
 name = "sdl3"
 version = "3.4.12"
 source = "path+../sdl3"
-checksum = "dcc58503e2ea9d0533b021a3e329363b856037c80a7277daea59f7dfc0a475b7"
+checksum = "c9f327a6820f65fe9a693571c9421a7e039401ce865cca749d61a3eb95c30e08"
+dependencies = []
+
+[[package]]
+id = "d8eff3ec37c30a5218dff691"
+name = "wgpu"
+version = "29.0.1"
+source = "path+../wgpu"
+checksum = "0f9d8daf9c1f30d6ecdf8ebe290261f17370c009f70e78d4b3841d83b90ccb65"
 dependencies = []
 
 [[package]]
@@ -13,10 +21,15 @@ id = "e6f9578d40ae230473304e63"
 name = "imgui"
 version = "1.92.8"
 source = "path+."
-checksum = "f315aa5cbaa360ff53b016fe5cc3d8afd165560a8d847fdd1e6414e499afaf45"
+checksum = "ae4d9d017b6efd1291eaced564ad966a35c31f8b33c915b021c32064a521f9e8"
 
 [[package.dependencies]]
 alias = "sdl3"
 request = "path+../sdl3"
 package = "507b520321b7bf65197c931d"
+
+[[package.dependencies]]
+alias = "wgpu"
+request = "path+../wgpu"
+package = "d8eff3ec37c30a5218dff691"
 
