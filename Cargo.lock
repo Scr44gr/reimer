@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "imgui-api-gen"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde_json",
 ]
@@ -827,14 +827,14 @@ dependencies = [
 
 [[package]]
 name = "reimer-ast"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-diagnostics",
 ]
 
 [[package]]
 name = "reimer-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-ast",
  "reimer-codegen-native",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "reimer-codegen-native"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -872,11 +872,11 @@ dependencies = [
 
 [[package]]
 name = "reimer-diagnostics"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "reimer-hir"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-diagnostics",
  "reimer-types",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "reimer-layout"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-diagnostics",
  "reimer-hir",
@@ -893,14 +893,14 @@ dependencies = [
 
 [[package]]
 name = "reimer-lexer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-diagnostics",
 ]
 
 [[package]]
 name = "reimer-lint"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-ast",
  "reimer-diagnostics",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "reimer-lsp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-ast",
  "reimer-diagnostics",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "reimer-package"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-ast",
  "reimer-diagnostics",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "reimer-parser"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-ast",
  "reimer-diagnostics",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "reimer-project"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-codegen-native",
  "reimer-package",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "reimer-resolver"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reimer-ast",
  "reimer-diagnostics",
@@ -979,11 +979,11 @@ dependencies = [
 
 [[package]]
 name = "reimer-runtime"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "reimer-types"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "rustc-hash"
@@ -999,7 +999,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdl-api-gen"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "lang-c",
 ]
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu-api-gen"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "windows-link"

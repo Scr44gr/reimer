@@ -35,14 +35,14 @@ cargo clippy --workspace --all-targets --all-features --locked -- -W clippy::per
 Then verify the tag before creating it:
 
 ```powershell
-.\scripts\release\verify-tag.ps1 -Tag v0.1.1
+.\scripts\release\verify-tag.ps1 -Tag v0.1.2
 ```
 
 ## Publish from a tag
 
 ```text
-git tag -a v0.1.1 -m "Reimer v0.1.1"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "Reimer v0.1.2"
+git push origin v0.1.2
 ```
 
 The tag must already exist and point to the code being released. The workflow never creates or moves a tag.

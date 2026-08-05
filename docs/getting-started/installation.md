@@ -14,7 +14,7 @@ Reimer releases contain native command-line tools and the matching standard libr
 PowerShell example:
 
 ```powershell
-$releaseName = "reimer-v0.1.1-x86_64-pc-windows-msvc"
+$releaseName = "reimer-v0.1.2-x86_64-pc-windows-msvc"
 $releaseRoot = Join-Path $env:LOCALAPPDATA "Programs\Reimer"
 New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
 Expand-Archive ".\$releaseName.zip" -DestinationPath $releaseRoot
@@ -31,7 +31,7 @@ Add the extracted directory containing `reimer.exe` to `PATH` through **System P
 
 ```bash
 mkdir -p "$HOME/.local/lib/reimer" "$HOME/.local/bin"
-tar -xzf reimer-v0.1.1-x86_64-unknown-linux-gnu.tar.gz \
+tar -xzf reimer-v0.1.2-x86_64-unknown-linux-gnu.tar.gz \
   --strip-components=1 \
   -C "$HOME/.local/lib/reimer"
 ln -sf "$HOME/.local/lib/reimer/reimer" "$HOME/.local/bin/reimer"
@@ -68,9 +68,9 @@ The first command should report that the file was checked. The second should rep
 Every release asset has a neighboring `.sha256` file. Compare it before extracting:
 
 ```powershell
-(Get-FileHash .\reimer-v0.1.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+(Get-FileHash .\reimer-v0.1.2-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
 ```
 
 ```bash
-sha256sum -c reimer-v0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c reimer-v0.1.2-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```

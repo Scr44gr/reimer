@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.2
+
+- Adds specialized generic function values and explicit turbofish calls for
+  statically typed engine callbacks.
+- Adds alignment-aware owned storage, arena and fixed-buffer lifecycle APIs,
+  and allocator-correct collection growth.
+- Adds `Result.expect(message)` for invariant failures without requiring error
+  formatting or hidden allocation.
+- Resolves native libraries and staged runtime files from package manifests
+  across supported hosts.
+- Improves compiler-backed hover, completion, ownership diagnostics, and
+  static allocator estimates for the new language surface.
+
 ## 0.1.1
 
 - Ships the extension with the Reimer 0.1.1 compiler and standard library.

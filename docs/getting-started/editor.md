@@ -7,7 +7,7 @@ The Reimer extension is backed by the real parser, resolver, and package graph. 
 Download the `.vsix` attached to the matching GitHub Release, then run:
 
 ```text
-code --install-extension reimer-language-win32-x64-0.1.1.vsix --force
+code --install-extension reimer-language-win32-x64-0.1.2.vsix --force
 ```
 
 You can also use **Extensions: Install from VSIX...** from the VS Code command palette. Reload VS Code after replacing an existing development build.
