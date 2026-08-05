@@ -247,6 +247,7 @@ struct TraitDefinition {
 #[derive(Debug, Clone)]
 struct TraitImplementation {
     trait_name: String,
+    method_owner: String,
     target: ast::TypeName,
     parameters: Vec<ast::GenericParameter>,
     where_predicates: Vec<ast::WherePredicate>,
@@ -273,6 +274,7 @@ struct TypeRegistry {
     trait_implementations: Vec<TraitImplementation>,
     constants: HashMap<String, hir::Expression>,
     constant_integers: HashMap<String, u64>,
+    implicit_derived_module_identity: Option<String>,
 }
 
 impl TypeRegistry {
@@ -506,6 +508,9 @@ impl TypeRegistry {
         span: Span,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Option<Type> {
+        if elements.is_empty() {
+            return Some(Type::Unit);
+        }
         let key = StructuralType::Tuple(elements.clone());
         if let Some(ty) = self.structural.get(&key) {
             return Some(*ty);
@@ -847,31 +852,47 @@ impl TypeRegistry {
                 None
             }
             TypeNameKind::Path(path) => {
-                let ty = single_path_name(path)
-                    .and_then(|name| environment.types.get(name).copied())
-                    .or_else(|| single_path_name(path).and_then(primitive_type))
-                    .or_else(|| {
-                        single_path_name(path).and_then(|name| self.names.get(name).copied())
-                    });
-                if ty.is_none() {
-                    let message = if single_path_name(path)
-                        .is_some_and(|name| self.generic_templates.contains_key(name))
-                    {
-                        format!(
-                            "generic type `{}` requires type or const arguments",
-                            path.display()
-                        )
-                    } else {
-                        format!("unknown type `{}`", path.display())
-                    };
-                    diagnostics.push(
-                        Diagnostic::error("E3005", message, type_name.span)
-                            .with_help("declare the type or supply its generic arguments"),
-                    );
-                }
-                ty
+                self.resolve_path_type_name(path, environment, type_name.span, diagnostics)
             }
         }
+    }
+
+    fn resolve_path_type_name(
+        &mut self,
+        path: &ast::Path,
+        environment: &GenericEnvironment,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        let name = single_path_name(path);
+        let ty = name
+            .and_then(|name| environment.types.get(name).copied())
+            .or_else(|| name.and_then(primitive_type))
+            .or_else(|| name.and_then(|name| self.names.get(name).copied()));
+        if ty.is_none()
+            && let Some(name) = name
+            && self
+                .generic_templates
+                .get(name)
+                .is_some_and(|template| implicit_derived_pack_spec(template.parameters()).is_some())
+        {
+            return self.instantiate_derived_pack_type(name, environment, span, diagnostics);
+        }
+        if ty.is_none() {
+            let message = if name.is_some_and(|name| self.generic_templates.contains_key(name)) {
+                format!(
+                    "generic type `{}` requires type or const arguments",
+                    path.display()
+                )
+            } else {
+                format!("unknown type `{}`", path.display())
+            };
+            diagnostics.push(
+                Diagnostic::error("E3005", message, span)
+                    .with_help("declare the type or supply its generic arguments"),
+            );
+        }
+        ty
     }
 
     fn resolve_type_sequence(
@@ -993,6 +1014,52 @@ impl TypeRegistry {
             span,
             diagnostics,
         )?;
+        self.instantiate_bound_generic_type(
+            name,
+            template,
+            &values,
+            &environment,
+            span,
+            diagnostics,
+        )
+    }
+
+    fn instantiate_derived_pack_type(
+        &mut self,
+        name: &str,
+        outer_environment: &GenericEnvironment,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
+        let template = self.generic_templates.get(name).cloned()?;
+        let (pack, marker) = implicit_derived_pack_spec(template.parameters())?;
+        let marker_name = single_path_name(marker)?;
+        let module_identity = self.implicit_derived_module_identity.clone();
+        let collected = self.derived_marker_types(marker_name, module_identity.as_deref());
+        let mut environment = outer_environment.clone();
+        environment
+            .type_packs
+            .insert(pack.name.clone(), collected.clone());
+        let values: Vec<GenericValue> = collected.into_iter().map(GenericValue::Type).collect();
+        self.instantiate_bound_generic_type(
+            name,
+            template,
+            &values,
+            &environment,
+            span,
+            diagnostics,
+        )
+    }
+
+    fn instantiate_bound_generic_type(
+        &mut self,
+        name: &str,
+        template: GenericTypeTemplate,
+        values: &[GenericValue],
+        environment: &GenericEnvironment,
+        span: Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<Type> {
         let where_predicates = match &template {
             GenericTypeTemplate::Struct(declaration) => &declaration.where_predicates,
             GenericTypeTemplate::Enum(declaration) => &declaration.where_predicates,
@@ -1000,7 +1067,7 @@ impl TypeRegistry {
         if !self.validate_bounds(
             template.parameters(),
             where_predicates,
-            &environment,
+            environment,
             span,
             diagnostics,
         ) {
@@ -1008,17 +1075,17 @@ impl TypeRegistry {
         }
         let key = GenericTypeKey {
             name: name.to_owned(),
-            arguments: values.clone(),
+            arguments: values.to_vec(),
         };
         if let Some(ty) = self.generic_instances.get(&key) {
-            if self.reject_hidden_scoped_storage(&values, *ty, span, diagnostics) {
+            if self.reject_hidden_scoped_storage(values, *ty, span, diagnostics) {
                 return None;
             }
             return Some(*ty);
         }
 
         let (ty, id, representation) =
-            self.reserve_generic_type(name, &template, &values, key, span, diagnostics)?;
+            self.reserve_generic_type(name, &template, values, key, span, diagnostics)?;
         let attributes = match &template {
             GenericTypeTemplate::Struct(declaration) => &declaration.attributes,
             GenericTypeTemplate::Enum(declaration) => &declaration.attributes,
@@ -1029,14 +1096,10 @@ impl TypeRegistry {
         let must_use = has_marker_attribute(attributes, "must_use");
         let kind = match template {
             GenericTypeTemplate::Struct(declaration) => hir::TypeDefinitionKind::Struct {
-                fields: self.resolve_fields_in(&declaration.fields, &environment, diagnostics),
+                fields: self.resolve_fields_in(&declaration.fields, environment, diagnostics),
             },
             GenericTypeTemplate::Enum(declaration) => hir::TypeDefinitionKind::Enum {
-                variants: self.resolve_variants_in(
-                    &declaration.variants,
-                    &environment,
-                    diagnostics,
-                ),
+                variants: self.resolve_variants_in(&declaration.variants, environment, diagnostics),
             },
         };
         if let Some(definition) = self
@@ -1051,10 +1114,32 @@ impl TypeRegistry {
             definition.kind = kind;
         }
         self.validate_type_derives(ty, diagnostics);
-        if self.reject_hidden_scoped_storage(&values, ty, span, diagnostics) {
+        if self.reject_hidden_scoped_storage(values, ty, span, diagnostics) {
             return None;
         }
         Some(ty)
+    }
+
+    fn derived_marker_types(&self, marker: &str, module_identity: Option<&str>) -> Vec<Type> {
+        let package = module_identity.and_then(module_package_identity);
+        self.definitions
+            .iter()
+            .filter(|definition| {
+                definition
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| marker_inventory_contains(name, package))
+                    && definition
+                        .marker_traits
+                        .iter()
+                        .any(|derived| derived == marker)
+            })
+            .filter_map(|definition| match definition.kind {
+                hir::TypeDefinitionKind::Struct { .. } => Some(Type::Struct(definition.id)),
+                hir::TypeDefinitionKind::Enum { .. } => Some(Type::Enum(definition.id)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn reserve_generic_type(
@@ -2142,49 +2227,84 @@ impl TypeRegistry {
             if implementation.trait_name != trait_name {
                 return false;
             }
-            let mut environment = self.base_environment();
-            if !self.infer_type_pattern(
-                &implementation.target,
-                ty,
-                &implementation.parameters,
-                &mut environment,
-            ) {
-                return false;
+            self.trait_implementation_matches(implementation, ty, depth)
+        })
+    }
+
+    fn trait_method_owner(&self, ty: Type, method: &str) -> Option<String> {
+        let mut owner: Option<&str> = None;
+        for implementation in &self.trait_implementations {
+            let declares_method =
+                self.traits
+                    .get(&implementation.trait_name)
+                    .is_some_and(|definition| {
+                        definition
+                            .declaration
+                            .methods
+                            .iter()
+                            .any(|candidate| candidate.name.name == method)
+                    });
+            if !declares_method || !self.trait_implementation_matches(implementation, ty, 0) {
+                continue;
             }
-            let parameter_bounds_hold = implementation.parameters.iter().all(|parameter| {
-                let ast::GenericParameter::Type { name, bounds, .. } = parameter else {
-                    return true;
-                };
-                let Some(actual) = environment.types.get(&name.name).copied() else {
-                    return false;
-                };
-                bounds.iter().all(|bound| {
-                    single_path_name(bound).is_some_and(|bound| {
-                        self.satisfies_trait_at_depth(actual, bound, depth + 1)
-                    })
-                })
-            });
-            let supertraits_hold = self.traits.get(trait_name).is_none_or(|definition| {
-                definition.declaration.supertraits.iter().all(|supertrait| {
-                    single_path_name(supertrait).is_some_and(|supertrait| {
-                        self.satisfies_trait_at_depth(ty, supertrait, depth + 1)
-                    })
-                })
-            });
-            parameter_bounds_hold
-                && supertraits_hold
-                && implementation.where_predicates.iter().all(|predicate| {
-                    let Some(subject) = self.resolve_existing_type(&predicate.ty, &environment)
-                    else {
-                        return false;
-                    };
-                    predicate.bounds.iter().all(|bound| {
-                        single_path_name(bound).is_some_and(|bound| {
-                            self.satisfies_trait_at_depth(subject, bound, depth + 1)
+            match owner {
+                Some(existing) if existing != implementation.method_owner => return None,
+                Some(_) => {}
+                None => owner = Some(&implementation.method_owner),
+            }
+        }
+        owner.map(str::to_owned)
+    }
+
+    fn trait_implementation_matches(
+        &self,
+        implementation: &TraitImplementation,
+        ty: Type,
+        depth: usize,
+    ) -> bool {
+        let mut environment = self.base_environment();
+        if !self.infer_type_pattern(
+            &implementation.target,
+            ty,
+            &implementation.parameters,
+            &mut environment,
+        ) {
+            return false;
+        }
+        let parameter_bounds_hold = implementation.parameters.iter().all(|parameter| {
+            let ast::GenericParameter::Type { name, bounds, .. } = parameter else {
+                return true;
+            };
+            let Some(actual) = environment.types.get(&name.name).copied() else {
+                return false;
+            };
+            bounds.iter().all(|bound| {
+                single_path_name(bound)
+                    .is_some_and(|bound| self.satisfies_trait_at_depth(actual, bound, depth + 1))
+            })
+        });
+        let supertraits_hold =
+            self.traits
+                .get(&implementation.trait_name)
+                .is_none_or(|definition| {
+                    definition.declaration.supertraits.iter().all(|supertrait| {
+                        single_path_name(supertrait).is_some_and(|supertrait| {
+                            self.satisfies_trait_at_depth(ty, supertrait, depth + 1)
                         })
                     })
+                });
+        parameter_bounds_hold
+            && supertraits_hold
+            && implementation.where_predicates.iter().all(|predicate| {
+                let Some(subject) = self.resolve_existing_type(&predicate.ty, &environment) else {
+                    return false;
+                };
+                predicate.bounds.iter().all(|bound| {
+                    single_path_name(bound).is_some_and(|bound| {
+                        self.satisfies_trait_at_depth(subject, bound, depth + 1)
+                    })
                 })
-        })
+            })
     }
 
     fn resolve_existing_type(
@@ -3260,13 +3380,14 @@ impl Resolver {
             .remember_preliminary_constants(&preliminary.constants);
         self.preliminary_constants = preliminary.constants;
         self.collect_type_headers(program);
-        self.collect_type_aliases(program);
         self.collect_trait_headers(program);
+        self.collect_trait_implementation_headers(program);
+        self.collect_type_aliases(program);
         self.validate_derived_marker_traits(program);
         self.resolve_type_definitions(program);
         self.validate_type_cycles();
         self.validate_derived_traits();
-        self.collect_trait_implementations(program);
+        self.validate_trait_implementations(program);
         let compiletime_constants = self.evaluate_compiletime(program);
         let declarations = self.collect_declarations(program);
         let statics = self.collect_statics(program, &compiletime_constants);
@@ -3711,10 +3832,17 @@ impl Resolver {
             let mut progress = false;
             for declaration in pending {
                 let mut attempt_diagnostics = Vec::new();
-                if let Some(target) = self
+                let module_identity =
+                    symbol_module_identity(&declaration.name.name).map(str::to_owned);
+                let previous_module = std::mem::replace(
+                    &mut self.types.implicit_derived_module_identity,
+                    module_identity,
+                );
+                let target = self
                     .types
-                    .resolve_type_name(&declaration.target, &mut attempt_diagnostics)
-                {
+                    .resolve_type_name(&declaration.target, &mut attempt_diagnostics);
+                self.types.implicit_derived_module_identity = previous_module;
+                if let Some(target) = target {
                     self.types
                         .names
                         .insert(declaration.name.name.clone(), target);
@@ -3725,9 +3853,16 @@ impl Resolver {
             }
             if !progress {
                 for declaration in unresolved {
+                    let module_identity =
+                        symbol_module_identity(&declaration.name.name).map(str::to_owned);
+                    let previous_module = std::mem::replace(
+                        &mut self.types.implicit_derived_module_identity,
+                        module_identity,
+                    );
                     let _ = self
                         .types
                         .resolve_type_name(&declaration.target, &mut self.diagnostics);
+                    self.types.implicit_derived_module_identity = previous_module;
                 }
                 break;
             }
@@ -3866,7 +4001,7 @@ impl Resolver {
         }
     }
 
-    fn collect_trait_implementations(&mut self, program: &ast::Program) {
+    fn collect_trait_implementation_headers(&mut self, program: &ast::Program) {
         for item in &program.items {
             let Item::Impl(implementation) = item else {
                 continue;
@@ -3922,21 +4057,39 @@ impl Resolver {
                 );
                 continue;
             }
-            if let Some(definition) = &definition {
+            self.types.trait_implementations.push(TraitImplementation {
+                method_owner: trait_implementation_method_owner(
+                    &trait_name,
+                    &implementation.target,
+                ),
+                trait_name,
+                target: implementation.target.clone(),
+                parameters: implementation.generic_parameters.clone(),
+                where_predicates: implementation.where_predicates.clone(),
+            });
+        }
+    }
+
+    fn validate_trait_implementations(&mut self, program: &ast::Program) {
+        for item in &program.items {
+            let Item::Impl(implementation) = item else {
+                continue;
+            };
+            let Some(trait_type) = &implementation.trait_type else {
+                continue;
+            };
+            let Some(trait_name) = type_constructor_name(trait_type) else {
+                continue;
+            };
+            if let Some(definition) = self.types.traits.get(trait_name).cloned() {
                 self.validate_trait_methods(&definition.declaration, implementation);
-            } else if !implementation.methods.is_empty() {
+            } else if is_builtin_trait(trait_name) && !implementation.methods.is_empty() {
                 self.diagnostics.push(Diagnostic::error(
                     "E6013",
                     format!("built-in marker trait `{trait_name}` does not declare methods"),
                     implementation.span,
                 ));
             }
-            self.types.trait_implementations.push(TraitImplementation {
-                trait_name,
-                target: implementation.target.clone(),
-                parameters: implementation.generic_parameters.clone(),
-                where_predicates: implementation.where_predicates.clone(),
-            });
         }
     }
 
@@ -4442,25 +4595,32 @@ impl Resolver {
             .iter()
             .any(|method| !method.generic_parameters.is_empty());
         if !implementation.generic_parameters.is_empty() || has_generic_methods {
-            let Some(owner) = type_constructor_name(&implementation.target).map(str::to_owned)
-            else {
-                self.diagnostics.push(Diagnostic::error(
-                    "E6001",
-                    "generic impl requires a single nominal target type",
-                    implementation.target.span,
-                ));
-                return;
+            let owner = if let Some(owner) = type_constructor_name(&implementation.target) {
+                if !self.types.generic_templates.contains_key(owner)
+                    && !self.types.names.contains_key(owner)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E6001",
+                        format!("cannot implement methods for unknown type `{owner}`"),
+                        implementation.target.span,
+                    ));
+                    return;
+                }
+                owner.to_owned()
+            } else {
+                let Some(trait_type) = &implementation.trait_type else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E6001",
+                        "generic inherent impl requires a single nominal target type",
+                        implementation.target.span,
+                    ));
+                    return;
+                };
+                let Some(trait_name) = type_constructor_name(trait_type) else {
+                    return;
+                };
+                trait_implementation_method_owner(trait_name, &implementation.target)
             };
-            if !self.types.generic_templates.contains_key(&owner)
-                && !self.types.names.contains_key(&owner)
-            {
-                self.diagnostics.push(Diagnostic::error(
-                    "E6001",
-                    format!("cannot implement methods for unknown type `{owner}`"),
-                    implementation.target.span,
-                ));
-                return;
-            }
             validate_generic_parameter_names(
                 &implementation.generic_parameters,
                 &mut self.diagnostics,
@@ -4491,20 +4651,28 @@ impl Resolver {
         else {
             return;
         };
-        let Some(owner) = self
+        let owner = if let Some(owner) = self
             .types
             .definition(target)
             .and_then(|definition| definition.name.clone())
-        else {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "E6001",
-                    "inherent impl requires a named struct or enum",
-                    implementation.target.span,
-                )
-                .with_help("implement methods on a declared nominal type"),
-            );
-            return;
+        {
+            owner
+        } else {
+            let Some(trait_type) = &implementation.trait_type else {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E6001",
+                        "inherent impl requires a named struct or enum",
+                        implementation.target.span,
+                    )
+                    .with_help("implement a trait to extend a structural type"),
+                );
+                return;
+            };
+            let Some(trait_name) = type_constructor_name(trait_type) else {
+                return;
+            };
+            trait_implementation_method_owner(trait_name, &implementation.target)
         };
         for method in &implementation.methods {
             if method.is_comptime {
@@ -5647,6 +5815,13 @@ impl<'context> FunctionAnalyzer<'context> {
                 ),
                 tuple.span,
             ));
+        }
+        if elements.is_empty() {
+            return Expression {
+                kind: ExpressionKind::Unit,
+                ty: Type::Unit,
+                span: tuple.span,
+            };
         }
         let ty = expected
             .filter(|ty| matches!(ty, Type::Tuple(_)))
@@ -7046,10 +7221,15 @@ impl<'context> FunctionAnalyzer<'context> {
             }
             return invalid_composite_expression(call.span);
         };
-        let Some(owner) = self.types.nominal_name(receiver_type).map(str::to_owned) else {
+        let owner = self
+            .types
+            .nominal_name(receiver_type)
+            .map(str::to_owned)
+            .or_else(|| self.types.trait_method_owner(receiver_type, &method.name));
+        let Some(owner) = owner else {
             self.diagnostics.push(Diagnostic::error(
                 "E6002",
-                format!("type `{receiver_type}` has no inherent methods"),
+                format!("type `{receiver_type}` has no method `{}`", method.name),
                 field.span,
             ));
             for argument in &call.arguments {
@@ -7177,10 +7357,11 @@ impl<'context> FunctionAnalyzer<'context> {
         if method.name == "take_type" {
             return self.analyze_tuple_type_take(call, field, method, expected_return);
         }
-        let (mutable_first, returns_tuple) = match method.name.as_str() {
-            "get_type" => (false, false),
-            "get_type_mut" => (true, false),
-            "split_type_mut" => (true, true),
+        let (mutable_receiver, returns_tuple, mutable_all) = match method.name.as_str() {
+            "get_type" => (false, false, false),
+            "get_type_mut" => (true, false, false),
+            "split_type_mut" => (true, true, false),
+            "split_types_mut" => (true, true, true),
             _ => return None,
         };
         let receiver_type = self.place_expression_type(&field.base)?;
@@ -7209,14 +7390,18 @@ impl<'context> FunctionAnalyzer<'context> {
         };
 
         self.require_expression_root_available(&field.base, call.span);
-        if mutable_first {
+        if mutable_receiver {
             self.require_mutable_place(&field.base);
         }
-        self.check_and_record_borrow(&field.base, mutable_first, call.span);
+        self.check_and_record_borrow(&field.base, mutable_receiver, call.span);
 
-        let Some(borrowed) =
-            self.borrow_tuple_type_fields(field, &selected, mutable_first, call.span)
-        else {
+        let Some(borrowed) = self.borrow_tuple_type_fields(
+            field,
+            &selected,
+            mutable_receiver,
+            mutable_all,
+            call.span,
+        ) else {
             return Some(invalid_composite_expression(call.span));
         };
         if !returns_tuple {
@@ -7364,7 +7549,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 Diagnostic::error(
                     "E6022",
                     if returns_tuple {
-                        "`split_type_mut` requires at least one requested type".to_owned()
+                        format!("`{}` requires at least one requested type", method.name)
                     } else {
                         format!("`{}` requires exactly one requested type", method.name)
                     },
@@ -7439,6 +7624,7 @@ impl<'context> FunctionAnalyzer<'context> {
         field: &ast::FieldExpression,
         selected: &[usize],
         mutable_first: bool,
+        mutable_all: bool,
         span: Span,
     ) -> Option<Vec<Expression>> {
         let mut borrowed = Vec::with_capacity(selected.len());
@@ -7453,7 +7639,7 @@ impl<'context> FunctionAnalyzer<'context> {
                 span,
             }));
             let place = self.analyze_place(&element_expression)?;
-            let mutable = mutable_first && request_index == 0;
+            let mutable = mutable_all || (mutable_first && request_index == 0);
             let reference_type = self
                 .types
                 .intern_reference(place.ty, mutable, span, self.diagnostics)
@@ -10340,6 +10526,22 @@ impl<'context> FunctionAnalyzer<'context> {
             .get(template.explicit_parameter_start..)
             .unwrap_or_default();
         self.bind_explicit_generic_arguments(call, explicit_parameters, &mut environment);
+        if template.explicit_parameter_start == 0
+            && call.generic_arguments.is_empty()
+            && let Some((pack, marker)) = implicit_derived_pack_spec(parameters)
+            && let Some(marker_name) = single_path_name(marker)
+            && template
+                .function
+                .parameters
+                .iter()
+                .all(|parameter| type_pattern_is_bound(&parameter.ty, parameters, &environment))
+        {
+            environment.type_packs.insert(
+                pack.name.clone(),
+                self.types
+                    .derived_marker_types(marker_name, self.module_identity.as_deref()),
+            );
+        }
         if let (Some(return_type), Some(expected)) =
             (&template.function.return_type, expected_return)
         {
@@ -11510,10 +11712,14 @@ impl<'context> FunctionAnalyzer<'context> {
                 let receiver = self
                     .place_expression_type(&field.base)
                     .or_else(|| self.temporary_method_receiver_type(&field.base))?;
-                let owner = self.types.nominal_name(receiver)?;
                 let ast::FieldName::Named(method) = &field.field else {
                     return None;
                 };
+                let owner = self
+                    .types
+                    .nominal_name(receiver)
+                    .map(str::to_owned)
+                    .or_else(|| self.types.trait_method_owner(receiver, &method.name))?;
                 let resolved_name = format!("{owner}::{}", method.name);
                 self.signatures
                     .get(&resolved_name)
@@ -12794,6 +13000,21 @@ fn has_marker_attribute(attributes: &[ast::Attribute], name: &str) -> bool {
         .any(|attribute| attribute.name.name == name && attribute.arguments.is_empty())
 }
 
+fn implicit_derived_pack_spec(
+    parameters: &[ast::GenericParameter],
+) -> Option<(&ast::Identifier, &ast::Path)> {
+    let ast::GenericParameter::TypePack { name, bounds, .. } = parameters.first()? else {
+        return None;
+    };
+    if parameters.len() != 1 {
+        return None;
+    }
+    let [marker] = bounds.as_slice() else {
+        return None;
+    };
+    Some((name, marker))
+}
+
 fn requested_alignment(attributes: &[ast::Attribute]) -> Option<u32> {
     attributes.iter().find_map(|attribute| {
         if attribute.name.name != "align" {
@@ -13188,6 +13409,13 @@ fn type_pattern_key(type_name: &ast::TypeName) -> String {
     }
 }
 
+fn trait_implementation_method_owner(trait_name: &str, target: &ast::TypeName) -> String {
+    type_constructor_name(target).map_or_else(
+        || format!("__trait_impl${trait_name}${}", type_pattern_key(target)),
+        str::to_owned,
+    )
+}
+
 fn const_expression_key(expression: &AstExpression) -> String {
     match expression {
         AstExpression::Integer(literal) => literal.value.to_string(),
@@ -13278,8 +13506,56 @@ fn type_constructor_name(type_name: &ast::TypeName) -> Option<&str> {
 }
 
 fn symbol_module_identity(name: &str) -> Option<&str> {
-    let (module, _) = name.strip_prefix("__module_")?.split_once('$')?;
-    Some(module)
+    const PREFIX: &str = "__module_";
+    let encoded = name.strip_prefix(PREFIX)?;
+    let bytes = encoded.as_bytes();
+    let mut cursor = 0;
+    loop {
+        let length_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == length_start || bytes.get(cursor) != Some(&b'_') {
+            return None;
+        }
+        let length = encoded[length_start..cursor].parse::<usize>().ok()?;
+        cursor = cursor.checked_add(1)?.checked_add(length)?;
+        match bytes.get(cursor) {
+            Some(b'_') => cursor += 1,
+            Some(b'$') => return encoded.get(..cursor),
+            _ => return None,
+        }
+    }
+}
+
+fn marker_inventory_contains(name: &str, package: Option<&str>) -> bool {
+    if !name.starts_with("__module_") {
+        return package.is_none();
+    }
+    let Some(module) = symbol_module_identity(name) else {
+        return false;
+    };
+    let Some(first) = encoded_module_first_segment(module) else {
+        return false;
+    };
+    if first == "std" {
+        return false;
+    }
+    if first.starts_with("$package$") {
+        return package == Some(first);
+    }
+    package.is_none()
+}
+
+fn module_package_identity(module: &str) -> Option<&str> {
+    encoded_module_first_segment(module).filter(|first| first.starts_with("$package$"))
+}
+
+fn encoded_module_first_segment(module: &str) -> Option<&str> {
+    let separator = module.find('_')?;
+    let length = module[..separator].parse::<usize>().ok()?;
+    let start = separator.checked_add(1)?;
+    module.get(start..start.checked_add(length)?)
 }
 
 fn assignment_root_path(expression: &AstExpression) -> Option<&ast::Path> {
@@ -13906,6 +14182,90 @@ mod tests {
     }
 
     #[test]
+    fn resolve_should_collect_marker_derives_into_omitted_type_packs() {
+        let source = "
+            trait Component: Copy {}
+            @derive(Copy, Component)
+            struct Position { x: i32 }
+            @derive(Copy, Component)
+            struct Velocity { x: i32 }
+            struct Registry<...Components: Component> { values: (...Components) }
+            fn components_ready<...Components: Component>() -> bool { true }
+            type GameComponents = Registry;
+            fn main() -> i32 {
+                let registry: GameComponents = Registry {
+                    values: (Position { x: 20 }, Velocity { x: 22 }),
+                };
+                if components_ready() { registry.values.0.x + registry.values.1.x } else { 0 }
+            }
+        ";
+
+        let program = resolve_fixture(source).expect("derived component pack should resolve");
+
+        assert!(program.types.iter().any(|definition| {
+            definition
+                .name
+                .as_deref()
+                .is_some_and(|name| name == "Registry<Position, Velocity>")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_infer_bounded_type_packs_from_call_arguments() {
+        let source = "
+            trait Component: Copy {}
+            @derive(Copy, Component)
+            struct Position { x: i32 }
+            @derive(Copy, Component)
+            struct Velocity { x: i32 }
+            @derive(Copy, Component)
+            struct Health { value: i32 }
+            fn accepts_bundle<...Components: Component>(
+                values: (...Components),
+            ) -> i32 {
+                let _ = values;
+                42
+            }
+            fn main() -> i32 {
+                let position = Position { x: 20 };
+                let velocity = Velocity { x: 22 };
+                accepts_bundle((position, velocity))
+            }
+        ";
+
+        resolve_fixture(source).expect("bounded pack should infer from the tuple argument");
+    }
+
+    #[test]
+    fn resolve_should_not_infer_an_unbounded_type_pack() {
+        let diagnostics = resolve_fixture(
+            "struct Registry<...Types> { values: (...Types) }
+             type Invalid = Registry;
+             fn main() -> i32 { 42 }",
+        )
+        .expect_err("an unbounded pack should remain explicit");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E3005" && diagnostic.message.contains("requires type")
+        }));
+    }
+
+    #[test]
+    fn resolve_should_normalize_an_empty_type_pack_tuple_to_unit() {
+        let source = "
+            struct Registry<...Types> { values: (...Types) }
+            type EmptyRegistry = Registry<>;
+            fn main() -> i32 {
+                let registry: EmptyRegistry = Registry { values: () };
+                let _ = registry;
+                42
+            }
+        ";
+
+        resolve_fixture(source).expect("empty variadic registry should resolve");
+    }
+
+    #[test]
     fn resolve_should_expand_variadic_value_templates() {
         let source = "
             struct Marker<T> { value: i32 }
@@ -13998,6 +14358,38 @@ mod tests {
                 .functions
                 .iter()
                 .any(|function| function.name.starts_with("read$instance$"))
+        );
+    }
+
+    #[test]
+    fn resolve_should_dispatch_traits_for_generic_function_pointers() {
+        let source = "
+            trait Callback {
+                fn invoke(&self);
+            }
+            impl<Context> Callback for fn(&mut Context) -> () {
+                fn invoke(&self) {
+                    let _ = self;
+                }
+            }
+            fn increment(value: &mut i32) { *value += 1; }
+            fn dispatch<Handler: Callback>(handler: Handler) {
+                handler.invoke();
+            }
+            fn main() -> i32 {
+                let handler: fn(&mut i32) -> () = increment;
+                dispatch(handler);
+                42
+            }
+        ";
+
+        let program = resolve_fixture(source).expect("function trait fixture should resolve");
+
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name.starts_with("dispatch$instance$"))
         );
     }
 
@@ -15210,6 +15602,22 @@ mod tests {
             }";
 
         resolve_fixture(source).expect("disjoint tuple fields should move independently");
+    }
+
+    #[test]
+    fn resolve_should_mutably_split_multiple_tuple_fields_by_type() {
+        let source = "fn main() -> i32 {
+            let mut values: (i32, bool, u8) = (20, true, 21);
+            {
+                let selected: (&mut i32, &mut u8) =
+                    values.split_types_mut<i32, u8>();
+                *selected.0 += 1;
+                *selected.1 += 1;
+            };
+            *values.get_type<i32>() + *values.get_type<u8>() as i32
+        }";
+
+        resolve_fixture(source).expect("distinct tuple fields should split mutably");
     }
 
     #[test]

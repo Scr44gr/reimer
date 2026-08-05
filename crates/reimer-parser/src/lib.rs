@@ -1738,6 +1738,9 @@ impl<'tokens> Parser<'tokens> {
 
     fn parse_generic_argument_list(&mut self) -> Option<Vec<GenericArgument>> {
         let mut arguments = Vec::new();
+        if self.at_type_greater() {
+            return Some(arguments);
+        }
         loop {
             let argument = if let Some(start) = self.take(&TokenKind::Ellipsis) {
                 let pack = self.expect_identifier("type pack name after `...`")?;
@@ -3120,6 +3123,23 @@ mod tests {
             &accepts.parameters[0].ty.kind,
             TypeNameKind::Generic { arguments, .. }
                 if matches!(arguments.get(1), Some(GenericArgument::Const(_)))
+        ));
+    }
+
+    #[test]
+    fn parse_should_allow_an_empty_variadic_argument_list() {
+        let source = "struct Registry<...Values> { values: (...Values) }
+            type EmptyRegistry = Registry<>;";
+        let tokens = lex(source).expect("fixture should lex");
+
+        let program = parse(&tokens).expect("fixture should parse");
+
+        let Item::TypeAlias(alias) = &program.items[1] else {
+            panic!("expected type alias");
+        };
+        assert!(matches!(
+            &alias.target.kind,
+            TypeNameKind::Generic { arguments, .. } if arguments.is_empty()
         ));
     }
 

@@ -2922,6 +2922,116 @@ mod tests {
     }
 
     #[test]
+    fn load_graph_should_resolve_generic_bounds_from_dependency_modules() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/src/main.reim",
+            "from library::resource import Bucket, Marker;
+             type MarkerBucket = Bucket<Marker>;
+             fn keep(value: MarkerBucket) -> MarkerBucket { value }
+             fn main() -> i32 { 42 }",
+        );
+        fixture.write(
+            "library/src/package.reim",
+            "pub import self::resource as resource;",
+        );
+        fixture.write(
+            "library/src/resource.reim",
+            "pub trait Resource: Copy {}
+             pub trait Managed: Resource {
+                 fn release(&mut self);
+             }
+             @derive(Copy)
+             pub struct Marker {}
+             impl Resource for Marker {}
+             impl Managed for Marker {
+                 fn release(&mut self) { let _ = self; }
+             }
+             pub struct Bucket<...Values: Managed> { values: (...Values) }",
+        );
+        let graph = SourceGraph {
+            root: "app".to_owned(),
+            packages: vec![
+                SourcePackage {
+                    id: "app".to_owned(),
+                    name: "app".to_owned(),
+                    source_root: fixture.path("app/src"),
+                    entry: fixture.path("app/src/main.reim"),
+                    dependencies: vec![SourceDependency {
+                        alias: "library".to_owned(),
+                        package: "library".to_owned(),
+                    }],
+                },
+                SourcePackage {
+                    id: "library".to_owned(),
+                    name: "library".to_owned(),
+                    source_root: fixture.path("library/src"),
+                    entry: fixture.path("library/src/package.reim"),
+                    dependencies: Vec::new(),
+                },
+            ],
+        };
+
+        let package = load_graph(&graph).expect("package graph should load");
+
+        reimer_resolver::resolve(&package.program)
+            .expect("dependency trait bounds should retain their canonical package identity");
+    }
+
+    #[test]
+    fn dependency_defined_derive_inventory_should_remain_package_scoped() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/src/main.reim",
+            "from library import component_value;
+             fn main() -> i32 { component_value() }",
+        );
+        fixture.write(
+            "library/src/package.reim",
+            "pub trait Component: Copy {}
+             @derive(Copy, Component)
+             pub struct Position { value: i32 }
+             pub struct Registry<...Components: Component> {
+                 values: (...Components)
+             }
+             type Components = Registry;
+             pub fn component_value() -> i32 {
+                 let registry: Components = Registry {
+                     values: (Position { value: 42 },),
+                 };
+                 registry.values.0.value
+             }",
+        );
+        let graph = SourceGraph {
+            root: "app".to_owned(),
+            packages: vec![
+                SourcePackage {
+                    id: "app".to_owned(),
+                    name: "app".to_owned(),
+                    source_root: fixture.path("app/src"),
+                    entry: fixture.path("app/src/main.reim"),
+                    dependencies: vec![SourceDependency {
+                        alias: "library".to_owned(),
+                        package: "library".to_owned(),
+                    }],
+                },
+                SourcePackage {
+                    id: "library".to_owned(),
+                    name: "library".to_owned(),
+                    source_root: fixture.path("library/src"),
+                    entry: fixture.path("library/src/package.reim"),
+                    dependencies: Vec::new(),
+                },
+            ],
+        };
+
+        let package = load_graph(&graph).expect("package graph should load");
+
+        reimer_resolver::resolve(&package.program)
+            .expect("a dependency should collect its own marker derives");
+    }
+
+    #[test]
     fn load_graph_should_reject_imports_of_transitive_dependencies() {
         let fixture = Fixture::new();
         fixture.write(
