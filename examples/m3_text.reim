@@ -1,4 +1,5 @@
 from std::alloc import AllocError, general_allocator;
+from std::io import println;
 from std::string import String, char_count, concat, contains, repeat, to_uppercase;
 
 fn text_is_valid(
@@ -19,12 +20,13 @@ fn exercise_text() -> Result<i32, AllocError> {
     let allocator = general_allocator();
 
     let mut formatted = String::with_capacity(&allocator, 32)?;
+    defer formatted.deinit();
+
     formatted.push_str("value=")?;
     formatted.push_i32(-42)?;
     formatted.push_str(", ready=")?;
     formatted.push_bool(true)?;
     formatted.push_char('🦀')?;
-
     let combined = concat(&allocator, "hello", " world")?;
     let repeated = repeat(&allocator, "na", 3)?;
     let uppercase = to_uppercase(&allocator, 'ß')?;
@@ -35,12 +37,10 @@ fn exercise_text() -> Result<i32, AllocError> {
         &repeated,
         &uppercase,
     );
-
+    println(formatted.as_str());
     uppercase.deinit();
     repeated.deinit();
     combined.deinit();
-    formatted.deinit();
-
     if valid {
         Ok(42)
     } else {
