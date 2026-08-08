@@ -8,6 +8,35 @@ use reimer_diagnostics::Diagnostic;
 use reimer_package::{FileDiagnostic, SourceGraph};
 use reimer_project::NativeDependencies;
 
+/// One observable stage in the frontend or native backend pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilerStage {
+    /// Reads, lexes, parses, and joins the reachable source modules.
+    LoadingSources,
+    /// Resolves names, types, ownership, and semantic constraints.
+    Resolving,
+    /// Lowers typed HIR to native object or JIT machine code.
+    GeneratingCode,
+}
+
+/// Progress emitted by compiler operations that opt into reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilerProgress<'path> {
+    /// A compiler stage has started.
+    StageStarted(CompilerStage),
+    /// An exact source file was included in the compiled module graph.
+    Source {
+        /// Source path as loaded by the package graph.
+        path: &'path Path,
+        /// One-based position in deterministic load order.
+        index: usize,
+        /// Total number of reachable source files.
+        total: usize,
+    },
+    /// A compiler stage completed successfully.
+    StageFinished(CompilerStage),
+}
+
 /// Runs the complete frontend without native code generation.
 ///
 /// # Errors
@@ -64,9 +93,29 @@ pub fn compile_file_to_object_with_options(
     path: &Path,
     optimization: OptimizationLevel,
 ) -> Result<Vec<u8>, Vec<FileDiagnostic>> {
-    let (package, program) = analyze_file(path)?;
-    reimer_codegen_native::emit_object_with_options(&program, optimization)
-        .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+    compile_file_to_object_with_progress(path, optimization, |_| {})
+}
+
+/// Compiles a file module graph while reporting sources and compiler stages.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, or backend diagnostics.
+pub fn compile_file_to_object_with_progress(
+    path: &Path,
+    optimization: OptimizationLevel,
+    mut progress: impl FnMut(CompilerProgress<'_>),
+) -> Result<Vec<u8>, Vec<FileDiagnostic>> {
+    let (package, program) = analyze_file_with_progress(path, &mut progress)?;
+    progress(CompilerProgress::StageStarted(
+        CompilerStage::GeneratingCode,
+    ));
+    let object = reimer_codegen_native::emit_object_with_options(&program, optimization)
+        .map_err(|diagnostics| package.map_diagnostics(diagnostics))?;
+    progress(CompilerProgress::StageFinished(
+        CompilerStage::GeneratingCode,
+    ));
+    Ok(object)
 }
 
 /// JIT-compiles and executes an entry file and its module graph.
@@ -102,9 +151,38 @@ pub fn execute_file_with_arguments(
     optimization: OptimizationLevel,
     arguments: Vec<OsString>,
 ) -> Result<i32, Vec<FileDiagnostic>> {
-    let (package, program) = analyze_file(path)?;
-    reimer_codegen_native::execute_with_arguments(&program, optimization, arguments)
-        .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+    execute_file_with_arguments_and_progress(path, optimization, arguments, |_| {})
+}
+
+/// JIT-compiles a file module graph with arguments while reporting progress.
+///
+/// The code-generation stage finishes immediately before source code receives
+/// control, so long-running programs do not keep compilation progress active.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, or backend diagnostics.
+pub fn execute_file_with_arguments_and_progress(
+    path: &Path,
+    optimization: OptimizationLevel,
+    arguments: Vec<OsString>,
+    mut progress: impl FnMut(CompilerProgress<'_>),
+) -> Result<i32, Vec<FileDiagnostic>> {
+    let (package, program) = analyze_file_with_progress(path, &mut progress)?;
+    progress(CompilerProgress::StageStarted(
+        CompilerStage::GeneratingCode,
+    ));
+    reimer_codegen_native::execute_with_arguments_and_ready(
+        &program,
+        optimization,
+        arguments,
+        || {
+            progress(CompilerProgress::StageFinished(
+                CompilerStage::GeneratingCode,
+            ));
+        },
+    )
+    .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
 
 /// Checks every source reachable through a resolved package graph.
@@ -125,9 +203,29 @@ pub fn compile_graph_to_object(
     graph: &SourceGraph,
     optimization: OptimizationLevel,
 ) -> Result<Vec<u8>, Vec<FileDiagnostic>> {
-    let (package, program) = analyze_graph(graph)?;
-    reimer_codegen_native::emit_object_with_options(&program, optimization)
-        .map_err(|diagnostics| package.map_diagnostics(diagnostics))
+    compile_graph_to_object_with_progress(graph, optimization, |_| {})
+}
+
+/// Compiles a resolved graph while reporting sources and compiler stages.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, or backend diagnostics.
+pub fn compile_graph_to_object_with_progress(
+    graph: &SourceGraph,
+    optimization: OptimizationLevel,
+    mut progress: impl FnMut(CompilerProgress<'_>),
+) -> Result<Vec<u8>, Vec<FileDiagnostic>> {
+    let (package, program) = analyze_graph_with_progress(graph, &mut progress)?;
+    progress(CompilerProgress::StageStarted(
+        CompilerStage::GeneratingCode,
+    ));
+    let object = reimer_codegen_native::emit_object_with_options(&program, optimization)
+        .map_err(|diagnostics| package.map_diagnostics(diagnostics))?;
+    progress(CompilerProgress::StageFinished(
+        CompilerStage::GeneratingCode,
+    ));
+    Ok(object)
 }
 
 /// JIT-compiles and executes a resolved package graph.
@@ -191,13 +289,45 @@ pub fn execute_graph_with_arguments_and_native_dependencies(
     arguments: Vec<OsString>,
     native: &NativeDependencies,
 ) -> Result<i32, Vec<FileDiagnostic>> {
-    let (package, program) = analyze_graph(graph)?;
-    reimer_codegen_native::execute_with_native_libraries(
+    execute_graph_with_arguments_and_native_dependencies_and_progress(
+        graph,
+        optimization,
+        arguments,
+        native,
+        |_| {},
+    )
+}
+
+/// JIT-compiles a resolved graph with native dependencies while reporting progress.
+///
+/// The code-generation stage finishes immediately before source code receives
+/// control, so long-running programs do not keep compilation progress active.
+///
+/// # Errors
+///
+/// Returns file-aware package, frontend, native-library, or backend diagnostics.
+pub fn execute_graph_with_arguments_and_native_dependencies_and_progress(
+    graph: &SourceGraph,
+    optimization: OptimizationLevel,
+    arguments: Vec<OsString>,
+    native: &NativeDependencies,
+    mut progress: impl FnMut(CompilerProgress<'_>),
+) -> Result<i32, Vec<FileDiagnostic>> {
+    let (package, program) = analyze_graph_with_progress(graph, &mut progress)?;
+    progress(CompilerProgress::StageStarted(
+        CompilerStage::GeneratingCode,
+    ));
+    reimer_codegen_native::execute_with_native_libraries_and_ready(
         &program,
         optimization,
         Some(arguments),
         native.library_paths(),
         native.link_libraries(),
+        || {
+            progress(CompilerProgress::StageFinished(
+                CompilerStage::GeneratingCode,
+            ));
+        },
     )
     .map_err(|diagnostics| package.map_diagnostics(diagnostics))
 }
@@ -403,14 +533,32 @@ fn analyze(source: &str) -> Result<reimer_hir::Program, Vec<Diagnostic>> {
 fn analyze_file(
     path: &Path,
 ) -> Result<(reimer_package::Package, reimer_hir::Program), Vec<FileDiagnostic>> {
+    analyze_file_with_progress(path, &mut |_| {})
+}
+
+fn analyze_file_with_progress(
+    path: &Path,
+    progress: &mut impl FnMut(CompilerProgress<'_>),
+) -> Result<(reimer_package::Package, reimer_hir::Program), Vec<FileDiagnostic>> {
+    progress(CompilerProgress::StageStarted(
+        CompilerStage::LoadingSources,
+    ));
     let package = reimer_package::load(path)?;
+    report_sources(&package, progress);
+    progress(CompilerProgress::StageFinished(
+        CompilerStage::LoadingSources,
+    ));
+    progress(CompilerProgress::StageStarted(CompilerStage::Resolving));
     let resolved = if is_library_entry(path) {
         reimer_resolver::resolve_library(&package.program)
     } else {
         reimer_resolver::resolve(&package.program)
     };
     match resolved {
-        Ok(program) => Ok((package, program)),
+        Ok(program) => {
+            progress(CompilerProgress::StageFinished(CompilerStage::Resolving));
+            Ok((package, program))
+        }
         Err(diagnostics) => Err(package.map_diagnostics(diagnostics)),
     }
 }
@@ -418,7 +566,22 @@ fn analyze_file(
 fn analyze_graph(
     graph: &SourceGraph,
 ) -> Result<(reimer_package::Package, reimer_hir::Program), Vec<FileDiagnostic>> {
+    analyze_graph_with_progress(graph, &mut |_| {})
+}
+
+fn analyze_graph_with_progress(
+    graph: &SourceGraph,
+    progress: &mut impl FnMut(CompilerProgress<'_>),
+) -> Result<(reimer_package::Package, reimer_hir::Program), Vec<FileDiagnostic>> {
+    progress(CompilerProgress::StageStarted(
+        CompilerStage::LoadingSources,
+    ));
     let package = reimer_package::load_graph(graph)?;
+    report_sources(&package, progress);
+    progress(CompilerProgress::StageFinished(
+        CompilerStage::LoadingSources,
+    ));
+    progress(CompilerProgress::StageStarted(CompilerStage::Resolving));
     let library = graph
         .packages
         .iter()
@@ -430,8 +593,25 @@ fn analyze_graph(
         reimer_resolver::resolve(&package.program)
     };
     match resolved {
-        Ok(program) => Ok((package, program)),
+        Ok(program) => {
+            progress(CompilerProgress::StageFinished(CompilerStage::Resolving));
+            Ok((package, program))
+        }
         Err(diagnostics) => Err(package.map_diagnostics(diagnostics)),
+    }
+}
+
+fn report_sources(
+    package: &reimer_package::Package,
+    progress: &mut impl FnMut(CompilerProgress<'_>),
+) {
+    let total = package.source_paths().count();
+    for (index, path) in package.source_paths().enumerate() {
+        progress(CompilerProgress::Source {
+            path,
+            index: index.saturating_add(1),
+            total,
+        });
     }
 }
 

@@ -1,5 +1,10 @@
 //! Native startup shim linked with one generated Reimer object.
 
+#![cfg_attr(
+    reimer_windows_subsystem = "windows",
+    windows_subsystem = "windows"
+)]
+
 unsafe extern "C" {
     fn program_main() -> i32;
 }

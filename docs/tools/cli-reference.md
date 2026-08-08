@@ -37,7 +37,7 @@ reimer check . --locked
 ## Run a program
 
 ```text
-reimer run [path] [--release] [--locked|--refresh] [-- <arguments>...]
+reimer run [path] [--release] [--locked|--refresh] [--verbosity <level>] [-- <arguments>...]
 ```
 
 Execution uses the Cranelift JIT. Arguments after `--` belong to the Reimer program rather than the compiler:
@@ -53,7 +53,7 @@ the package graph are resolved without requiring global `PATH`,
 ## Build a native executable
 
 ```text
-reimer build [path] [--release] [--locked|--refresh] [-o <executable>]
+reimer build [path] [--release] [--locked|--refresh] [--verbosity <level>] [-o <executable>]
 ```
 
 For executable packages and source files, `build` emits a native object and links it with the matching startup and runtime. Manifest-declared `.dll`, `.so`, or `.dylib` files are copied beside the executable. The resulting program does not need the Reimer compiler or a separate Reimer runtime when launched, although it still needs those explicitly declared third-party shared libraries.
@@ -61,6 +61,11 @@ For executable packages and source files, `build` emits a native object and link
 ```text
 reimer build . --release --locked -o game.exe
 ```
+
+On Windows, optimization and executable subsystem are independent. A release
+profile still produces a console application unless its manifest selects
+`windows-subsystem = "windows"`; see the
+[package reference](../guide/package-system.md#build-profiles-and-windows-applications).
 
 Library packages currently emit a native object. A stable library archive format is not part of the experimental release.
 
@@ -125,3 +130,36 @@ This low-level command writes a target-native object without linking an executab
 
 `--release`
 : Uses the manifest's release optimization level. Without it, commands use the debug profile.
+
+## Build and run verbosity
+
+`build` and `run` accept either a named level or conventional short aliases:
+
+```text
+reimer build . --release --verbosity verbose
+reimer run . -v
+reimer build . --release -vv
+reimer run . -q
+```
+
+`quiet` / `-q`
+: Suppresses the successful command summary. Program output is not hidden.
+
+`normal`
+: Preserves the concise default output.
+
+`verbose` / `-v`
+: Reports project resolution, source loading, semantic analysis, native code
+  generation, and linking with elapsed stage time and a continuously updated
+  approximate ETA.
+
+`trace` / `-vv` / `--trace`
+: Adds every exact source file in the resolved module graph plus native library
+  paths, link libraries, and staged runtime files.
+
+Progress is written to standard error so program output on standard output
+remains pipe-friendly. The ETA is based on completed compiler stages, is
+weighted so semantic analysis and native code generation count more than setup
+or linking, and recalculated after every stage. It should be treated as an
+approximation rather than a deadline; an overrun displays `eta --` until the
+next recalibration instead of reporting a misleading zero.

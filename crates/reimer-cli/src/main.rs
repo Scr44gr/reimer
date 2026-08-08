@@ -7,17 +7,19 @@ use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use reimer_cli::{
-    check_file, check_graph, compile_file_to_object, compile_file_to_object_with_options,
-    compile_graph_to_object, execute_file_test, execute_file_tests_with_progress,
-    execute_file_with_arguments, execute_graph_test_with_native_dependencies,
+    CompilerProgress, CompilerStage, check_file, check_graph, compile_file_to_object,
+    compile_file_to_object_with_progress, compile_graph_to_object_with_progress, execute_file_test,
+    execute_file_tests_with_progress, execute_file_with_arguments_and_progress,
+    execute_graph_test_with_native_dependencies,
     execute_graph_tests_with_native_dependencies_and_progress,
-    execute_graph_with_arguments_and_native_dependencies, execute_graph_with_native_dependencies,
-    file_test_names, graph_test_names,
+    execute_graph_with_arguments_and_native_dependencies_and_progress,
+    execute_graph_with_native_dependencies, file_test_names, graph_test_names,
 };
 use reimer_codegen_native::OptimizationLevel;
-use reimer_project::{BuildProfile, LockMode, NativeDependencies, Project};
+use reimer_project::{BuildProfile, LockMode, NativeDependencies, Project, WindowsSubsystem};
 
 mod documentation;
 mod generated_output;
@@ -25,6 +27,320 @@ mod native_linker;
 
 const MANIFEST_FILE: &str = "reimer.toml";
 const MAX_UNIT_TEST_WORKERS: usize = 4;
+const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
+const PROJECT_RESOLUTION_WORK: u32 = 2;
+const SOURCE_LOADING_WORK: u32 = 5;
+const SEMANTIC_ANALYSIS_WORK: u32 = 45;
+const NATIVE_CODE_GENERATION_WORK: u32 = 45;
+const NATIVE_LINKING_WORK: u32 = 3;
+const COMPILER_WORK: u32 =
+    SOURCE_LOADING_WORK + SEMANTIC_ANALYSIS_WORK + NATIVE_CODE_GENERATION_WORK;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Verbosity {
+    Quiet,
+    #[default]
+    Normal,
+    Verbose,
+    Trace,
+}
+
+impl Verbosity {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "quiet" => Ok(Self::Quiet),
+            "normal" => Ok(Self::Normal),
+            "verbose" => Ok(Self::Verbose),
+            "trace" => Ok(Self::Trace),
+            _ => Err(format!(
+                "invalid verbosity `{value}`; expected quiet, normal, verbose, or trace"
+            )),
+        }
+    }
+
+    const fn reports_progress(self) -> bool {
+        matches!(self, Self::Verbose | Self::Trace)
+    }
+
+    const fn reports_sources(self) -> bool {
+        matches!(self, Self::Trace)
+    }
+
+    const fn reports_summary(self) -> bool {
+        !matches!(self, Self::Quiet)
+    }
+}
+
+struct ProgressReporter {
+    verbosity: Verbosity,
+    started: Instant,
+    total_stages: usize,
+    completed_stages: usize,
+    total_work: u32,
+    completed_work: u32,
+    source_total: usize,
+    active: Option<ActiveStage>,
+}
+
+struct ActiveStage {
+    label: &'static str,
+    work: u32,
+    started: Instant,
+    heartbeat: Option<ProgressHeartbeat>,
+}
+
+struct ProgressHeartbeat {
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ProgressReporter {
+    fn new(verbosity: Verbosity, total_stages: usize, total_work: u32) -> Self {
+        Self {
+            verbosity,
+            started: Instant::now(),
+            total_stages,
+            completed_stages: 0,
+            total_work,
+            completed_work: 0,
+            source_total: 0,
+            active: None,
+        }
+    }
+
+    fn start_stage(&mut self, label: &'static str, work: u32) {
+        if !self.verbosity.reports_progress() {
+            return;
+        }
+        self.stop_active_heartbeat();
+        let stage_started = Instant::now();
+        let elapsed = self.started.elapsed();
+        let estimated = estimated_remaining(elapsed, self.completed_work, self.total_work);
+        eprintln!(
+            "{} starting {label}",
+            progress_prefix(
+                self.completed_stages.saturating_add(1),
+                self.total_stages,
+                elapsed,
+                estimated,
+            )
+        );
+        let heartbeat = ProgressHeartbeat::start(
+            self.started,
+            stage_started,
+            self.completed_stages.saturating_add(1),
+            self.total_stages,
+            label,
+            estimated,
+        );
+        self.active = Some(ActiveStage {
+            label,
+            work,
+            started: stage_started,
+            heartbeat: Some(heartbeat),
+        });
+    }
+
+    fn finish_stage(&mut self, label: &'static str, detail: Option<&str>) {
+        if !self.verbosity.reports_progress() {
+            return;
+        }
+        let Some(mut active) = self.active.take() else {
+            return;
+        };
+        drop(active.heartbeat.take());
+        let stage_elapsed = active.started.elapsed();
+        self.completed_stages = self.completed_stages.saturating_add(1);
+        self.completed_work = self.completed_work.saturating_add(active.work);
+        let elapsed = self.started.elapsed();
+        let estimated = estimated_remaining(elapsed, self.completed_work, self.total_work);
+        let detail = detail.map_or_else(String::new, |detail| format!("; {detail}"));
+        eprintln!(
+            "{} finished {} ({}{})",
+            progress_prefix(self.completed_stages, self.total_stages, elapsed, estimated,),
+            active.label,
+            format_duration(stage_elapsed),
+            detail,
+        );
+        debug_assert_eq!(active.label, label);
+    }
+
+    fn compiler_progress(&mut self, progress: CompilerProgress<'_>) {
+        match progress {
+            CompilerProgress::StageStarted(stage) => {
+                if stage == CompilerStage::LoadingSources {
+                    self.source_total = 0;
+                }
+                self.start_stage(compiler_stage_label(stage), compiler_stage_work(stage));
+            }
+            CompilerProgress::Source { path, index, total } => {
+                self.source_total = total;
+                if self.verbosity.reports_sources() {
+                    eprintln!(
+                        "[elapsed {}]   source {index}/{total}: {}",
+                        format_duration(self.started.elapsed()),
+                        path.display()
+                    );
+                }
+            }
+            CompilerProgress::StageFinished(stage) => {
+                let detail = (stage == CompilerStage::LoadingSources)
+                    .then(|| format!("{} source file(s)", self.source_total));
+                self.finish_stage(compiler_stage_label(stage), detail.as_deref());
+            }
+        }
+    }
+
+    fn trace_native_dependencies(&self, native: &NativeDependencies) {
+        if !self.verbosity.reports_sources() {
+            return;
+        }
+        for path in native.library_paths() {
+            eprintln!(
+                "[elapsed {}]   library path: {}",
+                format_duration(self.started.elapsed()),
+                path.display()
+            );
+        }
+        for library in native.link_libraries() {
+            eprintln!(
+                "[elapsed {}]   link library: {library}",
+                format_duration(self.started.elapsed())
+            );
+        }
+        for path in native.runtime_files() {
+            eprintln!(
+                "[elapsed {}]   runtime file: {}",
+                format_duration(self.started.elapsed()),
+                path.display()
+            );
+        }
+    }
+
+    fn set_totals(&mut self, total_stages: usize, total_work: u32) {
+        self.total_stages = total_stages;
+        self.total_work = total_work;
+    }
+
+    fn stop_active_heartbeat(&mut self) {
+        if let Some(active) = &mut self.active {
+            drop(active.heartbeat.take());
+        }
+    }
+}
+
+impl Drop for ProgressReporter {
+    fn drop(&mut self) {
+        self.stop_active_heartbeat();
+    }
+}
+
+impl ProgressHeartbeat {
+    fn start(
+        started: Instant,
+        stage_started: Instant,
+        stage_index: usize,
+        total_stages: usize,
+        label: &'static str,
+        estimated: Option<Duration>,
+    ) -> Self {
+        let (stop, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            loop {
+                match receiver.recv_timeout(PROGRESS_HEARTBEAT) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let stage_elapsed = stage_started.elapsed();
+                        let remaining =
+                            estimated.and_then(|duration| duration.checked_sub(stage_elapsed));
+                        eprintln!(
+                            "{} {label} (stage {})",
+                            progress_prefix(
+                                stage_index,
+                                total_stages,
+                                started.elapsed(),
+                                remaining,
+                            ),
+                            format_duration(stage_elapsed),
+                        );
+                    }
+                }
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for ProgressHeartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+const fn compiler_stage_label(stage: CompilerStage) -> &'static str {
+    match stage {
+        CompilerStage::LoadingSources => "source loading",
+        CompilerStage::Resolving => "semantic analysis",
+        CompilerStage::GeneratingCode => "native code generation",
+    }
+}
+
+const fn compiler_stage_work(stage: CompilerStage) -> u32 {
+    match stage {
+        CompilerStage::LoadingSources => SOURCE_LOADING_WORK,
+        CompilerStage::Resolving => SEMANTIC_ANALYSIS_WORK,
+        CompilerStage::GeneratingCode => NATIVE_CODE_GENERATION_WORK,
+    }
+}
+
+fn estimated_remaining(
+    elapsed: Duration,
+    completed_work: u32,
+    total_work: u32,
+) -> Option<Duration> {
+    if completed_work >= total_work {
+        return Some(Duration::ZERO);
+    }
+    if completed_work == 0 || elapsed < Duration::from_secs(1) {
+        return None;
+    }
+    let remaining_work = total_work.saturating_sub(completed_work);
+    elapsed
+        .checked_mul(remaining_work)
+        .and_then(|duration| duration.checked_div(completed_work))
+}
+
+fn progress_prefix(
+    stage: usize,
+    total_stages: usize,
+    elapsed: Duration,
+    estimated: Option<Duration>,
+) -> String {
+    let eta = estimated.map_or_else(
+        || "--".to_owned(),
+        |eta| format!("~{}", format_duration(eta)),
+    );
+    format!(
+        "[{stage}/{total_stages} | elapsed {} | eta {eta}]",
+        format_duration(elapsed)
+    )
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds < 60.0 {
+        return format!("{seconds:.1}s");
+    }
+    let minutes = duration.as_secs() / 60;
+    let seconds = duration.as_secs() % 60;
+    format!("{minutes}m {seconds:02}s")
+}
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -176,65 +492,103 @@ fn emit_object(source: &Path, output: Option<&Path>) -> Result<(), String> {
 
 fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> {
     if is_source_file(&options.path) {
-        validate_source_path(&options.path)?;
-        let object = compile_file_to_object_with_options(
-            &options.path,
-            profile_optimization(options.profile),
-        )
-        .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
-        if is_library_source(&options.path) {
-            let generated = output.is_none();
-            let output = output.map_or_else(
-                || default_source_object_output(&options.path),
-                Path::to_path_buf,
-            );
-            write_selected_output(Path::new("."), &output, &object, generated)?;
-            println!("emitted library object {}", output.display());
-            return Ok(());
-        }
+        return build_source(options, output);
+    }
+
+    build_project(options, output)
+}
+
+fn build_source(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> {
+    validate_source_path(&options.path)?;
+    let library = is_library_source(&options.path);
+    let mut reporter = ProgressReporter::new(
+        options.verbosity,
+        if library { 3 } else { 4 },
+        COMPILER_WORK + if library { 0 } else { NATIVE_LINKING_WORK },
+    );
+    let object = compile_file_to_object_with_progress(
+        &options.path,
+        profile_optimization(options.profile),
+        |progress| reporter.compiler_progress(progress),
+    )
+    .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+    if library {
         let generated = output.is_none();
         let output = output.map_or_else(
-            || default_source_executable_output(&options.path),
+            || default_source_object_output(&options.path),
             Path::to_path_buf,
         );
-        let artifact_directory = source_artifact_directory(&options.path, options.profile);
-        let native = NativeDependencies::default();
-        let object_path = native_linker::link_executable(
-            &object,
-            &output,
-            &artifact_directory,
-            Path::new("."),
-            &native,
-            generated,
-        )?;
+        write_selected_output(Path::new("."), &output, &object, generated)?;
+        if options.verbosity.reports_summary() {
+            println!("emitted library object {}", output.display());
+        }
+        return Ok(());
+    }
+    let generated = output.is_none();
+    let output = output.map_or_else(
+        || default_source_executable_output(&options.path),
+        Path::to_path_buf,
+    );
+    let artifact_directory = source_artifact_directory(&options.path, options.profile);
+    let native = NativeDependencies::default();
+    reporter.start_stage("native linking", NATIVE_LINKING_WORK);
+    let object_path = native_linker::link_executable(
+        &object,
+        &output,
+        &artifact_directory,
+        Path::new("."),
+        &native,
+        generated,
+        WindowsSubsystem::Console,
+    )?;
+    reporter.finish_stage("native linking", None);
+    if options.verbosity.reports_summary() {
         println!(
             "built executable {}\nobject: {}",
             output.display(),
             object_path.display()
         );
-        return Ok(());
     }
+    Ok(())
+}
 
+fn build_project(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> {
+    let mut reporter = ProgressReporter::new(
+        options.verbosity,
+        5,
+        PROJECT_RESOLUTION_WORK + COMPILER_WORK + NATIVE_LINKING_WORK,
+    );
+    reporter.start_stage("project resolution", PROJECT_RESOLUTION_WORK);
     let project = open_project(options)?;
+    reporter.finish_stage("project resolution", None);
     let entry = project.entry().map_err(|error| error.to_string())?;
+    let library = is_library_source(&entry);
+    if library {
+        reporter.set_totals(4, PROJECT_RESOLUTION_WORK + COMPILER_WORK);
+    }
     let optimization = selected_optimization(&project, options.profile)?;
-    let object = compile_graph_to_object(&project.source_graph(&entry), optimization)
-        .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
-    if is_library_source(&entry) {
+    let graph = project.source_graph(&entry);
+    let object = compile_graph_to_object_with_progress(&graph, optimization, |progress| {
+        reporter.compiler_progress(progress);
+    })
+    .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+    if library {
         let generated = output.is_none();
         let output = output.map_or_else(
             || default_project_object_output(&project, options.profile),
             Path::to_path_buf,
         );
         write_selected_output(project.root_directory(), &output, &object, generated)?;
-        println!(
-            "built {} {} ({})\nobject: {}\nlockfile: {}",
-            project.package_name(),
-            display_version(&project),
-            profile_name(options.profile),
-            output.display(),
-            project.lock_path().display()
-        );
+        if options.verbosity.reports_summary() {
+            println!(
+                "built {} {} ({})\nobject: {}\nlockfile: {}",
+                project.package_name(),
+                display_version(&project),
+                profile_name(options.profile),
+                output.display(),
+                project.lock_path().display()
+            );
+        }
         return Ok(());
     }
     let generated = output.is_none();
@@ -243,6 +597,8 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
         Path::to_path_buf,
     );
     let artifact_directory = project_artifact_directory(&project, options.profile);
+    reporter.start_stage("native linking", NATIVE_LINKING_WORK);
+    reporter.trace_native_dependencies(project.native_dependencies());
     let object_path = native_linker::link_executable(
         &object,
         &output,
@@ -250,43 +606,63 @@ fn build(options: &ProjectOptions, output: Option<&Path>) -> Result<(), String> 
         project.root_directory(),
         project.native_dependencies(),
         generated,
+        project.windows_subsystem(options.profile),
     )?;
-    println!(
-        "built {} {} ({})\nexecutable: {}\nobject: {}\nlockfile: {}",
-        project.package_name(),
-        display_version(&project),
-        profile_name(options.profile),
-        output.display(),
-        object_path.display(),
-        project.lock_path().display()
-    );
+    reporter.finish_stage("native linking", None);
+    if options.verbosity.reports_summary() {
+        println!(
+            "built {} {} ({})\nexecutable: {}\nobject: {}\nlockfile: {}",
+            project.package_name(),
+            display_version(&project),
+            profile_name(options.profile),
+            output.display(),
+            object_path.display(),
+            project.lock_path().display()
+        );
+    }
     Ok(())
 }
 
 fn execute(options: &ProjectOptions, arguments: &[OsString]) -> Result<(), String> {
     if is_source_file(&options.path) {
         validate_source_path(&options.path)?;
-        let result = execute_file_with_arguments(
+        let mut reporter = ProgressReporter::new(options.verbosity, 3, COMPILER_WORK);
+        let result = execute_file_with_arguments_and_progress(
             &options.path,
             profile_optimization(options.profile),
             runtime_arguments(&options.path, arguments),
+            |progress| reporter.compiler_progress(progress),
         )
         .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
-        println!("program returned {result}");
+        if options.verbosity.reports_summary() {
+            println!("program returned {result}");
+        }
         return Ok(());
     }
 
+    let mut reporter = ProgressReporter::new(
+        options.verbosity,
+        4,
+        PROJECT_RESOLUTION_WORK + COMPILER_WORK,
+    );
+    reporter.start_stage("project resolution", PROJECT_RESOLUTION_WORK);
     let project = open_project(options)?;
+    reporter.finish_stage("project resolution", None);
     let entry = project.entry().map_err(|error| error.to_string())?;
     let optimization = selected_optimization(&project, options.profile)?;
-    let result = execute_graph_with_arguments_and_native_dependencies(
-        &project.source_graph(&entry),
+    reporter.trace_native_dependencies(project.native_dependencies());
+    let graph = project.source_graph(&entry);
+    let result = execute_graph_with_arguments_and_native_dependencies_and_progress(
+        &graph,
         optimization,
         runtime_arguments(&entry, arguments),
         project.native_dependencies(),
+        |progress| reporter.compiler_progress(progress),
     )
     .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
-    println!("program returned {result}");
+    if options.verbosity.reports_summary() {
+        println!("program returned {result}");
+    }
     Ok(())
 }
 
@@ -1228,6 +1604,7 @@ struct ProjectOptions {
     path: PathBuf,
     lock_mode: LockMode,
     profile: BuildProfile,
+    verbosity: Verbosity,
 }
 
 fn parse_project_options(
@@ -1239,6 +1616,7 @@ fn parse_project_options(
     let mut lock_mode = LockMode::Use;
     let mut lock_flag = None;
     let mut profile = BuildProfile::Debug;
+    let mut verbosity = Verbosity::Normal;
     let mut arguments = arguments.peekable();
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
@@ -1255,6 +1633,12 @@ fn parse_project_options(
             }
             Some("--release") => profile = BuildProfile::Release,
             Some("--debug") => profile = BuildProfile::Debug,
+            Some("-q" | "--quiet") => verbosity = Verbosity::Quiet,
+            Some("-v" | "--verbose") => verbosity = Verbosity::Verbose,
+            Some("-vv" | "--trace") => verbosity = Verbosity::Trace,
+            Some("--verbosity") => {
+                verbosity = Verbosity::parse(&next_string(&mut arguments, "--verbosity")?)?;
+            }
             Some("-o" | "--output") if accept_output => {
                 output = Some(next_path(&mut arguments, "--output")?);
             }
@@ -1276,6 +1660,7 @@ fn parse_project_options(
             path: path.unwrap_or_else(|| PathBuf::from(".")),
             lock_mode,
             profile,
+            verbosity,
         },
         output,
     ))
@@ -1544,8 +1929,8 @@ fn usage() -> &'static str {
      reimer new <path>\n  \
      reimer init [path]\n  \
      reimer check [path] [--locked|--refresh]\n  \
-     reimer build [path] [--release] [--locked|--refresh] [-o <executable>]\n  \
-     reimer run [path] [--release] [--locked|--refresh] [-- <arguments>...]\n  \
+     reimer build [path] [--release] [--locked|--refresh] [-q|-v|-vv|--verbosity <level>] [-o <executable>]\n  \
+     reimer run [path] [--release] [--locked|--refresh] [-q|-v|-vv|--verbosity <level>] [-- <arguments>...]\n  \
      reimer test [path] [--release] [--locked|--refresh]\n  \
      reimer doc [path] [--locked|--refresh] [-o <file.md>]\n  \
      reimer fmt [path] [--check]\n  \
@@ -1559,11 +1944,24 @@ fn usage() -> &'static str {
 mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use super::{
-        AddSource, BuildProfile, Invocation, LockMode, dependency_section, insert_dependency,
-        validate_clean_target,
+        AddSource, BuildProfile, Invocation, LockMode, Verbosity, dependency_section,
+        estimated_remaining, insert_dependency, validate_clean_target,
     };
+
+    #[test]
+    fn estimated_remaining_should_use_completed_work() {
+        let estimate = estimated_remaining(Duration::from_secs(4), 2, 100);
+
+        assert_eq!(estimate, Some(Duration::from_secs(196)));
+        assert_eq!(
+            estimated_remaining(Duration::from_secs(4), 100, 100),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(estimated_remaining(Duration::from_secs(4), 0, 100), None);
+    }
 
     #[test]
     fn invocation_should_parse_help_flag() {
@@ -1595,7 +1993,22 @@ mod tests {
         assert_eq!(options.path, Path::new("demo"));
         assert_eq!(options.profile, BuildProfile::Release);
         assert_eq!(options.lock_mode, LockMode::Locked);
+        assert_eq!(options.verbosity, Verbosity::Normal);
         assert_eq!(output, Some(PathBuf::from("demo.exe")));
+    }
+
+    #[test]
+    fn invocation_should_parse_trace_verbosity() {
+        let arguments = ["build", "demo", "--verbosity", "trace"]
+            .map(OsString::from)
+            .to_vec();
+
+        let invocation = Invocation::parse(arguments).expect("verbosity should parse");
+
+        let Invocation::Build { options, .. } = invocation else {
+            panic!("expected build invocation");
+        };
+        assert_eq!(options.verbosity, Verbosity::Trace);
     }
 
     #[test]

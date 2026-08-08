@@ -48,6 +48,7 @@ optimization = 0
 
 [profile.release]
 optimization = 3
+windows-subsystem = "windows"
 ```
 
 Versions and requirements follow SemVer. A dependency may rename a package
@@ -138,6 +139,29 @@ The default path is `target/reimer/doc/<package>.md`.
 `fmt` normalizes trailing spaces, the final newline, and import order;
 `--check` only verifies. `clean` removes only `target/reimer` after resolving
 and validating the project root.
+
+## Build profiles and Windows applications
+
+Each profile accepts `optimization` and an optional `windows-subsystem`:
+
+```toml
+[profile.debug]
+optimization = 0
+windows-subsystem = "console"
+
+[profile.release]
+optimization = 3
+windows-subsystem = "windows"
+```
+
+- `console` is the default and preserves a terminal plus standard input,
+  output, and error streams.
+- `windows` produces a graphical Windows executable without opening a console
+  window. It has no effect on Linux or macOS.
+
+The setting is profile-specific because optimization does not imply an
+application type. Command-line tools should keep `console` in release builds;
+games can select `windows` only for release while retaining the debug console.
 
 ## Deliberate restriction
 

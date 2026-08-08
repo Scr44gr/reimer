@@ -52,6 +52,23 @@ fn assert_success(output: &Output) {
     );
 }
 
+#[cfg(windows)]
+fn pe_subsystem(path: &Path) -> u16 {
+    let image = fs::read(path).expect("PE image should be readable");
+    let pe_offset = u32::from_le_bytes(
+        image[0x3c..0x40]
+            .try_into()
+            .expect("DOS header should contain the PE offset"),
+    ) as usize;
+    assert_eq!(&image[pe_offset..pe_offset + 4], b"PE\0\0");
+    let optional_header = pe_offset + 24;
+    u16::from_le_bytes(
+        image[optional_header + 68..optional_header + 70]
+            .try_into()
+            .expect("optional header should contain a subsystem"),
+    )
+}
+
 #[test]
 fn doc_should_generate_documented_public_api_for_the_root_package() {
     let fixture = Fixture::new();
@@ -159,6 +176,57 @@ fn commands_should_compile_and_test_a_transitive_path_graph() {
         .status()
         .expect("built executable should start");
     assert_eq!(status.code(), Some(42));
+}
+
+#[test]
+fn run_trace_verbosity_should_report_stages_and_exact_sources_on_stderr() {
+    let fixture = Fixture::new();
+    fixture.write("app/reimer.toml", &manifest("app", ""));
+    fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }\n");
+    let app = fixture.path("app").display().to_string();
+
+    let output = invoke(&["run", &app, "--verbosity", "trace"]);
+    assert_success(&output);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("starting project resolution"));
+    assert!(stderr.contains("source 1/"));
+    assert!(stderr.contains("app\\src\\main.reim") || stderr.contains("app/src/main.reim"));
+    assert!(stderr.contains("finished native code generation"));
+    assert!(stderr.contains("eta"));
+}
+
+#[test]
+fn run_quiet_verbosity_should_suppress_the_command_summary() {
+    let fixture = Fixture::new();
+    fixture.write("app/reimer.toml", &manifest("app", ""));
+    fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }\n");
+    let app = fixture.path("app").display().to_string();
+
+    let output = invoke(&["run", &app, "--quiet"]);
+    assert_success(&output);
+
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn release_build_should_emit_a_gui_subsystem_when_the_profile_requests_it() {
+    let fixture = Fixture::new();
+    let configured_manifest = manifest("game", "").replace(
+        "[profile.release]\noptimization = 3\n",
+        "[profile.release]\noptimization = 3\nwindows-subsystem = \"windows\"\n",
+    );
+    fixture.write("game/reimer.toml", &configured_manifest);
+    fixture.write("game/src/main.reim", "fn main() -> i32 { 0 }\n");
+    let game = fixture.path("game").display().to_string();
+    let executable = fixture.path("game/target/game.exe");
+    let executable_text = executable.display().to_string();
+
+    let output = invoke(&["build", &game, "--release", "--output", &executable_text]);
+    assert_success(&output);
+
+    assert_eq!(pe_subsystem(&executable), 2);
 }
 
 #[test]

@@ -120,6 +120,17 @@ impl<T: Send> Thread<T> {
     pub fn join(self) -> Result<T, ThreadError> {
         __thread_join(self.raw)
     }
+
+    /// Joins through an owning field and retires its handle in place.
+    ///
+    /// This is useful for explicitly released services whose enclosing owner
+    /// is borrowed mutably during shutdown and therefore cannot move the
+    /// thread field out by value.
+    pub fn join_mut(&mut self) -> Result<T, ThreadError> {
+        let raw = self.raw;
+        self.raw = 0;
+        __thread_join(raw)
+    }
 }
 
 pub fn scope<A: Send, T: Send>(

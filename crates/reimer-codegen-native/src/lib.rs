@@ -439,7 +439,7 @@ pub fn execute_with_options(
     program: &Program,
     optimization: OptimizationLevel,
 ) -> Result<i32, Vec<Diagnostic>> {
-    execute_internal(program, optimization, None)
+    execute_internal(program, optimization, None, || {})
 }
 
 /// Compiles and executes the validated entry point with explicit process-style arguments.
@@ -453,7 +453,25 @@ pub fn execute_with_arguments(
     optimization: OptimizationLevel,
     arguments: Vec<OsString>,
 ) -> Result<i32, Vec<Diagnostic>> {
-    execute_internal(program, optimization, Some(arguments))
+    execute_with_arguments_and_ready(program, optimization, arguments, || {})
+}
+
+/// JIT-compiles an entry point with arguments and reports when execution can begin.
+///
+/// The callback runs after native definitions are finalized and before source
+/// code receives control.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when Cranelift rejects the program or JIT
+/// memory cannot be finalized.
+pub fn execute_with_arguments_and_ready(
+    program: &Program,
+    optimization: OptimizationLevel,
+    arguments: Vec<OsString>,
+    ready: impl FnOnce(),
+) -> Result<i32, Vec<Diagnostic>> {
+    execute_internal(program, optimization, Some(arguments), ready)
 }
 
 /// Compiles and executes the entry point using manifest-resolved native libraries.
@@ -473,6 +491,33 @@ pub fn execute_with_native_libraries(
     library_paths: &[PathBuf],
     preload: &[String],
 ) -> Result<i32, Vec<Diagnostic>> {
+    execute_with_native_libraries_and_ready(
+        program,
+        optimization,
+        arguments,
+        library_paths,
+        preload,
+        || {},
+    )
+}
+
+/// JIT-compiles with native libraries and reports when execution can begin.
+///
+/// The callback runs after native definitions are finalized and before source
+/// code receives control.
+///
+/// # Errors
+///
+/// Returns a backend diagnostic when a native library cannot be loaded,
+/// Cranelift rejects the program, or JIT memory cannot be finalized.
+pub fn execute_with_native_libraries_and_ready(
+    program: &Program,
+    optimization: OptimizationLevel,
+    arguments: Option<Vec<OsString>>,
+    library_paths: &[PathBuf],
+    preload: &[String],
+    ready: impl FnOnce(),
+) -> Result<i32, Vec<Diagnostic>> {
     execute_internal_with_native_libraries(
         program,
         optimization,
@@ -480,6 +525,7 @@ pub fn execute_with_native_libraries(
         library_paths,
         preload,
         &[],
+        ready,
     )
 }
 
@@ -487,8 +533,9 @@ fn execute_internal(
     program: &Program,
     optimization: OptimizationLevel,
     arguments: Option<Vec<OsString>>,
+    ready: impl FnOnce(),
 ) -> Result<i32, Vec<Diagnostic>> {
-    execute_internal_with_symbols(program, optimization, arguments, &[])
+    execute_internal_with_symbols(program, optimization, arguments, &[], ready)
 }
 
 fn execute_internal_with_symbols(
@@ -496,6 +543,7 @@ fn execute_internal_with_symbols(
     optimization: OptimizationLevel,
     arguments: Option<Vec<OsString>>,
     additional_symbols: &[(&str, *const u8)],
+    ready: impl FnOnce(),
 ) -> Result<i32, Vec<Diagnostic>> {
     execute_internal_with_native_libraries(
         program,
@@ -504,6 +552,7 @@ fn execute_internal_with_symbols(
         &[],
         &[],
         additional_symbols,
+        ready,
     )
 }
 
@@ -514,6 +563,7 @@ fn execute_internal_with_native_libraries(
     library_paths: &[PathBuf],
     preload: &[String],
     additional_symbols: &[(&str, *const u8)],
+    ready: impl FnOnce(),
 ) -> Result<i32, Vec<Diagnostic>> {
     let flags = cranelift_flags(optimization);
     let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
@@ -540,6 +590,7 @@ fn execute_internal_with_native_libraries(
         .copied()
         .ok_or_else(|| backend_error("typed HIR entry function is missing"))?;
     let pointer = module.get_finalized_function(entry);
+    ready();
     let session = arguments.map_or_else(
         reimer_runtime::ExecutionSession::begin,
         reimer_runtime::ExecutionSession::begin_with_arguments,
@@ -8944,7 +8995,7 @@ mod tests {
         ];
 
         let result =
-            execute_internal_with_symbols(&program, OptimizationLevel::None, None, &symbols)
+            execute_internal_with_symbols(&program, OptimizationLevel::None, None, &symbols, || {})
                 .expect("C aggregate fixture should execute");
 
         assert_eq!(result, 42);

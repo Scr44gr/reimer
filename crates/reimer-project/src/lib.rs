@@ -43,6 +43,17 @@ pub enum BuildProfile {
     Release,
 }
 
+/// Windows executable subsystem selected by a build profile.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsSubsystem {
+    /// Attaches the executable to a console and preserves standard streams.
+    #[default]
+    Console,
+    /// Starts the executable as a graphical application without a console window.
+    Windows,
+}
+
 /// A resolved project and its complete dependency graph.
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -53,6 +64,8 @@ pub struct Project {
     native_dependencies: NativeDependencies,
     debug_optimization: u8,
     release_optimization: u8,
+    debug_windows_subsystem: WindowsSubsystem,
+    release_windows_subsystem: WindowsSubsystem,
 }
 
 impl Project {
@@ -99,6 +112,15 @@ impl Project {
         match profile {
             BuildProfile::Debug => self.debug_optimization,
             BuildProfile::Release => self.release_optimization,
+        }
+    }
+
+    /// Returns the selected profile's Windows executable subsystem.
+    #[must_use]
+    pub const fn windows_subsystem(&self, profile: BuildProfile) -> WindowsSubsystem {
+        match profile {
+            BuildProfile::Debug => self.debug_windows_subsystem,
+            BuildProfile::Release => self.release_windows_subsystem,
         }
     }
 
@@ -344,6 +366,8 @@ struct ProfileTables {
 struct ProfileTable {
     #[serde(default)]
     optimization: Option<u8>,
+    #[serde(default, rename = "windows-subsystem")]
+    windows_subsystem: WindowsSubsystem,
 }
 
 #[derive(Debug)]
@@ -355,6 +379,8 @@ struct ParsedManifest {
     native: Vec<native::ParsedNativeTarget>,
     debug_optimization: u8,
     release_optimization: u8,
+    debug_windows_subsystem: WindowsSubsystem,
+    release_windows_subsystem: WindowsSubsystem,
 }
 
 #[derive(Debug)]
@@ -446,6 +472,8 @@ struct Resolver {
     visiting: Vec<(String, String)>,
     debug_optimization: u8,
     release_optimization: u8,
+    debug_windows_subsystem: WindowsSubsystem,
+    release_windows_subsystem: WindowsSubsystem,
 }
 
 impl Resolver {
@@ -474,6 +502,8 @@ impl Resolver {
             visiting: Vec::new(),
             debug_optimization: 0,
             release_optimization: 3,
+            debug_windows_subsystem: WindowsSubsystem::Console,
+            release_windows_subsystem: WindowsSubsystem::Console,
         })
     }
 
@@ -481,6 +511,8 @@ impl Resolver {
         let manifest = parse_manifest(&self.manifest_path)?;
         self.debug_optimization = manifest.debug_optimization;
         self.release_optimization = manifest.release_optimization;
+        self.debug_windows_subsystem = manifest.debug_windows_subsystem;
+        self.release_windows_subsystem = manifest.release_windows_subsystem;
         let root = self.resolve_path(manifest, None, None)?;
         let current = self.lock_document();
         if self.mode == LockMode::Locked {
@@ -501,6 +533,8 @@ impl Resolver {
             native_dependencies,
             debug_optimization: self.debug_optimization,
             release_optimization: self.release_optimization,
+            debug_windows_subsystem: self.debug_windows_subsystem,
+            release_windows_subsystem: self.release_windows_subsystem,
         })
     }
 
@@ -762,6 +796,8 @@ fn parse_manifest(path: &Path) -> Result<ParsedManifest, ProjectError> {
         validate_optimization(&path, "debug", document.profile.debug.optimization, 0)?;
     let release_optimization =
         validate_optimization(&path, "release", document.profile.release.optimization, 3)?;
+    let debug_windows_subsystem = document.profile.debug.windows_subsystem;
+    let release_windows_subsystem = document.profile.release.windows_subsystem;
     Ok(ParsedManifest {
         path,
         name: document.package.name,
@@ -770,6 +806,8 @@ fn parse_manifest(path: &Path) -> Result<ParsedManifest, ProjectError> {
         native,
         debug_optimization,
         release_optimization,
+        debug_windows_subsystem,
+        release_windows_subsystem,
     })
 }
 
@@ -1562,7 +1600,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::native::{NativeOperatingSystem, NativePlatform, host_native_platform};
-    use super::{BuildProfile, LockMode, Project, ProjectError, git_output, normalized_path};
+    use super::{
+        BuildProfile, LockMode, Project, ProjectError, WindowsSubsystem, git_output,
+        normalized_path,
+    };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -1623,6 +1664,38 @@ mod tests {
         let program =
             reimer_resolver::resolve(&package.program).expect("source graph should resolve");
         reimer_codegen_native::execute(&program).expect("source graph should execute")
+    }
+
+    #[test]
+    fn open_should_select_the_windows_subsystem_per_profile() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "app/reimer.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2026"
+
+[profile.debug]
+optimization = 0
+
+[profile.release]
+optimization = 3
+windows-subsystem = "windows"
+"#,
+        );
+        fixture.write("app/src/main.reim", "fn main() -> i32 { 0 }");
+
+        let project = Project::open(&fixture.path("app"), LockMode::Use)
+            .expect("profile subsystem should parse");
+
+        assert_eq!(
+            (
+                project.windows_subsystem(BuildProfile::Debug),
+                project.windows_subsystem(BuildProfile::Release),
+            ),
+            (WindowsSubsystem::Console, WindowsSubsystem::Windows)
+        );
     }
 
     fn write_portable_graph(fixture: &Fixture) {

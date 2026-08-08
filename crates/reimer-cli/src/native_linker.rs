@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use reimer_project::NativeDependencies;
+use reimer_project::{NativeDependencies, WindowsSubsystem};
 
 use crate::generated_output;
 
@@ -30,6 +30,7 @@ pub fn link_executable(
     generated_root: &Path,
     native: &NativeDependencies,
     generated_executable: bool,
+    windows_subsystem: WindowsSubsystem,
 ) -> Result<PathBuf, String> {
     let artifact_directory =
         generated_output::prepare_directory(generated_root, artifact_directory)?;
@@ -66,6 +67,7 @@ pub fn link_executable(
         .arg(format!("reimer_runtime={}", runtime_path.display()))
         .arg("-C")
         .arg(format!("link-arg={}", object_path.display()));
+    configure_windows_subsystem(&mut command, windows_subsystem);
     if let Some(linker) = linker {
         command
             .arg("-C")
@@ -103,6 +105,18 @@ pub fn link_executable(
     )?;
     Ok(object_path)
 }
+
+#[cfg(windows)]
+fn configure_windows_subsystem(command: &mut Command, subsystem: WindowsSubsystem) {
+    if subsystem == WindowsSubsystem::Windows {
+        command
+            .arg("--cfg")
+            .arg("reimer_windows_subsystem=\"windows\"");
+    }
+}
+
+#[cfg(not(windows))]
+fn configure_windows_subsystem(_command: &mut Command, _subsystem: WindowsSubsystem) {}
 
 fn stage_runtime_files(
     sources: &[PathBuf],
@@ -259,6 +273,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::stage_runtime_files;
+    #[cfg(windows)]
+    use super::{WindowsSubsystem, configure_windows_subsystem};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -352,5 +368,19 @@ mod tests {
 
         assert!(error.contains("conflict at"));
         assert!(!fixture.root.join("custom/native.dll").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configure_windows_subsystem_should_enable_the_gui_startup_attribute() {
+        let mut command = std::process::Command::new("rustc");
+
+        configure_windows_subsystem(&mut command, WindowsSubsystem::Windows);
+
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, ["--cfg", "reimer_windows_subsystem=\"windows\""]);
     }
 }
